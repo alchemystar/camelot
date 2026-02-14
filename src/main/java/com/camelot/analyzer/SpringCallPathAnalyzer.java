@@ -58,6 +58,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class SpringCallPathAnalyzer {
+    private DebugLogger debugLogger = DebugLogger.disabled();
     private static final Set<String> COMPONENT_ANNOTATIONS = setOf(
             "Component", "Service", "Repository", "Controller", "RestController", "Configuration"
     );
@@ -68,16 +69,21 @@ public class SpringCallPathAnalyzer {
 
     public static void main(String[] args) throws Exception {
         CliOptions options = CliOptions.parse(args);
+        Files.createDirectories(options.outputDir);
+        Path debugPath = options.debugOut;
+        if (debugPath == null) {
+            debugPath = options.outputDir.resolve("analysis-debug.log");
+        }
+        DebugLogger debugLogger = new DebugLogger(options.debug, debugPath);
         SpringCallPathAnalyzer analyzer = new SpringCallPathAnalyzer();
         AnalysisReport report = analyzer.analyze(
                 options.projectRoot,
                 options.maxDepth,
                 options.maxPathsPerEndpoint,
                 options.endpointPath,
-                options.entryMethod
+                options.entryMethod,
+                debugLogger
         );
-
-        Files.createDirectories(options.outputDir);
         Path jsonPath = options.outputDir.resolve("analysis-report.json");
         Path dotPath = options.outputDir.resolve("call-graph.dot");
 
@@ -103,17 +109,21 @@ public class SpringCallPathAnalyzer {
                 System.out.println("No method entry matched the filter.");
             }
         }
+        if (debugLogger.isEnabled()) {
+            debugLogger.flush();
+            System.out.println("Debug log:   " + debugLogger.getOutPath().toAbsolutePath());
+        }
     }
 
     public AnalysisReport analyze(Path projectRoot, int maxDepth, int maxPathsPerEndpoint) throws IOException {
-        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, null, null);
+        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, null, null, DebugLogger.disabled());
     }
 
     public AnalysisReport analyze(Path projectRoot,
                                   int maxDepth,
                                   int maxPathsPerEndpoint,
                                   String endpointPathFilter) throws IOException {
-        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, endpointPathFilter, null);
+        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, endpointPathFilter, null, DebugLogger.disabled());
     }
 
     public AnalysisReport analyze(Path projectRoot,
@@ -121,8 +131,22 @@ public class SpringCallPathAnalyzer {
                                   int maxPathsPerEndpoint,
                                   String endpointPathFilter,
                                   String entryMethodFilter) throws IOException {
+        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, endpointPathFilter, entryMethodFilter, DebugLogger.disabled());
+    }
+
+    public AnalysisReport analyze(Path projectRoot,
+                                  int maxDepth,
+                                  int maxPathsPerEndpoint,
+                                  String endpointPathFilter,
+                                  String entryMethodFilter,
+                                  DebugLogger debugLogger) throws IOException {
+        DebugLogger previousLogger = this.debugLogger;
+        this.debugLogger = debugLogger == null ? DebugLogger.disabled() : debugLogger;
+        try {
         JavaModel javaModel = parseJava(projectRoot);
         XmlModel xmlModel = parseXml(projectRoot);
+        this.debugLogger.log("START project=%s endpointFilter=%s entryMethodFilter=%s maxDepth=%d maxPaths=%d",
+                projectRoot.toAbsolutePath(), endpointPathFilter, entryMethodFilter, maxDepth, maxPathsPerEndpoint);
 
         BeanRegistry beanRegistry = buildBeanRegistry(javaModel, xmlModel);
         InjectionRegistry injectionRegistry = buildInjectionRegistry(javaModel, xmlModel, beanRegistry);
@@ -135,6 +159,7 @@ public class SpringCallPathAnalyzer {
         } else if (isBlank(entryMethodFilter)) {
             selectedEndpoints.addAll(endpoints);
         }
+        debugLogger.log("ENDPOINTS total=%d selected=%d", endpoints.size(), selectedEndpoints.size());
         Map<String, List<CallEdge>> edgesFrom = edges.stream()
                 .collect(Collectors.groupingBy(e -> e.from, LinkedHashMap::new, Collectors.toList()));
 
@@ -155,6 +180,7 @@ public class SpringCallPathAnalyzer {
         }
 
         Set<String> reachableMethodIds = collectReachableMethodIds(endpointPaths);
+        debugLogger.log("REACHABLE methods=%d endpointPaths=%d", reachableMethodIds.size(), endpointPaths.size());
         List<CallEdge> filteredEdges = edges;
         Map<String, String> methodDisplay;
         if (reachableMethodIds.isEmpty() && isBlank(endpointPathFilter) && isBlank(entryMethodFilter)) {
@@ -180,6 +206,9 @@ public class SpringCallPathAnalyzer {
                 filteredEdges,
                 endpointPaths
         );
+        } finally {
+            this.debugLogger = previousLogger;
+        }
     }
 
     private List<Endpoint> selectEndpoints(List<Endpoint> endpoints, String endpointPathFilter) {
@@ -204,12 +233,18 @@ public class SpringCallPathAnalyzer {
         }
 
         MethodSelector selector = MethodSelector.parse(entryMethodFilter.trim());
+        debugLogger.log("ENTRY_METHOD_SELECTOR raw=%s class=%s method=%s arity=%s",
+                entryMethodFilter,
+                selector.className,
+                selector.methodName,
+                String.valueOf(selector.parameterCount));
         Set<String> selected = new LinkedHashSet<String>();
         for (MethodModel method : methodsById.values()) {
             if (selector.matches(method)) {
                 selected.add(method.id);
             }
         }
+        debugLogger.log("ENTRY_METHOD_SELECTED count=%d methods=%s", selected.size(), selected);
 
         Set<String> expanded = new LinkedHashSet<String>(selected);
         for (String methodId : selected) {
@@ -232,6 +267,7 @@ public class SpringCallPathAnalyzer {
                 }
             }
         }
+        debugLogger.log("ENTRY_METHOD_EXPANDED count=%d methods=%s", expanded.size(), expanded);
         return expanded;
     }
 
@@ -261,10 +297,12 @@ public class SpringCallPathAnalyzer {
                     .sorted()
                     .collect(Collectors.toList());
         }
+        debugLogger.log("JAVA_SCAN files=%d", javaFiles.size());
 
         for (Path javaFile : javaFiles) {
             ParseResult<CompilationUnit> result = parser.parse(javaFile);
             if (!result.getResult().isPresent()) {
+                debugLogger.log("JAVA_PARSE_SKIP file=%s reason=parse-failed", javaFile.toAbsolutePath());
                 continue;
             }
             CompilationUnit cu = result.getResult().get();
@@ -343,8 +381,18 @@ public class SpringCallPathAnalyzer {
                     }
 
                     for (MethodCallExpr callExpr : methodDeclaration.findAll(MethodCallExpr.class)) {
-                        methodModel.calls.add(toCallSite(callExpr));
+                        CallSite callSite = toCallSite(callExpr);
+                        methodModel.calls.add(callSite);
+                        debugLogger.log(
+                                "PARSE_CALL from=%s line=%d call=%s scope=%s scopeToken=%s",
+                                methodModel.id,
+                                callSite.line,
+                                callExpr.toString(),
+                                callSite.scopeType,
+                                callSite.scopeToken
+                        );
                     }
+                    debugLogger.log("PARSE_METHOD id=%s calls=%d vars=%d", methodModel.id, methodModel.calls.size(), methodModel.visibleVariableTypes.size());
 
                     classModel.methodsById.put(methodModel.id, methodModel);
                     classModel.methodsByName.computeIfAbsent(methodModel.name, k -> new ArrayList<>()).add(methodModel);
@@ -352,8 +400,10 @@ public class SpringCallPathAnalyzer {
 
                 model.classesByName.put(fqcn, classModel);
                 model.simpleToFqcn.computeIfAbsent(simpleName, k -> new LinkedHashSet<>()).add(fqcn);
+                debugLogger.log("PARSE_CLASS class=%s methods=%d fields=%d", fqcn, classModel.methodsById.size(), classModel.fields.size());
             }
         }
+        debugLogger.log("JAVA_MODEL classes=%d", model.classesByName.size());
 
         return model;
     }
@@ -509,14 +559,19 @@ public class SpringCallPathAnalyzer {
     private boolean shouldAnalyzeJava(Path javaPath) {
         String normalizedPath = javaPath.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
         if (normalizedPath.contains("/src/test/") || normalizedPath.contains("/generated-test-sources/")) {
+            debugLogger.log("JAVA_FILTER_SKIP file=%s reason=test-source", javaPath.toAbsolutePath());
             return false;
         }
 
         String fileName = javaPath.getFileName() == null ? "" : javaPath.getFileName().toString();
-        return !(fileName.endsWith("Test.java")
+        boolean excluded = fileName.endsWith("Test.java")
                 || fileName.endsWith("Tests.java")
                 || fileName.endsWith("IT.java")
-                || fileName.endsWith("ITCase.java"));
+                || fileName.endsWith("ITCase.java");
+        if (excluded) {
+            debugLogger.log("JAVA_FILTER_SKIP file=%s reason=test-name", javaPath.toAbsolutePath());
+        }
+        return !excluded;
     }
 
     private boolean shouldAnalyzeXml(Path xmlPath) {
@@ -659,10 +714,14 @@ public class SpringCallPathAnalyzer {
 
     private List<CallEdge> buildCallEdges(JavaModel javaModel, Map<String, MethodModel> methodsById, InjectionRegistry injectionRegistry) {
         Map<String, CallEdgeAccumulator> edgeMap = new LinkedHashMap<>();
+        int totalCallSites = 0;
+        int resolvedCallSites = 0;
+        int unresolvedCallSites = 0;
 
         for (ClassModel classModel : javaModel.classesByName.values()) {
             for (MethodModel methodModel : classModel.methodsById.values()) {
                 for (CallSite call : methodModel.calls) {
+                    totalCallSites++;
                     Map<String, String> candidates = resolveCallCandidates(
                             classModel,
                             methodModel,
@@ -672,13 +731,52 @@ public class SpringCallPathAnalyzer {
                             injectionRegistry,
                             0
                     );
+                    if (candidates.isEmpty()) {
+                        unresolvedCallSites++;
+                        debugLogger.log(
+                                "RESOLVE_CALL_EMPTY from=%s line=%d call=%s/%d scope=%s scopeToken=%s",
+                                methodModel.id,
+                                call.line,
+                                call.methodName,
+                                call.argumentCount,
+                                call.scopeType,
+                                call.scopeToken
+                        );
+                    } else {
+                        resolvedCallSites++;
+                        debugLogger.log(
+                                "RESOLVE_CALL from=%s line=%d call=%s/%d targets=%d",
+                                methodModel.id,
+                                call.line,
+                                call.methodName,
+                                call.argumentCount,
+                                candidates.size()
+                        );
+                    }
                     for (Map.Entry<String, String> candidate : candidates.entrySet()) {
                         String key = methodModel.id + "->" + candidate.getKey();
-                        CallEdgeAccumulator accumulator = edgeMap.computeIfAbsent(
-                                key,
-                                k -> new CallEdgeAccumulator(methodModel.id, candidate.getKey(), call.line)
-                        );
+                        CallEdgeAccumulator accumulator = edgeMap.get(key);
+                        if (accumulator == null) {
+                            accumulator = new CallEdgeAccumulator(methodModel.id, candidate.getKey(), call.line);
+                            edgeMap.put(key, accumulator);
+                        } else {
+                            accumulator.occurrences++;
+                            debugLogger.log(
+                                    "EDGE_DEDUP from=%s to=%s line=%d occurrences=%d",
+                                    accumulator.from,
+                                    accumulator.to,
+                                    call.line,
+                                    accumulator.occurrences
+                            );
+                        }
                         accumulator.reasons.add(candidate.getValue());
+                        debugLogger.log(
+                                "EDGE_ADD from=%s to=%s reason=%s line=%d",
+                                methodModel.id,
+                                candidate.getKey(),
+                                candidate.getValue(),
+                                call.line
+                        );
                     }
                 }
             }
@@ -688,6 +786,13 @@ public class SpringCallPathAnalyzer {
                 .map(a -> new CallEdge(a.from, a.to, String.join("|", a.reasons), a.line))
                 .collect(Collectors.toCollection(ArrayList::new));
         edges.sort(Comparator.comparing((CallEdge e) -> e.from).thenComparing(e -> e.to));
+        debugLogger.log(
+                "CALL_GRAPH_SUMMARY callSites=%d resolvedCallSites=%d unresolvedCallSites=%d edges=%d",
+                totalCallSites,
+                resolvedCallSites,
+                unresolvedCallSites,
+                edges.size()
+        );
         return edges;
     }
 
@@ -699,6 +804,7 @@ public class SpringCallPathAnalyzer {
                                                       InjectionRegistry injectionRegistry,
                                                       int depth) {
         if (depth > 6) {
+            debugLogger.log("RESOLVE_DEPTH_GUARD from=%s call=%s/%d", methodModel.id, call.methodName, call.argumentCount);
             return Collections.emptyMap();
         }
 
@@ -752,6 +858,7 @@ public class SpringCallPathAnalyzer {
             for (Map.Entry<String, String> scopeCall : scopeCalls.entrySet()) {
                 MethodModel scopeMethod = methodsById.get(scopeCall.getKey());
                 if (scopeMethod == null || "void".equals(normalizeTypeName(scopeMethod.returnTypeName))) {
+                    debugLogger.log("RESOLVE_CHAIN_SKIP from=%s scopeMethod=%s", methodModel.id, scopeCall.getKey());
                     continue;
                 }
                 for (String scopeType : resolveClassesByType(scopeMethod.returnTypeName, javaModel)) {
@@ -762,6 +869,16 @@ public class SpringCallPathAnalyzer {
                     );
                 }
             }
+        }
+        if (resolved.isEmpty()) {
+            debugLogger.log(
+                    "RESOLVE_NO_TARGET from=%s call=%s/%d scope=%s scopeToken=%s",
+                    methodModel.id,
+                    call.methodName,
+                    call.argumentCount,
+                    call.scopeType,
+                    call.scopeToken
+            );
         }
         return resolved;
     }
@@ -1308,19 +1425,25 @@ public class SpringCallPathAnalyzer {
         public final int maxPathsPerEndpoint;
         public final String endpointPath;
         public final String entryMethod;
+        public final boolean debug;
+        public final Path debugOut;
 
         private CliOptions(Path projectRoot,
                            Path outputDir,
                            int maxDepth,
                            int maxPathsPerEndpoint,
                            String endpointPath,
-                           String entryMethod) {
+                           String entryMethod,
+                           boolean debug,
+                           Path debugOut) {
             this.projectRoot = projectRoot;
             this.outputDir = outputDir;
             this.maxDepth = maxDepth;
             this.maxPathsPerEndpoint = maxPathsPerEndpoint;
             this.endpointPath = endpointPath;
             this.entryMethod = entryMethod;
+            this.debug = debug;
+            this.debugOut = debugOut;
         }
 
         public static CliOptions parse(String[] args) {
@@ -1330,6 +1453,8 @@ public class SpringCallPathAnalyzer {
             int maxPaths = 200;
             String endpointPath = null;
             String entryMethod = null;
+            boolean debug = false;
+            Path debugOut = null;
 
             for (int i = 0; i < args.length; i++) {
                 String arg = args[i];
@@ -1345,10 +1470,14 @@ public class SpringCallPathAnalyzer {
                     endpointPath = args[++i];
                 } else if ("--entry-method".equals(arg) && i + 1 < args.length) {
                     entryMethod = args[++i];
+                } else if ("--debug".equals(arg)) {
+                    debug = true;
+                } else if ("--debug-out".equals(arg) && i + 1 < args.length) {
+                    debugOut = Paths.get(args[++i]).toAbsolutePath().normalize();
                 }
             }
 
-            return new CliOptions(projectRoot, outputDir, maxDepth, maxPaths, endpointPath, entryMethod);
+            return new CliOptions(projectRoot, outputDir, maxDepth, maxPaths, endpointPath, entryMethod, debug, debugOut);
         }
     }
 
@@ -1648,11 +1777,59 @@ public class SpringCallPathAnalyzer {
         public final String to;
         public final Set<String> reasons = new LinkedHashSet<>();
         public final int line;
+        public int occurrences = 1;
 
         public CallEdgeAccumulator(String from, String to, int line) {
             this.from = from;
             this.to = to;
             this.line = line;
+        }
+    }
+
+    public static class DebugLogger {
+        private final boolean enabled;
+        private final Path outPath;
+        private final List<String> lines = new ArrayList<String>();
+
+        public DebugLogger(boolean enabled, Path outPath) {
+            this.enabled = enabled;
+            this.outPath = outPath;
+        }
+
+        public static DebugLogger disabled() {
+            return new DebugLogger(false, null);
+        }
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public Path getOutPath() {
+            return outPath;
+        }
+
+        public void log(String pattern, Object... args) {
+            if (!enabled) {
+                return;
+            }
+            String message;
+            if (args == null || args.length == 0) {
+                message = pattern;
+            } else {
+                message = String.format(Locale.ROOT, pattern, args);
+            }
+            lines.add(Instant.now().toString() + " " + message);
+        }
+
+        public void flush() throws IOException {
+            if (!enabled || outPath == null) {
+                return;
+            }
+            Path parent = outPath.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.write(outPath, lines, StandardCharsets.UTF_8);
         }
     }
 

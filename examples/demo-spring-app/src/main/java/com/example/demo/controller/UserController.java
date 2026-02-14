@@ -1,5 +1,6 @@
 package com.example.demo.controller;
 
+import com.example.demo.service.AuditService;
 import com.example.demo.service.UserService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -14,8 +15,14 @@ public class UserController {
     @Autowired
     private UserService userService;
 
+    @Autowired
+    private AuditService auditService;
+
     @GetMapping("/{id}")
     public String getUser(@PathVariable("id") String id) {
-        return userService.findUser(id);
+        auditService.recordRequest(id);
+        String userPayload = userService.findUser(id);
+        auditService.recordResponse(id, userPayload);
+        return userPayload;
     }
 }

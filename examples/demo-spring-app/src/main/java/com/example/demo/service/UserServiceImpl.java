@@ -10,8 +10,24 @@ public class UserServiceImpl implements UserService {
     @Autowired
     private UserRepository userRepository;
 
+    @Autowired
+    private RiskService riskService;
+
+    @Autowired
+    private UserEnricherService userEnricherService;
+
+    @Autowired
+    private AuditService auditService;
+
     @Override
     public String findUser(String id) {
-        return userRepository.findById(id);
+        boolean risky = riskService.check(id);
+        String rawUser = userRepository.findById(id);
+        String enriched = userEnricherService.decorate(rawUser);
+        auditService.recordLookup(id, risky, enriched);
+        if (risky) {
+            return "risky:" + enriched;
+        }
+        return enriched;
     }
 }
