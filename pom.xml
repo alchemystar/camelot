@@ -8,8 +8,7 @@
     <name>spring-call-path-analyzer</name>
 
     <properties>
-        <maven.compiler.source>1.8</maven.compiler.source>
-        <maven.compiler.target>1.8</maven.compiler.target>
+        <maven.compiler.release>8</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <javaparser.version>3.27.1</javaparser.version>
         <jackson.version>2.18.2</jackson.version>

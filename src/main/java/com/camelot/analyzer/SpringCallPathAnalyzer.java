@@ -35,6 +35,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -76,7 +77,7 @@ public class SpringCallPathAnalyzer {
 
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         mapper.writeValue(jsonPath.toFile(), report);
-        Files.writeString(dotPath, report.toDot());
+        Files.write(dotPath, report.toDot().getBytes(StandardCharsets.UTF_8));
 
         System.out.println("Analysis finished.");
         System.out.println("JSON report: " + jsonPath.toAbsolutePath());
@@ -130,7 +131,7 @@ public class SpringCallPathAnalyzer {
 
         for (Path javaFile : javaFiles) {
             ParseResult<CompilationUnit> result = parser.parse(javaFile);
-            if (result.getResult().isEmpty()) {
+            if (!result.getResult().isPresent()) {
                 continue;
             }
             CompilationUnit cu = result.getResult().get();
@@ -229,7 +230,7 @@ public class SpringCallPathAnalyzer {
         String scopeToken = null;
         CallSite scopeCall = null;
 
-        if (callExpr.getScope().isEmpty()) {
+        if (!callExpr.getScope().isPresent()) {
             scopeType = ScopeType.UNSCOPED;
         } else {
             Expression scope = callExpr.getScope().get();
@@ -649,7 +650,7 @@ public class SpringCallPathAnalyzer {
                     continue;
                 }
                 Optional<MethodModel> entryMethod = classModel.methodsByName.getOrDefault("handleRequest", listOf()).stream().findFirst();
-                if (entryMethod.isEmpty()) {
+                if (!entryMethod.isPresent()) {
                     entryMethod = classModel.methodsByName.values().stream().flatMap(Collection::stream).findFirst();
                 }
                 entryMethod.ifPresent(methodModel -> endpoints.add(new Endpoint(mapping.path, listOf("ANY"), "XML", methodModel.id)));
