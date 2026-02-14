@@ -69,7 +69,13 @@ public class SpringCallPathAnalyzer {
     public static void main(String[] args) throws Exception {
         CliOptions options = CliOptions.parse(args);
         SpringCallPathAnalyzer analyzer = new SpringCallPathAnalyzer();
-        AnalysisReport report = analyzer.analyze(options.projectRoot, options.maxDepth, options.maxPathsPerEndpoint);
+        AnalysisReport report = analyzer.analyze(
+                options.projectRoot,
+                options.maxDepth,
+                options.maxPathsPerEndpoint,
+                options.endpointPath,
+                options.entryMethod
+        );
 
         Files.createDirectories(options.outputDir);
         Path jsonPath = options.outputDir.resolve("analysis-report.json");
@@ -85,9 +91,36 @@ public class SpringCallPathAnalyzer {
         System.out.println("Endpoints:   " + report.endpoints.size());
         System.out.println("Methods:     " + report.methodDisplay.size());
         System.out.println("Edges:       " + report.edges.size());
+        if (!isBlank(options.endpointPath)) {
+            System.out.println("Endpoint filter: " + options.endpointPath);
+            if (report.endpoints.isEmpty()) {
+                System.out.println("No endpoint matched the filter.");
+            }
+        }
+        if (!isBlank(options.entryMethod)) {
+            System.out.println("Entry method filter: " + options.entryMethod);
+            if (report.endpoints.isEmpty()) {
+                System.out.println("No method entry matched the filter.");
+            }
+        }
     }
 
     public AnalysisReport analyze(Path projectRoot, int maxDepth, int maxPathsPerEndpoint) throws IOException {
+        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, null, null);
+    }
+
+    public AnalysisReport analyze(Path projectRoot,
+                                  int maxDepth,
+                                  int maxPathsPerEndpoint,
+                                  String endpointPathFilter) throws IOException {
+        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, endpointPathFilter, null);
+    }
+
+    public AnalysisReport analyze(Path projectRoot,
+                                  int maxDepth,
+                                  int maxPathsPerEndpoint,
+                                  String endpointPathFilter,
+                                  String entryMethodFilter) throws IOException {
         JavaModel javaModel = parseJava(projectRoot);
         XmlModel xmlModel = parseXml(projectRoot);
 
@@ -96,24 +129,123 @@ public class SpringCallPathAnalyzer {
         Map<String, MethodModel> methodsById = collectMethods(javaModel);
         List<CallEdge> edges = buildCallEdges(javaModel, methodsById, injectionRegistry);
         List<Endpoint> endpoints = buildEndpoints(javaModel, xmlModel, beanRegistry);
-        Map<String, List<CallEdge>> edgesFrom = edges.stream().collect(Collectors.groupingBy(e -> e.from, LinkedHashMap::new, Collectors.toList()));
+        List<Endpoint> selectedEndpoints = new ArrayList<Endpoint>();
+        if (!isBlank(endpointPathFilter)) {
+            selectedEndpoints.addAll(selectEndpoints(endpoints, endpointPathFilter));
+        } else if (isBlank(entryMethodFilter)) {
+            selectedEndpoints.addAll(endpoints);
+        }
+        Map<String, List<CallEdge>> edgesFrom = edges.stream()
+                .collect(Collectors.groupingBy(e -> e.from, LinkedHashMap::new, Collectors.toList()));
 
         List<EndpointPaths> endpointPaths = new ArrayList<>();
-        for (Endpoint endpoint : endpoints) {
+        for (Endpoint endpoint : selectedEndpoints) {
             List<List<String>> paths = enumeratePaths(endpoint.entryMethodId, edgesFrom, maxDepth, maxPathsPerEndpoint);
             endpointPaths.add(new EndpointPaths(endpoint.path, endpoint.httpMethods, endpoint.source, endpoint.entryMethodId, paths));
         }
+        for (String entryMethodId : selectEntryMethods(entryMethodFilter, methodsById, javaModel)) {
+            List<List<String>> paths = enumeratePaths(entryMethodId, edgesFrom, maxDepth, maxPathsPerEndpoint);
+            endpointPaths.add(new EndpointPaths(
+                    "method:" + entryMethodId,
+                    listOf("METHOD"),
+                    "METHOD",
+                    entryMethodId,
+                    paths
+            ));
+        }
 
-        Map<String, String> methodDisplay = methodsById.values().stream()
-                .collect(Collectors.toMap(m -> m.id, MethodModel::display, (a, b) -> a, LinkedHashMap::new));
+        Set<String> reachableMethodIds = collectReachableMethodIds(endpointPaths);
+        List<CallEdge> filteredEdges = edges;
+        Map<String, String> methodDisplay;
+        if (reachableMethodIds.isEmpty() && isBlank(endpointPathFilter) && isBlank(entryMethodFilter)) {
+            methodDisplay = methodsById.values().stream()
+                    .collect(Collectors.toMap(m -> m.id, MethodModel::display, (a, b) -> a, LinkedHashMap::new));
+        } else {
+            filteredEdges = edges.stream()
+                    .filter(e -> reachableMethodIds.contains(e.from) && reachableMethodIds.contains(e.to))
+                    .collect(Collectors.toList());
+            methodDisplay = new LinkedHashMap<String, String>();
+            for (String methodId : reachableMethodIds) {
+                MethodModel methodModel = methodsById.get(methodId);
+                if (methodModel != null) {
+                    methodDisplay.put(methodId, methodModel.display());
+                }
+            }
+        }
 
         return new AnalysisReport(
                 Instant.now().toString(),
                 projectRoot.toAbsolutePath().toString(),
                 methodDisplay,
-                edges,
+                filteredEdges,
                 endpointPaths
         );
+    }
+
+    private List<Endpoint> selectEndpoints(List<Endpoint> endpoints, String endpointPathFilter) {
+        if (isBlank(endpointPathFilter)) {
+            return endpoints;
+        }
+        String normalizedFilter = normalizeHttpPath(endpointPathFilter.trim());
+        List<Endpoint> selected = new ArrayList<Endpoint>();
+        for (Endpoint endpoint : endpoints) {
+            if (normalizedFilter.equals(normalizeHttpPath(endpoint.path))) {
+                selected.add(endpoint);
+            }
+        }
+        return selected;
+    }
+
+    private Set<String> selectEntryMethods(String entryMethodFilter,
+                                           Map<String, MethodModel> methodsById,
+                                           JavaModel javaModel) {
+        if (isBlank(entryMethodFilter)) {
+            return new LinkedHashSet<String>();
+        }
+
+        MethodSelector selector = MethodSelector.parse(entryMethodFilter.trim());
+        Set<String> selected = new LinkedHashSet<String>();
+        for (MethodModel method : methodsById.values()) {
+            if (selector.matches(method)) {
+                selected.add(method.id);
+            }
+        }
+
+        Set<String> expanded = new LinkedHashSet<String>(selected);
+        for (String methodId : selected) {
+            MethodModel rootMethod = methodsById.get(methodId);
+            if (rootMethod == null) {
+                continue;
+            }
+            for (ClassModel classModel : javaModel.classesByName.values()) {
+                if (!isAssignableTo(classModel.fqcn, rootMethod.className, javaModel, new HashSet<String>())) {
+                    continue;
+                }
+                List<MethodModel> implementations = classModel.methodsByName.get(rootMethod.name);
+                if (implementations == null) {
+                    continue;
+                }
+                for (MethodModel implementation : implementations) {
+                    if (implementation.parameterCount == rootMethod.parameterCount) {
+                        expanded.add(implementation.id);
+                    }
+                }
+            }
+        }
+        return expanded;
+    }
+
+    private Set<String> collectReachableMethodIds(List<EndpointPaths> endpointPaths) {
+        Set<String> reachable = new LinkedHashSet<String>();
+        for (EndpointPaths endpointPath : endpointPaths) {
+            if (endpointPath.paths.isEmpty()) {
+                reachable.add(endpointPath.entryMethodId);
+            }
+            for (List<String> path : endpointPath.paths) {
+                reachable.addAll(path);
+            }
+        }
+        return reachable;
     }
 
     private JavaModel parseJava(Path projectRoot) throws IOException {
@@ -1174,12 +1306,21 @@ public class SpringCallPathAnalyzer {
         public final Path outputDir;
         public final int maxDepth;
         public final int maxPathsPerEndpoint;
+        public final String endpointPath;
+        public final String entryMethod;
 
-        private CliOptions(Path projectRoot, Path outputDir, int maxDepth, int maxPathsPerEndpoint) {
+        private CliOptions(Path projectRoot,
+                           Path outputDir,
+                           int maxDepth,
+                           int maxPathsPerEndpoint,
+                           String endpointPath,
+                           String entryMethod) {
             this.projectRoot = projectRoot;
             this.outputDir = outputDir;
             this.maxDepth = maxDepth;
             this.maxPathsPerEndpoint = maxPathsPerEndpoint;
+            this.endpointPath = endpointPath;
+            this.entryMethod = entryMethod;
         }
 
         public static CliOptions parse(String[] args) {
@@ -1187,6 +1328,8 @@ public class SpringCallPathAnalyzer {
             Path outputDir = projectRoot.resolve("build/reports/spring-call-path");
             int maxDepth = 8;
             int maxPaths = 200;
+            String endpointPath = null;
+            String entryMethod = null;
 
             for (int i = 0; i < args.length; i++) {
                 String arg = args[i];
@@ -1198,10 +1341,73 @@ public class SpringCallPathAnalyzer {
                     maxDepth = Integer.parseInt(args[++i]);
                 } else if ("--max-paths".equals(arg) && i + 1 < args.length) {
                     maxPaths = Integer.parseInt(args[++i]);
+                } else if ("--endpoint".equals(arg) && i + 1 < args.length) {
+                    endpointPath = args[++i];
+                } else if ("--entry-method".equals(arg) && i + 1 < args.length) {
+                    entryMethod = args[++i];
                 }
             }
 
-            return new CliOptions(projectRoot, outputDir, maxDepth, maxPaths);
+            return new CliOptions(projectRoot, outputDir, maxDepth, maxPaths, endpointPath, entryMethod);
+        }
+    }
+
+    public static class MethodSelector {
+        public final String className;
+        public final String methodName;
+        public final Integer parameterCount;
+
+        public MethodSelector(String className, String methodName, Integer parameterCount) {
+            this.className = className;
+            this.methodName = methodName;
+            this.parameterCount = parameterCount;
+        }
+
+        public static MethodSelector parse(String raw) {
+            String value = raw == null ? "" : raw.trim();
+            String className = null;
+            String methodPart = value;
+            Integer parameterCount = null;
+
+            int hashIndex = value.lastIndexOf('#');
+            if (hashIndex >= 0) {
+                className = value.substring(0, hashIndex).trim();
+                methodPart = value.substring(hashIndex + 1).trim();
+            }
+
+            int slashIndex = methodPart.lastIndexOf('/');
+            if (slashIndex > 0 && slashIndex + 1 < methodPart.length()) {
+                String arity = methodPart.substring(slashIndex + 1).trim();
+                try {
+                    parameterCount = Integer.parseInt(arity);
+                    methodPart = methodPart.substring(0, slashIndex).trim();
+                } catch (NumberFormatException ignored) {
+                    parameterCount = null;
+                }
+            }
+
+            int parenIndex = methodPart.indexOf('(');
+            if (parenIndex > 0) {
+                methodPart = methodPart.substring(0, parenIndex).trim();
+            }
+
+            return new MethodSelector(className, methodPart, parameterCount);
+        }
+
+        public boolean matches(MethodModel method) {
+            if (!isBlank(className)) {
+                String methodClassName = method.className;
+                if (!className.equals(methodClassName) && !className.equals(simpleName(methodClassName))) {
+                    return false;
+                }
+            }
+            if (!isBlank(methodName) && !methodName.equals(method.name)) {
+                return false;
+            }
+            if (parameterCount != null && parameterCount.intValue() != method.parameterCount) {
+                return false;
+            }
+            return true;
         }
     }
 

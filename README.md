@@ -32,7 +32,8 @@ JDK 要求：`Java 8+`（当前项目以 `source/target 1.8` 编译）。
 
 ```bash
 mvn -q compile
-mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --max-depth 8 --max-paths 200"
+mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --max-depth 8 --max-paths 200 --endpoint /users/{id}"
+mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --entry-method com.example.api.UserService#findUser/1"
 ```
 
 参数说明：
@@ -41,6 +42,8 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path
 - `--out`：输出目录，默认 `build/reports/spring-call-path`
 - `--max-depth`：路径最大深度，默认 `8`
 - `--max-paths`：每个入口最多输出路径数，默认 `200`
+- `--endpoint`：仅分析某个接口路径（如 `/users/{id}`），默认分析全部接口
+- `--entry-method`：仅分析某个方法入口（如 `com.foo.UserService#getById/1` 或 `UserService#getById`）
 
 ## 示例
 
