@@ -821,7 +821,7 @@ public class SpringCallPathAnalyzer {
                 for (String targetClass : targetSet.targets) {
                     addResolvedTargets(
                             resolved,
-                            resolveMethodByName(targetClass, call, javaModel),
+                            resolveMethodInClassHierarchy(targetClass, call, javaModel),
                             targetSet.reasonSummary()
                     );
                 }
@@ -830,14 +830,14 @@ public class SpringCallPathAnalyzer {
                 if (localType != null) {
                     Set<String> localCandidates = resolveClassesByType(localType, javaModel);
                     for (String localCandidate : localCandidates) {
-                        addResolvedTargets(resolved, resolveMethodByName(localCandidate, call, javaModel), "JAVA:local-var");
+                        addResolvedTargets(resolved, resolveMethodInClassHierarchy(localCandidate, call, javaModel), "JAVA:local-var");
                     }
                 } else {
                     FieldModel fieldModel = classModel.fields.get(call.scopeToken);
                     if (fieldModel != null) {
                         Set<String> typeCandidates = resolveClassesByType(fieldModel.typeName, javaModel);
                         for (String typeCandidate : typeCandidates) {
-                            addResolvedTargets(resolved, resolveMethodByName(typeCandidate, call, javaModel), "JAVA:field-type");
+                            addResolvedTargets(resolved, resolveMethodInClassHierarchy(typeCandidate, call, javaModel), "JAVA:field-type");
                         }
                     }
                 }
@@ -861,10 +861,22 @@ public class SpringCallPathAnalyzer {
                     debugLogger.log("RESOLVE_CHAIN_SKIP from=%s scopeMethod=%s", methodModel.id, scopeCall.getKey());
                     continue;
                 }
-                for (String scopeType : resolveClassesByType(scopeMethod.returnTypeName, javaModel)) {
+                Set<String> receiverTypes = new LinkedHashSet<String>(resolveClassesByType(scopeMethod.returnTypeName, javaModel));
+                boolean genericFallback = receiverTypes.isEmpty() || isLikelyTypeVariable(scopeMethod.returnTypeName);
+                if (genericFallback) {
+                    receiverTypes.addAll(resolveClassesByType(scopeMethod.className, javaModel));
+                    debugLogger.log(
+                            "RESOLVE_CHAIN_FALLBACK from=%s scopeMethod=%s returnType=%s receivers=%s",
+                            methodModel.id,
+                            scopeCall.getKey(),
+                            scopeMethod.returnTypeName,
+                            receiverTypes
+                    );
+                }
+                for (String scopeType : receiverTypes) {
                     addResolvedTargets(
                             resolved,
-                            resolveMethodByName(scopeType, call, javaModel),
+                            resolveMethodInClassHierarchy(scopeType, call, javaModel),
                             "CHAIN:" + scopeCall.getValue()
                     );
                 }
@@ -989,29 +1001,34 @@ public class SpringCallPathAnalyzer {
     }
 
     private Set<String> resolveMethodInClassAndParents(ClassModel classModel, CallSite call, JavaModel javaModel) {
-        Set<String> resolved = new LinkedHashSet<>(resolveMethodByName(classModel.fqcn, call, javaModel));
-        String superType = classModel.superType;
-        Set<String> guard = new HashSet<>();
+        return resolveMethodInClassHierarchy(classModel.fqcn, call, javaModel);
+    }
 
-        while (superType != null && guard.add(superType)) {
-            Set<String> superCandidates = resolveClassesByType(superType, javaModel);
-            if (superCandidates.isEmpty()) {
-                break;
+    private Set<String> resolveMethodInClassHierarchy(String className, CallSite call, JavaModel javaModel) {
+        Set<String> resolved = new LinkedHashSet<String>();
+        Deque<String> stack = new ArrayDeque<String>();
+        Set<String> visited = new HashSet<String>();
+        stack.add(className);
+
+        while (!stack.isEmpty()) {
+            String currentClass = stack.removeFirst();
+            if (!visited.add(currentClass)) {
+                continue;
             }
-            boolean moved = false;
-            for (String superCandidate : superCandidates) {
-                resolved.addAll(resolveMethodByName(superCandidate, call, javaModel));
-                ClassModel superClass = javaModel.classesByName.get(superCandidate);
-                if (superClass != null && superClass.superType != null) {
-                    superType = superClass.superType;
-                    moved = true;
-                    break;
-                }
+            resolved.addAll(resolveMethodByName(currentClass, call, javaModel));
+
+            ClassModel currentModel = javaModel.classesByName.get(currentClass);
+            if (currentModel == null) {
+                continue;
             }
-            if (!moved) {
-                break;
+            if (!isBlank(currentModel.superType)) {
+                stack.addAll(resolveDirectTypeNames(currentModel.superType, javaModel));
+            }
+            for (String iface : currentModel.implementedTypes) {
+                stack.addAll(resolveDirectTypeNames(iface, javaModel));
             }
         }
+
         return resolved;
     }
 
@@ -1153,6 +1170,20 @@ public class SpringCallPathAnalyzer {
             normalized = parts[parts.length - 1];
         }
         return normalized;
+    }
+
+    private static boolean isLikelyTypeVariable(String typeName) {
+        String normalized = normalizeTypeName(typeName);
+        if (isBlank(normalized)) {
+            return false;
+        }
+        if (normalized.contains(".") || normalized.contains("$")) {
+            return false;
+        }
+        if (normalized.length() == 1 && Character.isUpperCase(normalized.charAt(0))) {
+            return true;
+        }
+        return normalized.matches("[A-Z][A-Z0-9_]*");
     }
 
     private static String simpleName(String fqcnOrSimple) {
