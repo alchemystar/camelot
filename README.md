@@ -25,6 +25,7 @@
 - 输出
   - `analysis-report.json`
   - `call-graph.dot`
+  - `external-dependency-tree.txt`（仅外部依赖分支）
 
 ## 运行
 
@@ -35,6 +36,7 @@ mvn -q compile
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --max-depth 8 --max-paths 200 --endpoint /users/{id}"
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --entry-method com.example.api.UserService#findUser/1"
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --entry-method com.example.api.UserService#findUser/1 --debug"
+mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-rpc-prefix com.partner.api --non-external-rpc-prefix com.mycorp --non-external-rpc-prefix com.mycorp.shared"
 ```
 
 参数说明：
@@ -47,6 +49,21 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path
 - `--entry-method`：仅分析某个方法入口（如 `com.foo.UserService#getById/1` 或 `UserService#getById`）
 - `--debug`：输出解析调试日志（默认写到输出目录下 `analysis-debug.log`）
 - `--debug-out`：指定调试日志文件路径
+- `--external-rpc-prefix`：强制判定为外部 RPC 的包前缀（仅对 jar 类生效；可重复传，支持 `a,b` / `a;b` / `[a,b]` / `["a","b"]`）
+- `--non-external-rpc-prefix`：强制判定为非外部 RPC 的包前缀（仅对 jar 类生效；可重复传，支持 `a,b` / `a;b` / `[a,b]` / `["a","b"]`）
+- `--internal-jar-prefix`：兼容旧参数，等价于 `--non-external-rpc-prefix`
+
+## 外部依赖识别
+
+会对调用边标记外部依赖类型（`DB` / `CACHE` / `RPC`），并生成树状文件 `external-dependency-tree.txt`：
+
+- `RPC`（重点）：thrift 生成类、来自 jar 的外部类（排除 `java.*` 等 JDK 标准库，且排除 `--non-external-rpc-prefix` 命中前缀）、`Feign/Rpc/Grpc/Client` 特征
+- 只有 jar 中的类才会应用这两个前缀规则；工程源码类即使命中前缀，也不会据此前缀判定外部 RPC
+- 前缀优先级：若同时命中两类前缀，`--non-external-rpc-prefix` 优先（视为非外部 RPC）
+- `DB`：`Repository/Dao/Mapper` 注解、类名、包名等特征
+- `CACHE`：`Cacheable/CachePut/CacheEvict` 注解、`cache/redis` 类名或包名特征
+
+树结构只保留“最终命中外部依赖”的分支，纯 Java 内部处理且不触达外部依赖的分支不会展示。
 
 ## 示例
 

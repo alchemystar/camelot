@@ -59,6 +59,8 @@ import java.util.stream.Stream;
 
 public class SpringCallPathAnalyzer {
     private DebugLogger debugLogger = DebugLogger.disabled();
+    private Set<String> externalRpcPrefixes = Collections.emptySet();
+    private Set<String> nonExternalRpcPrefixes = Collections.emptySet();
     private static final Set<String> COMPONENT_ANNOTATIONS = setOf(
             "Component", "Service", "Repository", "Controller", "RestController", "Configuration"
     );
@@ -82,21 +84,33 @@ public class SpringCallPathAnalyzer {
                 options.maxPathsPerEndpoint,
                 options.endpointPath,
                 options.entryMethod,
-                debugLogger
+                debugLogger,
+                options.externalRpcPrefixes,
+                options.nonExternalRpcPrefixes
         );
         Path jsonPath = options.outputDir.resolve("analysis-report.json");
         Path dotPath = options.outputDir.resolve("call-graph.dot");
+        Path dependencyTreePath = options.outputDir.resolve("external-dependency-tree.txt");
 
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         mapper.writeValue(jsonPath.toFile(), report);
         Files.write(dotPath, report.toDot().getBytes(StandardCharsets.UTF_8));
+        Files.write(dependencyTreePath, report.toDependencyTreeText().getBytes(StandardCharsets.UTF_8));
 
         System.out.println("Analysis finished.");
         System.out.println("JSON report: " + jsonPath.toAbsolutePath());
         System.out.println("DOT graph:   " + dotPath.toAbsolutePath());
+        System.out.println("Dep tree:    " + dependencyTreePath.toAbsolutePath());
         System.out.println("Endpoints:   " + report.endpoints.size());
         System.out.println("Methods:     " + report.methodDisplay.size());
         System.out.println("Edges:       " + report.edges.size());
+        System.out.println("Ext trees:   " + report.externalDependencyTrees.size());
+        if (!options.externalRpcPrefixes.isEmpty()) {
+            System.out.println("External RPC prefixes: " + options.externalRpcPrefixes);
+        }
+        if (!options.nonExternalRpcPrefixes.isEmpty()) {
+            System.out.println("Non-external RPC prefixes: " + options.nonExternalRpcPrefixes);
+        }
         if (!isBlank(options.endpointPath)) {
             System.out.println("Endpoint filter: " + options.endpointPath);
             if (report.endpoints.isEmpty()) {
@@ -116,14 +130,32 @@ public class SpringCallPathAnalyzer {
     }
 
     public AnalysisReport analyze(Path projectRoot, int maxDepth, int maxPathsPerEndpoint) throws IOException {
-        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, null, null, DebugLogger.disabled());
+        return analyze(
+                projectRoot,
+                maxDepth,
+                maxPathsPerEndpoint,
+                null,
+                null,
+                DebugLogger.disabled(),
+                Collections.<String>emptySet(),
+                Collections.<String>emptySet()
+        );
     }
 
     public AnalysisReport analyze(Path projectRoot,
                                   int maxDepth,
                                   int maxPathsPerEndpoint,
                                   String endpointPathFilter) throws IOException {
-        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, endpointPathFilter, null, DebugLogger.disabled());
+        return analyze(
+                projectRoot,
+                maxDepth,
+                maxPathsPerEndpoint,
+                endpointPathFilter,
+                null,
+                DebugLogger.disabled(),
+                Collections.<String>emptySet(),
+                Collections.<String>emptySet()
+        );
     }
 
     public AnalysisReport analyze(Path projectRoot,
@@ -131,7 +163,16 @@ public class SpringCallPathAnalyzer {
                                   int maxPathsPerEndpoint,
                                   String endpointPathFilter,
                                   String entryMethodFilter) throws IOException {
-        return analyze(projectRoot, maxDepth, maxPathsPerEndpoint, endpointPathFilter, entryMethodFilter, DebugLogger.disabled());
+        return analyze(
+                projectRoot,
+                maxDepth,
+                maxPathsPerEndpoint,
+                endpointPathFilter,
+                entryMethodFilter,
+                DebugLogger.disabled(),
+                Collections.<String>emptySet(),
+                Collections.<String>emptySet()
+        );
     }
 
     public AnalysisReport analyze(Path projectRoot,
@@ -140,13 +181,45 @@ public class SpringCallPathAnalyzer {
                                   String endpointPathFilter,
                                   String entryMethodFilter,
                                   DebugLogger debugLogger) throws IOException {
+        return analyze(
+                projectRoot,
+                maxDepth,
+                maxPathsPerEndpoint,
+                endpointPathFilter,
+                entryMethodFilter,
+                debugLogger,
+                Collections.<String>emptySet(),
+                Collections.<String>emptySet()
+        );
+    }
+
+    public AnalysisReport analyze(Path projectRoot,
+                                  int maxDepth,
+                                  int maxPathsPerEndpoint,
+                                  String endpointPathFilter,
+                                  String entryMethodFilter,
+                                  DebugLogger debugLogger,
+                                  Set<String> externalRpcPrefixes,
+                                  Set<String> nonExternalRpcPrefixes) throws IOException {
         DebugLogger previousLogger = this.debugLogger;
+        Set<String> previousExternalRpcPrefixes = this.externalRpcPrefixes;
+        Set<String> previousNonExternalRpcPrefixes = this.nonExternalRpcPrefixes;
         this.debugLogger = debugLogger == null ? DebugLogger.disabled() : debugLogger;
+        this.externalRpcPrefixes = normalizePackagePrefixes(externalRpcPrefixes);
+        this.nonExternalRpcPrefixes = normalizePackagePrefixes(nonExternalRpcPrefixes);
         try {
         JavaModel javaModel = parseJava(projectRoot);
         XmlModel xmlModel = parseXml(projectRoot);
-        this.debugLogger.log("START project=%s endpointFilter=%s entryMethodFilter=%s maxDepth=%d maxPaths=%d",
-                projectRoot.toAbsolutePath(), endpointPathFilter, entryMethodFilter, maxDepth, maxPathsPerEndpoint);
+        this.debugLogger.log(
+                "START project=%s endpointFilter=%s entryMethodFilter=%s maxDepth=%d maxPaths=%d externalRpcPrefixes=%s nonExternalRpcPrefixes=%s",
+                projectRoot.toAbsolutePath(),
+                endpointPathFilter,
+                entryMethodFilter,
+                maxDepth,
+                maxPathsPerEndpoint,
+                this.externalRpcPrefixes,
+                this.nonExternalRpcPrefixes
+        );
 
         BeanRegistry beanRegistry = buildBeanRegistry(javaModel, xmlModel);
         InjectionRegistry injectionRegistry = buildInjectionRegistry(javaModel, xmlModel, beanRegistry);
@@ -198,15 +271,26 @@ public class SpringCallPathAnalyzer {
                 }
             }
         }
+        for (CallEdge edge : filteredEdges) {
+            if (!methodDisplay.containsKey(edge.from)) {
+                methodDisplay.put(edge.from, toMethodDisplay(edge.from, methodsById));
+            }
+            if (!methodDisplay.containsKey(edge.to)) {
+                methodDisplay.put(edge.to, toMethodDisplay(edge.to, methodsById));
+            }
+        }
 
         return new AnalysisReport(
                 Instant.now().toString(),
                 projectRoot.toAbsolutePath().toString(),
                 methodDisplay,
                 filteredEdges,
-                endpointPaths
+                endpointPaths,
+                buildExternalDependencyTrees(endpointPaths, filteredEdges, methodDisplay)
         );
         } finally {
+            this.externalRpcPrefixes = previousExternalRpcPrefixes;
+            this.nonExternalRpcPrefixes = previousNonExternalRpcPrefixes;
             this.debugLogger = previousLogger;
         }
     }
@@ -282,6 +366,229 @@ public class SpringCallPathAnalyzer {
             }
         }
         return reachable;
+    }
+
+    private String toMethodDisplay(String methodId, Map<String, MethodModel> methodsById) {
+        MethodModel model = methodsById.get(methodId);
+        if (model != null) {
+            return model.display();
+        }
+        MethodIdInfo info = MethodIdInfo.parse(methodId);
+        if (info == null) {
+            return methodId;
+        }
+        return info.className + "#" + info.methodName + "(" + info.parameterCount + ") [external]";
+    }
+
+    private List<ExternalDependencyTree> buildExternalDependencyTrees(List<EndpointPaths> endpointPaths,
+                                                                      List<CallEdge> edges,
+                                                                      Map<String, String> methodDisplay) {
+        Map<String, CallEdge> edgeByKey = new LinkedHashMap<String, CallEdge>();
+        for (CallEdge edge : edges) {
+            edgeByKey.put(edge.from + "->" + edge.to, edge);
+        }
+
+        List<ExternalDependencyTree> trees = new ArrayList<ExternalDependencyTree>();
+        for (EndpointPaths endpointPath : endpointPaths) {
+            MutableDependencyNode root = new MutableDependencyNode(
+                    endpointPath.entryMethodId,
+                    methodDisplay.get(endpointPath.entryMethodId)
+            );
+            boolean hasExternalBranch = false;
+
+            for (List<String> path : endpointPath.paths) {
+                if (path == null || path.size() < 2) {
+                    continue;
+                }
+
+                int edgeCount = path.size() - 1;
+                boolean[] keepEdge = new boolean[edgeCount];
+                boolean downstreamExternal = false;
+
+                for (int i = edgeCount - 1; i >= 0; i--) {
+                    String from = path.get(i);
+                    String to = path.get(i + 1);
+                    CallEdge edge = edgeByKey.get(from + "->" + to);
+                    if (edge != null && !edge.externalDependencyTypes.isEmpty()) {
+                        downstreamExternal = true;
+                    }
+                    keepEdge[i] = downstreamExternal;
+                }
+
+                if (!downstreamExternal) {
+                    continue;
+                }
+                hasExternalBranch = true;
+
+                MutableDependencyNode current = root;
+                for (int i = 0; i < edgeCount; i++) {
+                    if (!keepEdge[i]) {
+                        continue;
+                    }
+                    String from = path.get(i);
+                    String to = path.get(i + 1);
+                    CallEdge edge = edgeByKey.get(from + "->" + to);
+                    List<String> dependencyTypes = edge == null ? listOf() : edge.externalDependencyTypes;
+                    String reason = edge == null ? "" : edge.reason;
+                    int line = edge == null ? -1 : edge.line;
+                    current = current.addChild(
+                            from,
+                            to,
+                            methodDisplay.get(to),
+                            dependencyTypes,
+                            reason,
+                            line
+                    );
+                }
+            }
+
+            if (!hasExternalBranch) {
+                continue;
+            }
+            trees.add(new ExternalDependencyTree(
+                    endpointPath.path,
+                    endpointPath.httpMethods,
+                    endpointPath.source,
+                    endpointPath.entryMethodId,
+                    root.toImmutable()
+            ));
+        }
+        debugLogger.log("EXTERNAL_DEP_TREES count=%d", trees.size());
+        return trees;
+    }
+
+    private List<String> classifyExternalDependencyTypes(String calleeMethodId,
+                                                         Map<String, MethodModel> methodsById,
+                                                         JavaModel javaModel) {
+        MethodModel calleeMethod = methodsById.get(calleeMethodId);
+        MethodIdInfo idInfo = MethodIdInfo.parse(calleeMethodId);
+        if (calleeMethod == null && idInfo == null) {
+            return listOf();
+        }
+
+        String className = calleeMethod != null ? calleeMethod.className : idInfo.className;
+        String simpleClassName = simpleName(className);
+        String packageName = "";
+        if (!isBlank(className) && className.contains(".")) {
+            packageName = className.substring(0, className.lastIndexOf('.')).toLowerCase(Locale.ROOT);
+        }
+        ClassModel calleeClass = javaModel.classesByName.get(className);
+        String methodName = calleeMethod != null ? calleeMethod.name : idInfo.methodName;
+
+        Set<String> classAnnotations = calleeClass == null ? Collections.<String>emptySet() : calleeClass.annotations;
+        Set<String> methodAnnotations = calleeMethod == null ? Collections.<String>emptySet() : calleeMethod.annotations;
+
+        boolean sourceClass = calleeClass != null;
+        boolean jarClass = !sourceClass && !isBlank(className);
+        boolean jdkClass = startsWithAnyIgnoreCase(className, "java.", "javax.", "jakarta.", "sun.");
+        boolean matchedExternalPrefix = startsWithAnyPrefixIgnoreCase(className, externalRpcPrefixes);
+        boolean matchedNonExternalPrefix = startsWithAnyPrefixIgnoreCase(className, nonExternalRpcPrefixes);
+        boolean forceExternalRpc = jarClass && matchedExternalPrefix;
+        boolean forceNonExternalRpc = jarClass && matchedNonExternalPrefix;
+        boolean thriftClass = containsAnyIgnoreCase(className, ".thrift.", "thrift.", "$client", "$iface")
+                || containsAnyIgnoreCase(simpleClassName, "Thrift", "Iface", "AsyncClient");
+
+        boolean db = false;
+        boolean cache = false;
+        boolean rpc = false;
+
+        if (classAnnotations.contains("Repository")
+                || classAnnotations.contains("Mapper")
+                || classAnnotations.contains("Dao")
+                || endsWithAnyIgnoreCase(simpleClassName, "Repository", "Repo", "Dao", "Mapper")
+                || containsAnyIgnoreCase(packageName, ".repo", ".repository", ".dao", ".mapper", ".mybatis")) {
+            db = true;
+        }
+
+        if (containsAnyIgnoreCase(simpleClassName, "Cache", "Redis", "Caffeine", "Ehcache", "Memcache")
+                || containsAnyIgnoreCase(packageName, ".cache", ".redis", ".caffeine", ".ehcache", ".memcache")
+                || methodAnnotations.contains("Cacheable")
+                || methodAnnotations.contains("CachePut")
+                || methodAnnotations.contains("CacheEvict")) {
+            cache = true;
+        }
+
+        if (classAnnotations.contains("FeignClient")
+                || containsAnyIgnoreCase(simpleClassName, "Feign", "Rpc", "Grpc", "Remote", "Gateway", "Client")
+                || containsAnyIgnoreCase(packageName, ".rpc", ".remote", ".feign", ".grpc", ".client", ".gateway")) {
+            rpc = true;
+        }
+        if (thriftClass) {
+            rpc = true;
+        }
+        if (jarClass && !jdkClass && !forceNonExternalRpc && !db && !cache) {
+            rpc = true;
+        }
+        if (forceExternalRpc) {
+            rpc = true;
+        }
+        if (forceNonExternalRpc) {
+            rpc = false;
+        }
+        if (forceExternalRpc && forceNonExternalRpc) {
+            debugLogger.log("RPC_PREFIX_CONFLICT class=%s external=%s nonExternal=%s",
+                    className,
+                    externalRpcPrefixes,
+                    nonExternalRpcPrefixes);
+        }
+        if (sourceClass && (matchedExternalPrefix || matchedNonExternalPrefix)) {
+            debugLogger.log("RPC_PREFIX_IGNORED_NON_JAR class=%s", className);
+        }
+
+        if (db && containsAnyIgnoreCase(methodName, "getFromCache", "cache")) {
+            cache = true;
+        }
+
+        List<String> kinds = new ArrayList<String>();
+        if (db) {
+            kinds.add("DB");
+        }
+        if (cache) {
+            kinds.add("CACHE");
+        }
+        if (rpc) {
+            kinds.add("RPC");
+        }
+        return kinds;
+    }
+
+    private static boolean endsWithAnyIgnoreCase(String raw, String... suffixes) {
+        if (raw == null) {
+            return false;
+        }
+        String lower = raw.toLowerCase(Locale.ROOT);
+        for (String suffix : suffixes) {
+            if (lower.endsWith(suffix.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsAnyIgnoreCase(String raw, String... tokens) {
+        if (raw == null) {
+            return false;
+        }
+        String lower = raw.toLowerCase(Locale.ROOT);
+        for (String token : tokens) {
+            if (lower.contains(token.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean startsWithAnyIgnoreCase(String raw, String... prefixes) {
+        if (raw == null) {
+            return false;
+        }
+        String lower = raw.toLowerCase(Locale.ROOT);
+        for (String prefix : prefixes) {
+            if (lower.startsWith(prefix.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private JavaModel parseJava(Path projectRoot) throws IOException {
@@ -782,9 +1089,25 @@ public class SpringCallPathAnalyzer {
             }
         }
 
-        List<CallEdge> edges = edgeMap.values().stream()
-                .map(a -> new CallEdge(a.from, a.to, String.join("|", a.reasons), a.line))
-                .collect(Collectors.toCollection(ArrayList::new));
+        List<CallEdge> edges = new ArrayList<CallEdge>();
+        for (CallEdgeAccumulator accumulator : edgeMap.values()) {
+            List<String> dependencyTypes = classifyExternalDependencyTypes(accumulator.to, methodsById, javaModel);
+            if (!dependencyTypes.isEmpty()) {
+                debugLogger.log(
+                        "EDGE_EXTERNAL from=%s to=%s types=%s",
+                        accumulator.from,
+                        accumulator.to,
+                        dependencyTypes
+                );
+            }
+            edges.add(new CallEdge(
+                    accumulator.from,
+                    accumulator.to,
+                    String.join("|", accumulator.reasons),
+                    accumulator.line,
+                    dependencyTypes
+            ));
+        }
         edges.sort(Comparator.comparing((CallEdge e) -> e.from).thenComparing(e -> e.to));
         debugLogger.log(
                 "CALL_GRAPH_SUMMARY callSites=%d resolvedCallSites=%d unresolvedCallSites=%d edges=%d",
@@ -828,14 +1151,14 @@ public class SpringCallPathAnalyzer {
             } else {
                 String localType = methodModel.visibleVariableTypes.get(call.scopeToken);
                 if (localType != null) {
-                    Set<String> localCandidates = resolveClassesByType(localType, javaModel);
+                    Set<String> localCandidates = resolveClassesByTypeWithContext(localType, javaModel, classModel);
                     for (String localCandidate : localCandidates) {
                         addResolvedTargets(resolved, resolveMethodInClassHierarchy(localCandidate, call, javaModel), "JAVA:local-var");
                     }
                 } else {
                     FieldModel fieldModel = classModel.fields.get(call.scopeToken);
                     if (fieldModel != null) {
-                        Set<String> typeCandidates = resolveClassesByType(fieldModel.typeName, javaModel);
+                        Set<String> typeCandidates = resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
                         for (String typeCandidate : typeCandidates) {
                             addResolvedTargets(resolved, resolveMethodInClassHierarchy(typeCandidate, call, javaModel), "JAVA:field-type");
                         }
@@ -861,8 +1184,15 @@ public class SpringCallPathAnalyzer {
                     debugLogger.log("RESOLVE_CHAIN_SKIP from=%s scopeMethod=%s", methodModel.id, scopeCall.getKey());
                     continue;
                 }
-                Set<String> receiverTypes = new LinkedHashSet<String>(resolveClassesByType(scopeMethod.returnTypeName, javaModel));
-                boolean genericFallback = receiverTypes.isEmpty() || isLikelyTypeVariable(scopeMethod.returnTypeName);
+                ClassModel scopeClassModel = javaModel.classesByName.get(scopeMethod.className);
+                Set<String> receiverTypes = new LinkedHashSet<String>(
+                        resolveClassesByTypeWithContext(scopeMethod.returnTypeName, javaModel, scopeClassModel)
+                );
+                boolean likelyTypeVariable = isLikelyTypeVariable(scopeMethod.returnTypeName);
+                if (likelyTypeVariable) {
+                    receiverTypes.clear();
+                }
+                boolean genericFallback = receiverTypes.isEmpty() || likelyTypeVariable;
                 if (genericFallback) {
                     receiverTypes.addAll(resolveClassesByType(scopeMethod.className, javaModel));
                     debugLogger.log(
@@ -1035,13 +1365,23 @@ public class SpringCallPathAnalyzer {
     private Set<String> resolveMethodByName(String className, CallSite call, JavaModel javaModel) {
         ClassModel target = javaModel.classesByName.get(className);
         if (target == null) {
-            return setOf();
+            if (isBlank(className)) {
+                return setOf();
+            }
+            return setOf(methodId(className, call.methodName, call.argumentCount));
         }
         List<MethodModel> methods = target.methodsByName.getOrDefault(call.methodName, listOf());
-        return methods.stream()
+        Set<String> exact = methods.stream()
                 .filter(m -> m.parameterCount == call.argumentCount)
                 .map(m -> m.id)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (!exact.isEmpty()) {
+            return exact;
+        }
+        if (methods.size() == 1) {
+            return setOf(methods.get(0).id);
+        }
+        return setOf();
     }
 
     private Set<String> resolveClassesByBeanId(String beanId, BeanRegistry beanRegistry, JavaModel javaModel) {
@@ -1083,6 +1423,43 @@ public class SpringCallPathAnalyzer {
                 }
             }
         }
+        return candidates;
+    }
+
+    private Set<String> resolveClassesByTypeWithContext(String typeName, JavaModel javaModel, ClassModel contextClass) {
+        Set<String> candidates = new LinkedHashSet<String>(resolveClassesByType(typeName, javaModel));
+        if (!candidates.isEmpty()) {
+            return candidates;
+        }
+
+        String normalized = normalizeTypeName(typeName);
+        if (isBlank(normalized)) {
+            return candidates;
+        }
+        if (normalized.contains(".")) {
+            candidates.add(normalized);
+            return candidates;
+        }
+
+        if (contextClass != null) {
+            String imported = contextClass.importContext.directImports.get(normalized);
+            if (!isBlank(imported)) {
+                candidates.add(imported);
+            }
+            for (String wildcard : contextClass.importContext.wildcardImports) {
+                if (!isBlank(wildcard)) {
+                    candidates.add(wildcard + "." + normalized);
+                }
+            }
+            if (!isBlank(contextClass.packageName)) {
+                String samePackageClass = contextClass.packageName + "." + normalized;
+                if (javaModel.classesByName.containsKey(samePackageClass)) {
+                    candidates.add(samePackageClass);
+                }
+            }
+        }
+
+        candidates.add("java.lang." + normalized);
         return candidates;
     }
 
@@ -1424,6 +1801,74 @@ public class SpringCallPathAnalyzer {
         return value == null || value.trim().isEmpty();
     }
 
+    private static Set<String> normalizePackagePrefixes(Collection<String> rawPrefixes) {
+        if (rawPrefixes == null || rawPrefixes.isEmpty()) {
+            return Collections.emptySet();
+        }
+        Set<String> normalized = new LinkedHashSet<String>();
+        for (String rawPrefix : rawPrefixes) {
+            if (isBlank(rawPrefix)) {
+                continue;
+            }
+            String value = rawPrefix.trim().toLowerCase(Locale.ROOT);
+            if (value.endsWith(".")) {
+                value = value.substring(0, value.length() - 1);
+            }
+            if (!isBlank(value)) {
+                normalized.add(value);
+            }
+        }
+        if (normalized.isEmpty()) {
+            return Collections.emptySet();
+        }
+        return Collections.unmodifiableSet(normalized);
+    }
+
+    private static void collectPackagePrefixes(Set<String> out, String raw) {
+        if (out == null || isBlank(raw)) {
+            return;
+        }
+        String prepared = raw.trim();
+        if ((prepared.startsWith("[") && prepared.endsWith("]"))
+                || (prepared.startsWith("(") && prepared.endsWith(")"))) {
+            prepared = prepared.substring(1, prepared.length() - 1).trim();
+        }
+
+        String[] tokens = prepared.split("[,;]");
+        if (tokens.length == 1 && prepared.contains(" ")) {
+            tokens = prepared.split("\\s+");
+        }
+
+        for (String token : tokens) {
+            String trimmed = token == null ? "" : token.trim();
+            if (trimmed.length() >= 2
+                    && ((trimmed.startsWith("\"") && trimmed.endsWith("\""))
+                    || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+                trimmed = trimmed.substring(1, trimmed.length() - 1).trim();
+            }
+            if (!isBlank(trimmed)) {
+                out.add(trimmed);
+            }
+        }
+    }
+
+    private static boolean startsWithAnyPrefixIgnoreCase(String raw, Collection<String> prefixes) {
+        if (isBlank(raw) || prefixes == null || prefixes.isEmpty()) {
+            return false;
+        }
+        String lower = raw.toLowerCase(Locale.ROOT);
+        for (String prefix : prefixes) {
+            if (isBlank(prefix)) {
+                continue;
+            }
+            String normalizedPrefix = prefix.toLowerCase(Locale.ROOT);
+            if (lower.equals(normalizedPrefix) || lower.startsWith(normalizedPrefix + ".")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @SafeVarargs
     private static <T> Set<T> setOf(T... values) {
         Set<T> set = new LinkedHashSet<T>();
@@ -1458,6 +1903,8 @@ public class SpringCallPathAnalyzer {
         public final String entryMethod;
         public final boolean debug;
         public final Path debugOut;
+        public final Set<String> externalRpcPrefixes;
+        public final Set<String> nonExternalRpcPrefixes;
 
         private CliOptions(Path projectRoot,
                            Path outputDir,
@@ -1466,7 +1913,9 @@ public class SpringCallPathAnalyzer {
                            String endpointPath,
                            String entryMethod,
                            boolean debug,
-                           Path debugOut) {
+                           Path debugOut,
+                           Set<String> externalRpcPrefixes,
+                           Set<String> nonExternalRpcPrefixes) {
             this.projectRoot = projectRoot;
             this.outputDir = outputDir;
             this.maxDepth = maxDepth;
@@ -1475,6 +1924,8 @@ public class SpringCallPathAnalyzer {
             this.entryMethod = entryMethod;
             this.debug = debug;
             this.debugOut = debugOut;
+            this.externalRpcPrefixes = externalRpcPrefixes;
+            this.nonExternalRpcPrefixes = nonExternalRpcPrefixes;
         }
 
         public static CliOptions parse(String[] args) {
@@ -1486,6 +1937,8 @@ public class SpringCallPathAnalyzer {
             String entryMethod = null;
             boolean debug = false;
             Path debugOut = null;
+            Set<String> externalRpcPrefixes = new LinkedHashSet<String>();
+            Set<String> nonExternalRpcPrefixes = new LinkedHashSet<String>();
 
             for (int i = 0; i < args.length; i++) {
                 String arg = args[i];
@@ -1505,10 +1958,28 @@ public class SpringCallPathAnalyzer {
                     debug = true;
                 } else if ("--debug-out".equals(arg) && i + 1 < args.length) {
                     debugOut = Paths.get(args[++i]).toAbsolutePath().normalize();
+                } else if ("--external-rpc-prefix".equals(arg) && i + 1 < args.length) {
+                    collectPackagePrefixes(externalRpcPrefixes, args[++i]);
+                } else if ("--non-external-rpc-prefix".equals(arg) && i + 1 < args.length) {
+                    collectPackagePrefixes(nonExternalRpcPrefixes, args[++i]);
+                } else if ("--internal-jar-prefix".equals(arg) && i + 1 < args.length) {
+                    // Backward compatible alias of --non-external-rpc-prefix
+                    collectPackagePrefixes(nonExternalRpcPrefixes, args[++i]);
                 }
             }
 
-            return new CliOptions(projectRoot, outputDir, maxDepth, maxPaths, endpointPath, entryMethod, debug, debugOut);
+            return new CliOptions(
+                    projectRoot,
+                    outputDir,
+                    maxDepth,
+                    maxPaths,
+                    endpointPath,
+                    entryMethod,
+                    debug,
+                    debugOut,
+                    normalizePackagePrefixes(externalRpcPrefixes),
+                    normalizePackagePrefixes(nonExternalRpcPrefixes)
+            );
         }
     }
 
@@ -1571,23 +2042,58 @@ public class SpringCallPathAnalyzer {
         }
     }
 
+    public static class MethodIdInfo {
+        public final String className;
+        public final String methodName;
+        public final int parameterCount;
+
+        public MethodIdInfo(String className, String methodName, int parameterCount) {
+            this.className = className;
+            this.methodName = methodName;
+            this.parameterCount = parameterCount;
+        }
+
+        public static MethodIdInfo parse(String methodId) {
+            if (isBlank(methodId)) {
+                return null;
+            }
+            int hashIndex = methodId.lastIndexOf('#');
+            int slashIndex = methodId.lastIndexOf('/');
+            if (hashIndex <= 0 || slashIndex <= hashIndex) {
+                return null;
+            }
+            String className = methodId.substring(0, hashIndex);
+            String methodName = methodId.substring(hashIndex + 1, slashIndex);
+            String arityRaw = methodId.substring(slashIndex + 1);
+            try {
+                int arity = Integer.parseInt(arityRaw);
+                return new MethodIdInfo(className, methodName, arity);
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+    }
+
     public static class AnalysisReport {
         public final String generatedAt;
         public final String projectRoot;
         public final Map<String, String> methodDisplay;
         public final List<CallEdge> edges;
         public final List<EndpointPaths> endpoints;
+        public final List<ExternalDependencyTree> externalDependencyTrees;
 
         public AnalysisReport(String generatedAt,
                               String projectRoot,
                               Map<String, String> methodDisplay,
                               List<CallEdge> edges,
-                              List<EndpointPaths> endpoints) {
+                              List<EndpointPaths> endpoints,
+                              List<ExternalDependencyTree> externalDependencyTrees) {
             this.generatedAt = generatedAt;
             this.projectRoot = projectRoot;
             this.methodDisplay = methodDisplay;
             this.edges = edges;
             this.endpoints = endpoints;
+            this.externalDependencyTrees = externalDependencyTrees;
         }
 
         public String toDot() {
@@ -1620,6 +2126,45 @@ public class SpringCallPathAnalyzer {
             return sb.toString();
         }
 
+        public String toDependencyTreeText() {
+            if (externalDependencyTrees == null || externalDependencyTrees.isEmpty()) {
+                return "No external dependencies detected.\n";
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (ExternalDependencyTree tree : externalDependencyTrees) {
+                sb.append("Entry: ")
+                        .append(tree.path)
+                        .append(" [")
+                        .append(String.join(",", tree.httpMethods))
+                        .append("] source=")
+                        .append(tree.source)
+                        .append("\n");
+                appendDependencyNode(sb, tree.root, "  ");
+                sb.append("\n");
+            }
+            return sb.toString();
+        }
+
+        private void appendDependencyNode(StringBuilder sb, DependencyNode node, String indent) {
+            if (node == null) {
+                return;
+            }
+            String display = node.methodDisplay == null ? node.methodId : node.methodDisplay;
+            sb.append(indent).append(display).append("\n");
+            for (DependencyEdge edge : node.children) {
+                sb.append(indent).append("  -> ").append(edge.toMethodDisplay == null ? edge.toMethodId : edge.toMethodDisplay);
+                if (!edge.externalDependencyTypes.isEmpty()) {
+                    sb.append(" [").append(String.join(",", edge.externalDependencyTypes)).append("]");
+                }
+                if (!isBlank(edge.callReason)) {
+                    sb.append(" {").append(edge.callReason).append("}");
+                }
+                sb.append("\n");
+                appendDependencyNode(sb, edge.child, indent + "    ");
+            }
+        }
+
         private static String escape(String raw) {
             return raw.replace("\\", "\\\\").replace("\"", "\\\"");
         }
@@ -1645,17 +2190,77 @@ public class SpringCallPathAnalyzer {
         }
     }
 
+    public static class ExternalDependencyTree {
+        public final String path;
+        public final List<String> httpMethods;
+        public final String source;
+        public final String entryMethodId;
+        public final DependencyNode root;
+
+        public ExternalDependencyTree(String path,
+                                      List<String> httpMethods,
+                                      String source,
+                                      String entryMethodId,
+                                      DependencyNode root) {
+            this.path = path;
+            this.httpMethods = httpMethods;
+            this.source = source;
+            this.entryMethodId = entryMethodId;
+            this.root = root;
+        }
+    }
+
+    public static class DependencyNode {
+        public final String methodId;
+        public final String methodDisplay;
+        public final List<DependencyEdge> children;
+
+        public DependencyNode(String methodId, String methodDisplay, List<DependencyEdge> children) {
+            this.methodId = methodId;
+            this.methodDisplay = methodDisplay;
+            this.children = children;
+        }
+    }
+
+    public static class DependencyEdge {
+        public final String fromMethodId;
+        public final String toMethodId;
+        public final String toMethodDisplay;
+        public final List<String> externalDependencyTypes;
+        public final String callReason;
+        public final int line;
+        public final DependencyNode child;
+
+        public DependencyEdge(String fromMethodId,
+                              String toMethodId,
+                              String toMethodDisplay,
+                              List<String> externalDependencyTypes,
+                              String callReason,
+                              int line,
+                              DependencyNode child) {
+            this.fromMethodId = fromMethodId;
+            this.toMethodId = toMethodId;
+            this.toMethodDisplay = toMethodDisplay;
+            this.externalDependencyTypes = externalDependencyTypes;
+            this.callReason = callReason;
+            this.line = line;
+            this.child = child;
+        }
+    }
+
     public static class CallEdge {
         public final String from;
         public final String to;
         public final String reason;
         public final int line;
+        public final List<String> externalDependencyTypes;
 
-        public CallEdge(String from, String to, String reason, int line) {
+        public CallEdge(String from, String to, String reason, int line, List<String> externalDependencyTypes) {
             this.from = from;
             this.to = to;
             this.reason = reason;
             this.line = line;
+            this.externalDependencyTypes = externalDependencyTypes == null ? listOf() : externalDependencyTypes;
         }
     }
 
@@ -1814,6 +2419,79 @@ public class SpringCallPathAnalyzer {
             this.from = from;
             this.to = to;
             this.line = line;
+        }
+    }
+
+    private static class MutableDependencyNode {
+        private final String methodId;
+        private final String methodDisplay;
+        private final Map<String, MutableDependencyEdge> childrenByTarget = new LinkedHashMap<String, MutableDependencyEdge>();
+
+        private MutableDependencyNode(String methodId, String methodDisplay) {
+            this.methodId = methodId;
+            this.methodDisplay = methodDisplay;
+        }
+
+        private MutableDependencyNode addChild(String fromMethodId,
+                                               String toMethodId,
+                                               String toMethodDisplay,
+                                               List<String> dependencyTypes,
+                                               String callReason,
+                                               int line) {
+            MutableDependencyEdge edge = childrenByTarget.get(toMethodId);
+            if (edge == null) {
+                edge = new MutableDependencyEdge(
+                        fromMethodId,
+                        toMethodId,
+                        toMethodDisplay,
+                        callReason,
+                        line
+                );
+                childrenByTarget.put(toMethodId, edge);
+            }
+            if (dependencyTypes != null) {
+                edge.externalDependencyTypes.addAll(dependencyTypes);
+            }
+            return edge.child;
+        }
+
+        private DependencyNode toImmutable() {
+            List<DependencyEdge> children = new ArrayList<DependencyEdge>();
+            for (MutableDependencyEdge edge : childrenByTarget.values()) {
+                children.add(new DependencyEdge(
+                        edge.fromMethodId,
+                        edge.toMethodId,
+                        edge.toMethodDisplay,
+                        new ArrayList<String>(edge.externalDependencyTypes),
+                        edge.callReason,
+                        edge.line,
+                        edge.child.toImmutable()
+                ));
+            }
+            return new DependencyNode(methodId, methodDisplay, children);
+        }
+    }
+
+    private static class MutableDependencyEdge {
+        private final String fromMethodId;
+        private final String toMethodId;
+        private final String toMethodDisplay;
+        private final Set<String> externalDependencyTypes = new LinkedHashSet<String>();
+        private final String callReason;
+        private final int line;
+        private final MutableDependencyNode child;
+
+        private MutableDependencyEdge(String fromMethodId,
+                                      String toMethodId,
+                                      String toMethodDisplay,
+                                      String callReason,
+                                      int line) {
+            this.fromMethodId = fromMethodId;
+            this.toMethodId = toMethodId;
+            this.toMethodDisplay = toMethodDisplay;
+            this.callReason = callReason;
+            this.line = line;
+            this.child = new MutableDependencyNode(toMethodId, toMethodDisplay);
         }
     }
 
