@@ -28,6 +28,8 @@
 
 ## 运行
 
+JDK 要求：`Java 8+`（当前项目以 `source/target 1.8` 编译）。
+
 ```bash
 mvn -q compile
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --max-depth 8 --max-paths 200"
@@ -60,4 +62,3 @@ mvn -q exec:java -Dexec.args="--project ./examples/demo-spring-app --out ./build
 - 未处理反射、动态代理细节、SpEL、运行时条件装配
 - 对局部变量类型、重载解析、跨模块依赖解析是“启发式”而非完整类型系统
 - `@Bean` 方法产出的 Bean 与复杂 AOP/事务织入尚未完整建模
-

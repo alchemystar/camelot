@@ -34,9 +34,11 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
@@ -55,11 +57,11 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class SpringCallPathAnalyzer {
-    private static final Set<String> COMPONENT_ANNOTATIONS = Set.of(
+    private static final Set<String> COMPONENT_ANNOTATIONS = setOf(
             "Component", "Service", "Repository", "Controller", "RestController", "Configuration"
     );
-    private static final Set<String> INJECTION_ANNOTATIONS = Set.of("Autowired", "Inject", "Resource");
-    private static final Set<String> REQUEST_MAPPING_ANNOTATIONS = Set.of(
+    private static final Set<String> INJECTION_ANNOTATIONS = setOf("Autowired", "Inject", "Resource");
+    private static final Set<String> REQUEST_MAPPING_ANNOTATIONS = setOf(
             "RequestMapping", "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping"
     );
 
@@ -123,7 +125,7 @@ public class SpringCallPathAnalyzer {
                     .filter(Files::isRegularFile)
                     .filter(p -> p.toString().endsWith(".java"))
                     .sorted()
-                    .toList();
+                    .collect(Collectors.toList());
         }
 
         for (Path javaFile : javaFiles) {
@@ -136,15 +138,16 @@ public class SpringCallPathAnalyzer {
             ImportContext importContext = ImportContext.from(cu, packageName);
 
             for (TypeDeclaration<?> typeDeclaration : cu.getTypes()) {
-                if (!(typeDeclaration instanceof ClassOrInterfaceDeclaration declaration)) {
+                if (!(typeDeclaration instanceof ClassOrInterfaceDeclaration)) {
                     continue;
                 }
+                ClassOrInterfaceDeclaration declaration = (ClassOrInterfaceDeclaration) typeDeclaration;
                 String simpleName = declaration.getNameAsString();
-                String fqcn = packageName.isBlank() ? simpleName : packageName + "." + simpleName;
+                String fqcn = isBlank(packageName) ? simpleName : packageName + "." + simpleName;
 
                 ClassModel classModel = new ClassModel(fqcn, simpleName, packageName, importContext);
                 classModel.annotations.addAll(annotationNames(declaration));
-                classModel.implementedTypes.addAll(declaration.getImplementedTypes().stream().map(t -> t.asString()).toList());
+                classModel.implementedTypes.addAll(declaration.getImplementedTypes().stream().map(t -> t.asString()).collect(Collectors.toList()));
                 declaration.getExtendedTypes().stream().findFirst().ifPresent(t -> classModel.superType = t.asString());
                 classModel.beanNameFromAnnotation = extractBeanNameFromStereotype(declaration).orElse(null);
                 classModel.classRequestPaths.addAll(extractPathsFromAnnotations(declaration.getAnnotations()));
@@ -160,22 +163,24 @@ public class SpringCallPathAnalyzer {
                 }
 
                 for (ConstructorDeclaration constructor : declaration.getConstructors()) {
-                    boolean autowiredCtor = hasAnyAnnotation(constructor, Set.of("Autowired", "Inject"));
+                    boolean autowiredCtor = hasAnyAnnotation(constructor, setOf("Autowired", "Inject"));
                     if (!autowiredCtor && declaration.getConstructors().size() != 1) {
                         continue;
                     }
                     Map<String, String> paramTypes = constructor.getParameters().stream()
                             .collect(Collectors.toMap(Parameter::getNameAsString, p -> p.getType().asString(), (a, b) -> a));
                     for (AssignExpr assignExpr : constructor.findAll(AssignExpr.class)) {
-                        if (!(assignExpr.getTarget() instanceof FieldAccessExpr fa)) {
+                        if (!(assignExpr.getTarget() instanceof FieldAccessExpr)) {
                             continue;
                         }
+                        FieldAccessExpr fa = (FieldAccessExpr) assignExpr.getTarget();
                         if (!(fa.getScope() instanceof ThisExpr)) {
                             continue;
                         }
-                        if (!(assignExpr.getValue() instanceof NameExpr ne)) {
+                        if (!(assignExpr.getValue() instanceof NameExpr)) {
                             continue;
                         }
+                        NameExpr ne = (NameExpr) assignExpr.getValue();
                         String paramType = paramTypes.get(ne.getNameAsString());
                         if (paramType != null) {
                             classModel.constructorInjectedFieldTypes.put(fa.getNameAsString(), paramType);
@@ -230,13 +235,16 @@ public class SpringCallPathAnalyzer {
             Expression scope = callExpr.getScope().get();
             if (scope instanceof ThisExpr) {
                 scopeType = ScopeType.THIS;
-            } else if (scope instanceof NameExpr nameExpr) {
+            } else if (scope instanceof NameExpr) {
+                NameExpr nameExpr = (NameExpr) scope;
                 scopeType = ScopeType.NAME;
                 scopeToken = nameExpr.getNameAsString();
-            } else if (scope instanceof FieldAccessExpr fieldAccessExpr && fieldAccessExpr.getScope() instanceof ThisExpr) {
+            } else if (scope instanceof FieldAccessExpr && ((FieldAccessExpr) scope).getScope() instanceof ThisExpr) {
+                FieldAccessExpr fieldAccessExpr = (FieldAccessExpr) scope;
                 scopeType = ScopeType.NAME;
                 scopeToken = fieldAccessExpr.getNameAsString();
-            } else if (scope instanceof MethodCallExpr nestedCallExpr) {
+            } else if (scope instanceof MethodCallExpr) {
+                MethodCallExpr nestedCallExpr = (MethodCallExpr) scope;
                 scopeType = ScopeType.METHOD_CALL;
                 scopeCall = toCallSite(nestedCallExpr);
             }
@@ -257,7 +265,7 @@ public class SpringCallPathAnalyzer {
                     .filter(Files::isRegularFile)
                     .filter(p -> p.toString().endsWith(".xml"))
                     .sorted()
-                    .toList();
+                    .collect(Collectors.toList());
         }
 
         for (Path xml : xmlFiles) {
@@ -270,30 +278,32 @@ public class SpringCallPathAnalyzer {
 
             NodeList aliases = doc.getElementsByTagName("alias");
             for (int i = 0; i < aliases.getLength(); i++) {
-                if (!(aliases.item(i) instanceof Element alias)) {
+                if (!(aliases.item(i) instanceof Element)) {
                     continue;
                 }
+                Element alias = (Element) aliases.item(i);
                 String name = alias.getAttribute("name");
                 String aliasName = alias.getAttribute("alias");
-                if (!name.isBlank() && !aliasName.isBlank()) {
+                if (!isBlank(name) && !isBlank(aliasName)) {
                     model.aliasToName.put(aliasName, name);
                 }
             }
 
             NodeList beans = doc.getElementsByTagName("bean");
             for (int i = 0; i < beans.getLength(); i++) {
-                if (!(beans.item(i) instanceof Element bean)) {
+                if (!(beans.item(i) instanceof Element)) {
                     continue;
                 }
+                Element bean = (Element) beans.item(i);
                 String beanId = bean.getAttribute("id");
-                if (beanId.isBlank()) {
+                if (isBlank(beanId)) {
                     String nameAttr = bean.getAttribute("name");
-                    if (!nameAttr.isBlank()) {
+                    if (!isBlank(nameAttr)) {
                         beanId = nameAttr.split("[,;\\s]")[0];
                     }
                 }
                 String className = bean.getAttribute("class");
-                if (!beanId.isBlank() && !className.isBlank()) {
+                if (!isBlank(beanId) && !isBlank(className)) {
                     model.beansById.put(beanId, className);
                 }
 
@@ -304,45 +314,48 @@ public class SpringCallPathAnalyzer {
 
                 NodeList properties = bean.getElementsByTagName("property");
                 for (int j = 0; j < properties.getLength(); j++) {
-                    if (!(properties.item(j) instanceof Element property)) {
+                    if (!(properties.item(j) instanceof Element)) {
                         continue;
                     }
+                    Element property = (Element) properties.item(j);
                     String name = property.getAttribute("name");
                     String ref = property.getAttribute("ref");
-                    if (ref.isBlank()) {
+                    if (isBlank(ref)) {
                         NodeList refs = property.getElementsByTagName("ref");
                         for (int k = 0; k < refs.getLength(); k++) {
-                            if (!(refs.item(k) instanceof Element refElement)) {
+                            if (!(refs.item(k) instanceof Element)) {
                                 continue;
                             }
+                            Element refElement = (Element) refs.item(k);
                             ref = refElement.getAttribute("bean");
-                            if (ref.isBlank()) {
+                            if (isBlank(ref)) {
                                 ref = refElement.getAttribute("local");
                             }
-                            if (!ref.isBlank()) {
+                            if (!isBlank(ref)) {
                                 break;
                             }
                         }
                     }
-                    if (!beanId.isBlank() && !name.isBlank() && !ref.isBlank()) {
+                    if (!isBlank(beanId) && !isBlank(name) && !isBlank(ref)) {
                         model.propertyRefs.add(new XmlPropertyRef(beanId, name, ref));
                     }
                 }
 
                 NodeList constructorArgs = bean.getElementsByTagName("constructor-arg");
                 for (int j = 0; j < constructorArgs.getLength(); j++) {
-                    if (!(constructorArgs.item(j) instanceof Element ctorArg)) {
+                    if (!(constructorArgs.item(j) instanceof Element)) {
                         continue;
                     }
+                    Element ctorArg = (Element) constructorArgs.item(j);
                     String ref = ctorArg.getAttribute("ref");
-                    if (ref.isBlank()) {
+                    if (isBlank(ref)) {
                         continue;
                     }
                     String name = ctorArg.getAttribute("name");
-                    if (name.isBlank()) {
+                    if (isBlank(name)) {
                         name = "$ctor$" + ctorArg.getAttribute("index");
                     }
-                    if (!beanId.isBlank()) {
+                    if (!isBlank(beanId)) {
                         model.propertyRefs.add(new XmlPropertyRef(beanId, name, ref));
                     }
                 }
@@ -356,33 +369,36 @@ public class SpringCallPathAnalyzer {
         List<XmlUrlMapping> mappings = new ArrayList<>();
         NodeList properties = mappingBean.getElementsByTagName("property");
         for (int i = 0; i < properties.getLength(); i++) {
-            if (!(properties.item(i) instanceof Element property)) {
+            if (!(properties.item(i) instanceof Element)) {
                 continue;
             }
+            Element property = (Element) properties.item(i);
             if (!"urlMap".equals(property.getAttribute("name"))) {
                 continue;
             }
 
             NodeList entries = property.getElementsByTagName("entry");
             for (int j = 0; j < entries.getLength(); j++) {
-                if (!(entries.item(j) instanceof Element entry)) {
+                if (!(entries.item(j) instanceof Element)) {
                     continue;
                 }
+                Element entry = (Element) entries.item(j);
                 String path = entry.getAttribute("key");
                 String beanRef = entry.getAttribute("value-ref");
-                if (!path.isBlank() && !beanRef.isBlank()) {
+                if (!isBlank(path) && !isBlank(beanRef)) {
                     mappings.add(new XmlUrlMapping(path, beanRef));
                 }
             }
 
             NodeList props = property.getElementsByTagName("prop");
             for (int j = 0; j < props.getLength(); j++) {
-                if (!(props.item(j) instanceof Element prop)) {
+                if (!(props.item(j) instanceof Element)) {
                     continue;
                 }
+                Element prop = (Element) props.item(j);
                 String path = prop.getAttribute("key");
                 String beanRef = prop.getTextContent() == null ? "" : prop.getTextContent().trim();
-                if (!path.isBlank() && !beanRef.isBlank()) {
+                if (!isBlank(path) && !isBlank(beanRef)) {
                     mappings.add(new XmlUrlMapping(path, beanRef));
                 }
             }
@@ -396,7 +412,7 @@ public class SpringCallPathAnalyzer {
         for (ClassModel classModel : javaModel.classesByName.values()) {
             if (classModel.isComponent()) {
                 String beanId = classModel.beanNameFromAnnotation;
-                if (beanId == null || beanId.isBlank()) {
+                if (beanId == null || isBlank(beanId)) {
                     beanId = decapitalize(classModel.simpleName);
                 }
                 registry.beanIdToClasses.computeIfAbsent(beanId, k -> new LinkedHashSet<>()).add(classModel.fqcn);
@@ -424,7 +440,7 @@ public class SpringCallPathAnalyzer {
 
                 if (isResource) {
                     String resourceName = fieldModel.resourceName;
-                    if (resourceName == null || resourceName.isBlank()) {
+                    if (resourceName == null || isBlank(resourceName)) {
                         resourceName = fieldModel.name;
                     }
                     Set<String> byBean = resolveClassesByBeanId(resourceName, beanRegistry, javaModel);
@@ -521,7 +537,7 @@ public class SpringCallPathAnalyzer {
                                                       InjectionRegistry injectionRegistry,
                                                       int depth) {
         if (depth > 6) {
-            return Map.of();
+            return Collections.emptyMap();
         }
 
         Map<String, String> resolved = new LinkedHashMap<>();
@@ -531,7 +547,7 @@ public class SpringCallPathAnalyzer {
         }
 
         if (call.scopeType == ScopeType.NAME && call.scopeToken != null) {
-            Map<String, TargetSet> classTargets = injectionRegistry.targetsByClass.getOrDefault(classModel.fqcn, Map.of());
+            Map<String, TargetSet> classTargets = injectionRegistry.targetsByClass.getOrDefault(classModel.fqcn, Collections.emptyMap());
             TargetSet targetSet = classTargets.get(call.scopeToken);
             if (targetSet != null && !targetSet.targets.isEmpty()) {
                 for (String targetClass : targetSet.targets) {
@@ -606,8 +622,8 @@ public class SpringCallPathAnalyzer {
                 if (!methodMapped) {
                     continue;
                 }
-                List<String> methodPaths = method.requestPaths.isEmpty() ? List.of("") : method.requestPaths;
-                List<String> classPaths = classModel.classRequestPaths.isEmpty() ? List.of("") : classModel.classRequestPaths;
+                List<String> methodPaths = method.requestPaths.isEmpty() ? listOf("") : method.requestPaths;
+                List<String> classPaths = classModel.classRequestPaths.isEmpty() ? listOf("") : classModel.classRequestPaths;
                 Set<String> httpMethods = new LinkedHashSet<>();
                 httpMethods.addAll(classModel.classHttpMethods);
                 httpMethods.addAll(method.httpMethods);
@@ -632,11 +648,11 @@ public class SpringCallPathAnalyzer {
                 if (classModel == null) {
                     continue;
                 }
-                Optional<MethodModel> entryMethod = classModel.methodsByName.getOrDefault("handleRequest", List.of()).stream().findFirst();
+                Optional<MethodModel> entryMethod = classModel.methodsByName.getOrDefault("handleRequest", listOf()).stream().findFirst();
                 if (entryMethod.isEmpty()) {
                     entryMethod = classModel.methodsByName.values().stream().flatMap(Collection::stream).findFirst();
                 }
-                entryMethod.ifPresent(methodModel -> endpoints.add(new Endpoint(mapping.path, List.of("ANY"), "XML", methodModel.id)));
+                entryMethod.ifPresent(methodModel -> endpoints.add(new Endpoint(mapping.path, listOf("ANY"), "XML", methodModel.id)));
             }
         }
 
@@ -669,7 +685,7 @@ public class SpringCallPathAnalyzer {
         currentPath.addLast(methodId);
         visiting.add(methodId);
 
-        List<CallEdge> outgoing = edgesFrom.getOrDefault(methodId, List.of());
+        List<CallEdge> outgoing = edgesFrom.getOrDefault(methodId, listOf());
         boolean hasNext = false;
 
         if (depthLeft > 0) {
@@ -723,9 +739,9 @@ public class SpringCallPathAnalyzer {
     private Set<String> resolveMethodByName(String className, CallSite call, JavaModel javaModel) {
         ClassModel target = javaModel.classesByName.get(className);
         if (target == null) {
-            return Set.of();
+            return setOf();
         }
-        List<MethodModel> methods = target.methodsByName.getOrDefault(call.methodName, List.of());
+        List<MethodModel> methods = target.methodsByName.getOrDefault(call.methodName, listOf());
         return methods.stream()
                 .filter(m -> m.parameterCount == call.argumentCount)
                 .map(m -> m.id)
@@ -733,11 +749,11 @@ public class SpringCallPathAnalyzer {
     }
 
     private Set<String> resolveClassesByBeanId(String beanId, BeanRegistry beanRegistry, JavaModel javaModel) {
-        if (beanId == null || beanId.isBlank()) {
-            return Set.of();
+        if (beanId == null || isBlank(beanId)) {
+            return setOf();
         }
         String resolvedBeanId = resolveAlias(beanId, beanRegistry.aliasToName);
-        Set<String> classes = beanRegistry.beanIdToClasses.getOrDefault(resolvedBeanId, Set.of());
+        Set<String> classes = beanRegistry.beanIdToClasses.getOrDefault(resolvedBeanId, setOf());
         if (!classes.isEmpty()) {
             return classes;
         }
@@ -748,18 +764,18 @@ public class SpringCallPathAnalyzer {
         }
 
         String decapitalized = decapitalize(beanId);
-        return beanRegistry.beanIdToClasses.getOrDefault(decapitalized, Set.of());
+        return beanRegistry.beanIdToClasses.getOrDefault(decapitalized, setOf());
     }
 
     private Set<String> resolveClassesByType(String typeName, JavaModel javaModel) {
         String normalized = normalizeTypeName(typeName);
-        if (normalized.isBlank()) {
-            return Set.of();
+        if (isBlank(normalized)) {
+            return setOf();
         }
 
         Set<String> roots = resolveDirectTypeNames(normalized, javaModel);
         if (roots.isEmpty() && normalized.contains(".")) {
-            roots = Set.of(normalized);
+            roots = setOf(normalized);
         }
 
         Set<String> candidates = new LinkedHashSet<>(roots);
@@ -814,15 +830,15 @@ public class SpringCallPathAnalyzer {
 
     private Set<String> resolveDirectTypeNames(String typeName, JavaModel javaModel) {
         String normalized = normalizeTypeName(typeName);
-        if (normalized.isBlank()) {
-            return Set.of();
+        if (isBlank(normalized)) {
+            return setOf();
         }
         Set<String> direct = new LinkedHashSet<>();
         if (normalized.contains(".")) {
             direct.add(normalized);
-            direct.addAll(javaModel.simpleToFqcn.getOrDefault(simpleName(normalized), Set.of()));
+            direct.addAll(javaModel.simpleToFqcn.getOrDefault(simpleName(normalized), setOf()));
         } else {
-            direct.addAll(javaModel.simpleToFqcn.getOrDefault(normalized, Set.of()));
+            direct.addAll(javaModel.simpleToFqcn.getOrDefault(normalized, setOf()));
         }
         return direct;
     }
@@ -891,8 +907,8 @@ public class SpringCallPathAnalyzer {
             if (!COMPONENT_ANNOTATIONS.contains(annName)) {
                 continue;
             }
-            Optional<String> value = extractAnnotationValue(annotation, Set.of("value", "name"));
-            if (value.isPresent() && !value.get().isBlank()) {
+            Optional<String> value = extractAnnotationValue(annotation, setOf("value", "name"));
+            if (value.isPresent() && !isBlank(value.get())) {
                 return value;
             }
         }
@@ -904,7 +920,7 @@ public class SpringCallPathAnalyzer {
             if (!"Resource".equals(simpleName(annotation.getNameAsString()))) {
                 continue;
             }
-            Optional<String> value = extractAnnotationValue(annotation, Set.of("name", "value"));
+            Optional<String> value = extractAnnotationValue(annotation, setOf("name", "value"));
             if (value.isPresent()) {
                 return value;
             }
@@ -919,11 +935,11 @@ public class SpringCallPathAnalyzer {
             if (!REQUEST_MAPPING_ANNOTATIONS.contains(annName)) {
                 continue;
             }
-            Optional<String> path = extractAnnotationValue(annotation, Set.of("value", "path"));
+            Optional<String> path = extractAnnotationValue(annotation, setOf("value", "path"));
             path.ifPresent(paths::add);
-            paths.addAll(extractAnnotationArrayValues(annotation, Set.of("value", "path")));
+            paths.addAll(extractAnnotationArrayValues(annotation, setOf("value", "path")));
         }
-        return paths.stream().filter(s -> !s.isBlank()).distinct().toList();
+        return paths.stream().filter(s -> !isBlank(s)).distinct().collect(Collectors.toList());
     }
 
     private static Set<String> extractHttpMethods(List<AnnotationExpr> annotations) {
@@ -931,16 +947,26 @@ public class SpringCallPathAnalyzer {
         for (AnnotationExpr annotation : annotations) {
             String annName = simpleName(annotation.getNameAsString());
             switch (annName) {
-                case "GetMapping" -> methods.add("GET");
-                case "PostMapping" -> methods.add("POST");
-                case "PutMapping" -> methods.add("PUT");
-                case "DeleteMapping" -> methods.add("DELETE");
-                case "PatchMapping" -> methods.add("PATCH");
-                case "RequestMapping" -> {
+                case "GetMapping":
+                    methods.add("GET");
+                    break;
+                case "PostMapping":
+                    methods.add("POST");
+                    break;
+                case "PutMapping":
+                    methods.add("PUT");
+                    break;
+                case "DeleteMapping":
+                    methods.add("DELETE");
+                    break;
+                case "PatchMapping":
+                    methods.add("PATCH");
+                    break;
+                case "RequestMapping":
                     methods.addAll(extractRequestMappingMethodValues(annotation));
-                }
-                default -> {
-                }
+                    break;
+                default:
+                    break;
             }
         }
         return methods;
@@ -948,13 +974,15 @@ public class SpringCallPathAnalyzer {
 
     private static Set<String> extractRequestMappingMethodValues(AnnotationExpr annotation) {
         Set<String> methods = new LinkedHashSet<>();
-        if (annotation instanceof NormalAnnotationExpr normal) {
+        if (annotation instanceof NormalAnnotationExpr) {
+            NormalAnnotationExpr normal = (NormalAnnotationExpr) annotation;
             for (MemberValuePair pair : normal.getPairs()) {
                 if (!"method".equals(pair.getNameAsString())) {
                     continue;
                 }
                 Expression value = pair.getValue();
-                if (value instanceof ArrayInitializerExpr arrayInitializerExpr) {
+                if (value instanceof ArrayInitializerExpr) {
+                    ArrayInitializerExpr arrayInitializerExpr = (ArrayInitializerExpr) value;
                     for (Expression e : arrayInitializerExpr.getValues()) {
                         methods.add(parseRequestMethodConstant(e));
                     }
@@ -963,7 +991,7 @@ public class SpringCallPathAnalyzer {
                 }
             }
         }
-        methods.removeIf(String::isBlank);
+        methods.removeIf(SpringCallPathAnalyzer::isBlank);
         return methods;
     }
 
@@ -974,7 +1002,8 @@ public class SpringCallPathAnalyzer {
     }
 
     private static Optional<String> extractAnnotationValue(AnnotationExpr annotation, Set<String> keys) {
-        if (annotation instanceof SingleMemberAnnotationExpr singleMember) {
+        if (annotation instanceof SingleMemberAnnotationExpr) {
+            SingleMemberAnnotationExpr singleMember = (SingleMemberAnnotationExpr) annotation;
             if (!keys.contains("value")) {
                 return Optional.empty();
             }
@@ -982,12 +1011,14 @@ public class SpringCallPathAnalyzer {
             if (value instanceof ArrayInitializerExpr) {
                 return Optional.empty();
             }
-            if (value instanceof StringLiteralExpr sle) {
+            if (value instanceof StringLiteralExpr) {
+                StringLiteralExpr sle = (StringLiteralExpr) value;
                 return Optional.ofNullable(sle.asString());
             }
             return Optional.of(value.toString().replace("\"", ""));
         }
-        if (annotation instanceof NormalAnnotationExpr normalAnnotationExpr) {
+        if (annotation instanceof NormalAnnotationExpr) {
+            NormalAnnotationExpr normalAnnotationExpr = (NormalAnnotationExpr) annotation;
             for (MemberValuePair pair : normalAnnotationExpr.getPairs()) {
                 if (!keys.contains(pair.getNameAsString())) {
                     continue;
@@ -996,7 +1027,8 @@ public class SpringCallPathAnalyzer {
                 if (value instanceof ArrayInitializerExpr) {
                     return Optional.empty();
                 }
-                if (value instanceof StringLiteralExpr sle) {
+                if (value instanceof StringLiteralExpr) {
+                    StringLiteralExpr sle = (StringLiteralExpr) value;
                     return Optional.ofNullable(sle.asString());
                 }
                 return Optional.of(value.toString().replace("\"", ""));
@@ -1006,19 +1038,22 @@ public class SpringCallPathAnalyzer {
     }
 
     private static List<String> extractAnnotationArrayValues(AnnotationExpr annotation, Set<String> keys) {
-        if (!(annotation instanceof NormalAnnotationExpr normal)) {
-            return List.of();
+        if (!(annotation instanceof NormalAnnotationExpr)) {
+            return listOf();
         }
+        NormalAnnotationExpr normal = (NormalAnnotationExpr) annotation;
         List<String> values = new ArrayList<>();
         for (MemberValuePair pair : normal.getPairs()) {
             if (!keys.contains(pair.getNameAsString())) {
                 continue;
             }
-            if (!(pair.getValue() instanceof ArrayInitializerExpr array)) {
+            if (!(pair.getValue() instanceof ArrayInitializerExpr)) {
                 continue;
             }
+            ArrayInitializerExpr array = (ArrayInitializerExpr) pair.getValue();
             for (Expression value : array.getValues()) {
-                if (value instanceof StringLiteralExpr sle) {
+                if (value instanceof StringLiteralExpr) {
+                    StringLiteralExpr sle = (StringLiteralExpr) value;
                     values.add(sle.asString());
                 } else {
                     values.add(value.toString().replace("\"", ""));
@@ -1055,13 +1090,34 @@ public class SpringCallPathAnalyzer {
     }
 
     private static String decapitalize(String name) {
-        if (name == null || name.isBlank()) {
+        if (name == null || isBlank(name)) {
             return name;
         }
         if (name.length() > 1 && Character.isUpperCase(name.charAt(1)) && Character.isUpperCase(name.charAt(0))) {
             return name;
         }
         return Character.toLowerCase(name.charAt(0)) + name.substring(1);
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
+    @SafeVarargs
+    private static <T> Set<T> setOf(T... values) {
+        Set<T> set = new LinkedHashSet<T>();
+        if (values != null) {
+            set.addAll(Arrays.asList(values));
+        }
+        return set;
+    }
+
+    @SafeVarargs
+    private static <T> List<T> listOf(T... values) {
+        if (values == null || values.length == 0) {
+            return new ArrayList<T>();
+        }
+        return new ArrayList<T>(Arrays.asList(values));
     }
 
     public enum ScopeType {
@@ -1086,7 +1142,7 @@ public class SpringCallPathAnalyzer {
         }
 
         public static CliOptions parse(String[] args) {
-            Path projectRoot = Path.of(".").toAbsolutePath().normalize();
+            Path projectRoot = Paths.get(".").toAbsolutePath().normalize();
             Path outputDir = projectRoot.resolve("build/reports/spring-call-path");
             int maxDepth = 8;
             int maxPaths = 200;
@@ -1094,9 +1150,9 @@ public class SpringCallPathAnalyzer {
             for (int i = 0; i < args.length; i++) {
                 String arg = args[i];
                 if ("--project".equals(arg) && i + 1 < args.length) {
-                    projectRoot = Path.of(args[++i]).toAbsolutePath().normalize();
+                    projectRoot = Paths.get(args[++i]).toAbsolutePath().normalize();
                 } else if ("--out".equals(arg) && i + 1 < args.length) {
-                    outputDir = Path.of(args[++i]).toAbsolutePath().normalize();
+                    outputDir = Paths.get(args[++i]).toAbsolutePath().normalize();
                 } else if ("--max-depth".equals(arg) && i + 1 < args.length) {
                     maxDepth = Integer.parseInt(args[++i]);
                 } else if ("--max-paths".equals(arg) && i + 1 < args.length) {
