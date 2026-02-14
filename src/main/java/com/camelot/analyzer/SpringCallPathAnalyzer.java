@@ -270,10 +270,17 @@ public class SpringCallPathAnalyzer {
         }
 
         for (Path xml : xmlFiles) {
+            if (!shouldAnalyzeXml(xml)) {
+                continue;
+            }
             Document doc;
             try {
                 doc = factory.newDocumentBuilder().parse(xml.toFile());
             } catch (Exception e) {
+                continue;
+            }
+            Element root = doc.getDocumentElement();
+            if (root == null || !"beans".equalsIgnoreCase(normalizeXmlTagName(root.getTagName()))) {
                 continue;
             }
 
@@ -364,6 +371,14 @@ public class SpringCallPathAnalyzer {
         }
 
         return model;
+    }
+
+    private boolean shouldAnalyzeXml(Path xmlPath) {
+        String fileName = xmlPath.getFileName() == null ? "" : xmlPath.getFileName().toString().toLowerCase(Locale.ROOT);
+        if (fileName.startsWith("log4j") || fileName.startsWith("logback")) {
+            return false;
+        }
+        return true;
     }
 
     private List<XmlUrlMapping> parseUrlMappings(Element mappingBean) {
@@ -883,6 +898,17 @@ public class SpringCallPathAnalyzer {
         }
         int idx = fqcnOrSimple.lastIndexOf('.');
         return idx >= 0 ? fqcnOrSimple.substring(idx + 1) : fqcnOrSimple;
+    }
+
+    private static String normalizeXmlTagName(String tagName) {
+        if (tagName == null) {
+            return "";
+        }
+        int idx = tagName.indexOf(':');
+        if (idx >= 0 && idx + 1 < tagName.length()) {
+            return tagName.substring(idx + 1);
+        }
+        return tagName;
     }
 
     private static Set<String> annotationNames(NodeWithAnnotations<?> node) {
