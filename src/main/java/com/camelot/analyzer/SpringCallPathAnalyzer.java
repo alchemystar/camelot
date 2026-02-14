@@ -125,6 +125,7 @@ public class SpringCallPathAnalyzer {
             javaFiles = stream
                     .filter(Files::isRegularFile)
                     .filter(p -> p.toString().endsWith(".java"))
+                    .filter(this::shouldAnalyzeJava)
                     .sorted()
                     .collect(Collectors.toList());
         }
@@ -371,6 +372,19 @@ public class SpringCallPathAnalyzer {
         }
 
         return model;
+    }
+
+    private boolean shouldAnalyzeJava(Path javaPath) {
+        String normalizedPath = javaPath.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+        if (normalizedPath.contains("/src/test/") || normalizedPath.contains("/generated-test-sources/")) {
+            return false;
+        }
+
+        String fileName = javaPath.getFileName() == null ? "" : javaPath.getFileName().toString();
+        return !(fileName.endsWith("Test.java")
+                || fileName.endsWith("Tests.java")
+                || fileName.endsWith("IT.java")
+                || fileName.endsWith("ITCase.java"));
     }
 
     private boolean shouldAnalyzeXml(Path xmlPath) {
