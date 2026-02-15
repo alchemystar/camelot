@@ -57,6 +57,7 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 
 会对调用边标记外部依赖类型（`DB` / `CACHE` / `RPC`），并生成树状文件 `external-dependency-tree.txt`：
 
+- 仅 `Bean` 方法调用会参与外部依赖判定（注入来源如 `@Autowired/@Resource`、XML `property-ref`，含链式 `CHAIN:`）
 - `RPC`（重点）：thrift 生成类、来自 jar 的外部类（排除 `java.*` 等 JDK 标准库，且排除 `--non-external-rpc-prefix` 命中前缀）、`Feign/Rpc/Grpc/Client` 特征
 - 只有 jar 中的类才会应用这两个前缀规则；工程源码类即使命中前缀，也不会据此前缀判定外部 RPC
 - 前缀优先级：若同时命中两类前缀，`--non-external-rpc-prefix` 优先（视为非外部 RPC）

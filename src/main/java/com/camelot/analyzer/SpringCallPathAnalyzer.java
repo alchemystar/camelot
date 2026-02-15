@@ -59,8 +59,6 @@ import java.util.stream.Stream;
 
 public class SpringCallPathAnalyzer {
     private DebugLogger debugLogger = DebugLogger.disabled();
-    private Set<String> externalRpcPrefixes = Collections.emptySet();
-    private Set<String> nonExternalRpcPrefixes = Collections.emptySet();
     private static final Set<String> COMPONENT_ANNOTATIONS = setOf(
             "Component", "Service", "Repository", "Controller", "RestController", "Configuration"
     );
@@ -201,24 +199,37 @@ public class SpringCallPathAnalyzer {
                                   DebugLogger debugLogger,
                                   Set<String> externalRpcPrefixes,
                                   Set<String> nonExternalRpcPrefixes) throws IOException {
+        DependencyAnalysisModule dependencyAnalysisModule = new DependencyAnalysisModule(this);
+        return dependencyAnalysisModule.analyzeWithDependencies(
+                projectRoot,
+                maxDepth,
+                maxPathsPerEndpoint,
+                endpointPathFilter,
+                entryMethodFilter,
+                debugLogger,
+                externalRpcPrefixes,
+                nonExternalRpcPrefixes
+        );
+    }
+
+    public CodeAnalysisResult analyzeCode(Path projectRoot,
+                                          int maxDepth,
+                                          int maxPathsPerEndpoint,
+                                          String endpointPathFilter,
+                                          String entryMethodFilter,
+                                          DebugLogger debugLogger) throws IOException {
         DebugLogger previousLogger = this.debugLogger;
-        Set<String> previousExternalRpcPrefixes = this.externalRpcPrefixes;
-        Set<String> previousNonExternalRpcPrefixes = this.nonExternalRpcPrefixes;
         this.debugLogger = debugLogger == null ? DebugLogger.disabled() : debugLogger;
-        this.externalRpcPrefixes = normalizePackagePrefixes(externalRpcPrefixes);
-        this.nonExternalRpcPrefixes = normalizePackagePrefixes(nonExternalRpcPrefixes);
         try {
         JavaModel javaModel = parseJava(projectRoot);
         XmlModel xmlModel = parseXml(projectRoot);
         this.debugLogger.log(
-                "START project=%s endpointFilter=%s entryMethodFilter=%s maxDepth=%d maxPaths=%d externalRpcPrefixes=%s nonExternalRpcPrefixes=%s",
+                "START project=%s endpointFilter=%s entryMethodFilter=%s maxDepth=%d maxPaths=%d",
                 projectRoot.toAbsolutePath(),
                 endpointPathFilter,
                 entryMethodFilter,
                 maxDepth,
-                maxPathsPerEndpoint,
-                this.externalRpcPrefixes,
-                this.nonExternalRpcPrefixes
+                maxPathsPerEndpoint
         );
 
         BeanRegistry beanRegistry = buildBeanRegistry(javaModel, xmlModel);
@@ -280,17 +291,15 @@ public class SpringCallPathAnalyzer {
             }
         }
 
-        return new AnalysisReport(
-                Instant.now().toString(),
+        return new CodeAnalysisResult(
                 projectRoot.toAbsolutePath().toString(),
+                javaModel,
+                methodsById,
                 methodDisplay,
                 filteredEdges,
-                endpointPaths,
-                buildExternalDependencyTrees(endpointPaths, filteredEdges, methodDisplay)
+                endpointPaths
         );
         } finally {
-            this.externalRpcPrefixes = previousExternalRpcPrefixes;
-            this.nonExternalRpcPrefixes = previousNonExternalRpcPrefixes;
             this.debugLogger = previousLogger;
         }
     }
@@ -378,217 +387,6 @@ public class SpringCallPathAnalyzer {
             return methodId;
         }
         return info.className + "#" + info.methodName + "(" + info.parameterCount + ") [external]";
-    }
-
-    private List<ExternalDependencyTree> buildExternalDependencyTrees(List<EndpointPaths> endpointPaths,
-                                                                      List<CallEdge> edges,
-                                                                      Map<String, String> methodDisplay) {
-        Map<String, CallEdge> edgeByKey = new LinkedHashMap<String, CallEdge>();
-        for (CallEdge edge : edges) {
-            edgeByKey.put(edge.from + "->" + edge.to, edge);
-        }
-
-        List<ExternalDependencyTree> trees = new ArrayList<ExternalDependencyTree>();
-        for (EndpointPaths endpointPath : endpointPaths) {
-            MutableDependencyNode root = new MutableDependencyNode(
-                    endpointPath.entryMethodId,
-                    methodDisplay.get(endpointPath.entryMethodId)
-            );
-            boolean hasExternalBranch = false;
-
-            for (List<String> path : endpointPath.paths) {
-                if (path == null || path.size() < 2) {
-                    continue;
-                }
-
-                int edgeCount = path.size() - 1;
-                boolean[] keepEdge = new boolean[edgeCount];
-                boolean downstreamExternal = false;
-
-                for (int i = edgeCount - 1; i >= 0; i--) {
-                    String from = path.get(i);
-                    String to = path.get(i + 1);
-                    CallEdge edge = edgeByKey.get(from + "->" + to);
-                    if (edge != null && !edge.externalDependencyTypes.isEmpty()) {
-                        downstreamExternal = true;
-                    }
-                    keepEdge[i] = downstreamExternal;
-                }
-
-                if (!downstreamExternal) {
-                    continue;
-                }
-                hasExternalBranch = true;
-
-                MutableDependencyNode current = root;
-                for (int i = 0; i < edgeCount; i++) {
-                    if (!keepEdge[i]) {
-                        continue;
-                    }
-                    String from = path.get(i);
-                    String to = path.get(i + 1);
-                    CallEdge edge = edgeByKey.get(from + "->" + to);
-                    List<String> dependencyTypes = edge == null ? listOf() : edge.externalDependencyTypes;
-                    String reason = edge == null ? "" : edge.reason;
-                    int line = edge == null ? -1 : edge.line;
-                    current = current.addChild(
-                            from,
-                            to,
-                            methodDisplay.get(to),
-                            dependencyTypes,
-                            reason,
-                            line
-                    );
-                }
-            }
-
-            if (!hasExternalBranch) {
-                continue;
-            }
-            trees.add(new ExternalDependencyTree(
-                    endpointPath.path,
-                    endpointPath.httpMethods,
-                    endpointPath.source,
-                    endpointPath.entryMethodId,
-                    root.toImmutable()
-            ));
-        }
-        debugLogger.log("EXTERNAL_DEP_TREES count=%d", trees.size());
-        return trees;
-    }
-
-    private List<String> classifyExternalDependencyTypes(String calleeMethodId,
-                                                         Map<String, MethodModel> methodsById,
-                                                         JavaModel javaModel) {
-        MethodModel calleeMethod = methodsById.get(calleeMethodId);
-        MethodIdInfo idInfo = MethodIdInfo.parse(calleeMethodId);
-        if (calleeMethod == null && idInfo == null) {
-            return listOf();
-        }
-
-        String className = calleeMethod != null ? calleeMethod.className : idInfo.className;
-        String simpleClassName = simpleName(className);
-        String packageName = "";
-        if (!isBlank(className) && className.contains(".")) {
-            packageName = className.substring(0, className.lastIndexOf('.')).toLowerCase(Locale.ROOT);
-        }
-        ClassModel calleeClass = javaModel.classesByName.get(className);
-        String methodName = calleeMethod != null ? calleeMethod.name : idInfo.methodName;
-
-        Set<String> classAnnotations = calleeClass == null ? Collections.<String>emptySet() : calleeClass.annotations;
-        Set<String> methodAnnotations = calleeMethod == null ? Collections.<String>emptySet() : calleeMethod.annotations;
-
-        boolean sourceClass = calleeClass != null;
-        boolean jarClass = !sourceClass && !isBlank(className);
-        boolean jdkClass = startsWithAnyIgnoreCase(className, "java.", "javax.", "jakarta.", "sun.");
-        boolean matchedExternalPrefix = startsWithAnyPrefixIgnoreCase(className, externalRpcPrefixes);
-        boolean matchedNonExternalPrefix = startsWithAnyPrefixIgnoreCase(className, nonExternalRpcPrefixes);
-        boolean forceExternalRpc = jarClass && matchedExternalPrefix;
-        boolean forceNonExternalRpc = jarClass && matchedNonExternalPrefix;
-        boolean thriftClass = containsAnyIgnoreCase(className, ".thrift.", "thrift.", "$client", "$iface")
-                || containsAnyIgnoreCase(simpleClassName, "Thrift", "Iface", "AsyncClient");
-
-        boolean db = false;
-        boolean cache = false;
-        boolean rpc = false;
-
-        if (classAnnotations.contains("Repository")
-                || classAnnotations.contains("Mapper")
-                || classAnnotations.contains("Dao")
-                || endsWithAnyIgnoreCase(simpleClassName, "Repository", "Repo", "Dao", "Mapper")
-                || containsAnyIgnoreCase(packageName, ".repo", ".repository", ".dao", ".mapper", ".mybatis")) {
-            db = true;
-        }
-
-        if (containsAnyIgnoreCase(simpleClassName, "Cache", "Redis", "Caffeine", "Ehcache", "Memcache")
-                || containsAnyIgnoreCase(packageName, ".cache", ".redis", ".caffeine", ".ehcache", ".memcache")
-                || methodAnnotations.contains("Cacheable")
-                || methodAnnotations.contains("CachePut")
-                || methodAnnotations.contains("CacheEvict")) {
-            cache = true;
-        }
-
-        if (classAnnotations.contains("FeignClient")
-                || containsAnyIgnoreCase(simpleClassName, "Feign", "Rpc", "Grpc", "Remote", "Gateway", "Client")
-                || containsAnyIgnoreCase(packageName, ".rpc", ".remote", ".feign", ".grpc", ".client", ".gateway")) {
-            rpc = true;
-        }
-        if (thriftClass) {
-            rpc = true;
-        }
-        if (jarClass && !jdkClass && !forceNonExternalRpc && !db && !cache) {
-            rpc = true;
-        }
-        if (forceExternalRpc) {
-            rpc = true;
-        }
-        if (forceNonExternalRpc) {
-            rpc = false;
-        }
-        if (forceExternalRpc && forceNonExternalRpc) {
-            debugLogger.log("RPC_PREFIX_CONFLICT class=%s external=%s nonExternal=%s",
-                    className,
-                    externalRpcPrefixes,
-                    nonExternalRpcPrefixes);
-        }
-        if (sourceClass && (matchedExternalPrefix || matchedNonExternalPrefix)) {
-            debugLogger.log("RPC_PREFIX_IGNORED_NON_JAR class=%s", className);
-        }
-
-        if (db && containsAnyIgnoreCase(methodName, "getFromCache", "cache")) {
-            cache = true;
-        }
-
-        List<String> kinds = new ArrayList<String>();
-        if (db) {
-            kinds.add("DB");
-        }
-        if (cache) {
-            kinds.add("CACHE");
-        }
-        if (rpc) {
-            kinds.add("RPC");
-        }
-        return kinds;
-    }
-
-    private static boolean endsWithAnyIgnoreCase(String raw, String... suffixes) {
-        if (raw == null) {
-            return false;
-        }
-        String lower = raw.toLowerCase(Locale.ROOT);
-        for (String suffix : suffixes) {
-            if (lower.endsWith(suffix.toLowerCase(Locale.ROOT))) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean containsAnyIgnoreCase(String raw, String... tokens) {
-        if (raw == null) {
-            return false;
-        }
-        String lower = raw.toLowerCase(Locale.ROOT);
-        for (String token : tokens) {
-            if (lower.contains(token.toLowerCase(Locale.ROOT))) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean startsWithAnyIgnoreCase(String raw, String... prefixes) {
-        if (raw == null) {
-            return false;
-        }
-        String lower = raw.toLowerCase(Locale.ROOT);
-        for (String prefix : prefixes) {
-            if (lower.startsWith(prefix.toLowerCase(Locale.ROOT))) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private JavaModel parseJava(Path projectRoot) throws IOException {
@@ -1091,21 +889,12 @@ public class SpringCallPathAnalyzer {
 
         List<CallEdge> edges = new ArrayList<CallEdge>();
         for (CallEdgeAccumulator accumulator : edgeMap.values()) {
-            List<String> dependencyTypes = classifyExternalDependencyTypes(accumulator.to, methodsById, javaModel);
-            if (!dependencyTypes.isEmpty()) {
-                debugLogger.log(
-                        "EDGE_EXTERNAL from=%s to=%s types=%s",
-                        accumulator.from,
-                        accumulator.to,
-                        dependencyTypes
-                );
-            }
             edges.add(new CallEdge(
                     accumulator.from,
                     accumulator.to,
                     String.join("|", accumulator.reasons),
                     accumulator.line,
-                    dependencyTypes
+                    listOf()
             ));
         }
         edges.sort(Comparator.comparing((CallEdge e) -> e.from).thenComparing(e -> e.to));
@@ -1852,23 +1641,6 @@ public class SpringCallPathAnalyzer {
         }
     }
 
-    private static boolean startsWithAnyPrefixIgnoreCase(String raw, Collection<String> prefixes) {
-        if (isBlank(raw) || prefixes == null || prefixes.isEmpty()) {
-            return false;
-        }
-        String lower = raw.toLowerCase(Locale.ROOT);
-        for (String prefix : prefixes) {
-            if (isBlank(prefix)) {
-                continue;
-            }
-            String normalizedPrefix = prefix.toLowerCase(Locale.ROOT);
-            if (lower.equals(normalizedPrefix) || lower.startsWith(normalizedPrefix + ".")) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     @SafeVarargs
     private static <T> Set<T> setOf(T... values) {
         Set<T> set = new LinkedHashSet<T>();
@@ -2071,6 +1843,29 @@ public class SpringCallPathAnalyzer {
             } catch (NumberFormatException ignored) {
                 return null;
             }
+        }
+    }
+
+    public static class CodeAnalysisResult {
+        public final String projectRoot;
+        public final JavaModel javaModel;
+        public final Map<String, MethodModel> methodsById;
+        public final Map<String, String> methodDisplay;
+        public final List<CallEdge> edges;
+        public final List<EndpointPaths> endpoints;
+
+        public CodeAnalysisResult(String projectRoot,
+                                  JavaModel javaModel,
+                                  Map<String, MethodModel> methodsById,
+                                  Map<String, String> methodDisplay,
+                                  List<CallEdge> edges,
+                                  List<EndpointPaths> endpoints) {
+            this.projectRoot = projectRoot;
+            this.javaModel = javaModel;
+            this.methodsById = methodsById;
+            this.methodDisplay = methodDisplay;
+            this.edges = edges;
+            this.endpoints = endpoints;
         }
     }
 
