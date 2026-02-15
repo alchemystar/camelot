@@ -75,6 +75,7 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 - 组装调用识别：`add/addStep/addHandler/append/then/link/register/stage/...`
 - 从注入 Bean 参数（如 `validateStage`）推断 stage 实现类，再结合 Pipeline 终止方法内部的 step 调用签名（如 `apply/1`）补边
 - 支持静态下钻：当组装逻辑分散在父类/子类方法中（如 `AbstractPipeline + 子类 override`），会沿调用链递归收集组装参数并合并推断结果
+- 支持 `build()` 返回值追踪：从 `return` 结果反向追踪变量赋值/改写链（含 helper 方法、变量重赋值）以更精确还原组装结果
 
 示例工程中新增了 `/pipeline/{id}` 入口，可用于验证该能力。
 

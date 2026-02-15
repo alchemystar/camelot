@@ -27,6 +27,7 @@ import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.nodeTypes.NodeWithAnnotations;
+import com.github.javaparser.ast.stmt.ReturnStmt;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
@@ -514,6 +515,49 @@ public class SpringCallPathAnalyzer {
                                 callSite.scopeToken
                         );
                     }
+
+                    for (VariableDeclarator variable : methodDeclaration.findAll(VariableDeclarator.class)) {
+                        if (!variable.getInitializer().isPresent()) {
+                            continue;
+                        }
+                        ValueExpr valueExpr = toValueExpr(variable.getInitializer().get());
+                        if (valueExpr == null) {
+                            continue;
+                        }
+                        int line = variable.getBegin().map(p -> p.line).orElse(-1);
+                        methodModel.assignments.add(new AssignmentFlow(variable.getNameAsString(), valueExpr, line));
+                    }
+
+                    for (AssignExpr assignExpr : methodDeclaration.findAll(AssignExpr.class)) {
+                        String targetName = null;
+                        if (assignExpr.getTarget() instanceof NameExpr) {
+                            targetName = ((NameExpr) assignExpr.getTarget()).getNameAsString();
+                        } else if (assignExpr.getTarget() instanceof FieldAccessExpr
+                                && ((FieldAccessExpr) assignExpr.getTarget()).getScope() instanceof ThisExpr) {
+                            targetName = ((FieldAccessExpr) assignExpr.getTarget()).getNameAsString();
+                        }
+                        if (isBlank(targetName)) {
+                            continue;
+                        }
+                        ValueExpr valueExpr = toValueExpr(assignExpr.getValue());
+                        if (valueExpr == null) {
+                            continue;
+                        }
+                        int line = assignExpr.getBegin().map(p -> p.line).orElse(-1);
+                        methodModel.assignments.add(new AssignmentFlow(targetName, valueExpr, line));
+                    }
+
+                    for (ReturnStmt returnStmt : methodDeclaration.findAll(ReturnStmt.class)) {
+                        if (!returnStmt.getExpression().isPresent()) {
+                            continue;
+                        }
+                        ValueExpr valueExpr = toValueExpr(returnStmt.getExpression().get());
+                        if (valueExpr == null) {
+                            continue;
+                        }
+                        int line = returnStmt.getBegin().map(p -> p.line).orElse(-1);
+                        methodModel.returns.add(new ReturnFlow(valueExpr, line));
+                    }
                     debugLogger.log("PARSE_METHOD id=%s calls=%d vars=%d", methodModel.id, methodModel.calls.size(), methodModel.visibleVariableTypes.size());
 
                     classModel.methodsById.put(methodModel.id, methodModel);
@@ -586,6 +630,22 @@ public class SpringCallPathAnalyzer {
             return "new " + ((ObjectCreationExpr) argument).getType().asString();
         }
         return argument == null ? "" : argument.toString();
+    }
+
+    private ValueExpr toValueExpr(Expression expression) {
+        if (expression == null) {
+            return null;
+        }
+        if (expression instanceof MethodCallExpr) {
+            return ValueExpr.forCall(toCallSite((MethodCallExpr) expression));
+        }
+        if (expression instanceof NameExpr) {
+            return ValueExpr.forVariable(((NameExpr) expression).getNameAsString());
+        }
+        if (expression instanceof FieldAccessExpr && ((FieldAccessExpr) expression).getScope() instanceof ThisExpr) {
+            return ValueExpr.forVariable(((FieldAccessExpr) expression).getNameAsString());
+        }
+        return null;
     }
 
     private XmlModel parseXml(Path projectRoot) throws IOException {
@@ -995,6 +1055,7 @@ public class SpringCallPathAnalyzer {
                 methodsById,
                 injectionRegistry
         ));
+        assemblyArgs = deduplicatePipelineAssemblyArgs(assemblyArgs);
         if (assemblyArgs.isEmpty()) {
             return Collections.emptyMap();
         }
@@ -1104,7 +1165,7 @@ public class SpringCallPathAnalyzer {
         List<PipelineAssemblyArg> args = new ArrayList<PipelineAssemblyArg>();
         Set<String> visitedMethodIds = new LinkedHashSet<String>();
         for (String scopeMethodId : scopeCandidates.keySet()) {
-            collectPipelineAssemblyArgsFromMethod(
+            collectPipelineAssemblyArgsFromMethodReturn(
                     scopeMethodId,
                     javaModel,
                     methodsById,
@@ -1117,13 +1178,13 @@ public class SpringCallPathAnalyzer {
         return args;
     }
 
-    private void collectPipelineAssemblyArgsFromMethod(String methodId,
-                                                       JavaModel javaModel,
-                                                       Map<String, MethodModel> methodsById,
-                                                       InjectionRegistry injectionRegistry,
-                                                       int depth,
-                                                       Set<String> visiting,
-                                                       List<PipelineAssemblyArg> out) {
+    private void collectPipelineAssemblyArgsFromMethodReturn(String methodId,
+                                                             JavaModel javaModel,
+                                                             Map<String, MethodModel> methodsById,
+                                                             InjectionRegistry injectionRegistry,
+                                                             int depth,
+                                                             Set<String> visiting,
+                                                             List<PipelineAssemblyArg> out) {
         if (depth > 8 || !visiting.add(methodId)) {
             return;
         }
@@ -1138,47 +1199,254 @@ public class SpringCallPathAnalyzer {
             return;
         }
 
-        for (CallSite callSite : methodModel.calls) {
-            String methodName = callSite.methodName == null ? "" : callSite.methodName.toLowerCase(Locale.ROOT);
-            if (PIPELINE_ASSEMBLY_METHOD_NAMES.contains(methodName)) {
-                for (String token : callSite.argumentTokens) {
-                    String normalized = normalizePipelineArgToken(token);
-                    if (!isBlank(normalized)) {
-                        out.add(new PipelineAssemblyArg(normalized, classModel.fqcn));
-                        debugLogger.log(
-                                "PIPELINE_ASSEMBLY_ARG method=%s owner=%s token=%s",
-                                methodModel.id,
-                                classModel.fqcn,
-                                normalized
-                        );
-                    }
-                }
+        Set<String> variableVisit = new LinkedHashSet<String>();
+        if (methodModel.returns.isEmpty()) {
+            // Fallback: if no explicit return expression is captured, use method body calls as approximation.
+            for (CallSite callSite : methodModel.calls) {
+                collectPipelineAssemblyArgsFromCallSite(
+                        classModel,
+                        methodModel,
+                        callSite,
+                        Integer.MAX_VALUE,
+                        javaModel,
+                        methodsById,
+                        injectionRegistry,
+                        depth,
+                        visiting,
+                        variableVisit,
+                        out
+                );
             }
+        } else {
+            for (ReturnFlow returnFlow : methodModel.returns) {
+                collectPipelineAssemblyArgsFromValueExpr(
+                        classModel,
+                        methodModel,
+                        returnFlow.value,
+                        returnFlow.line <= 0 ? Integer.MAX_VALUE : returnFlow.line,
+                        javaModel,
+                        methodsById,
+                        injectionRegistry,
+                        depth,
+                        visiting,
+                        variableVisit,
+                        out
+                );
+            }
+        }
+        visiting.remove(methodId);
+    }
 
-            Map<String, String> targets = resolveCallCandidates(
+    private void collectPipelineAssemblyArgsFromValueExpr(ClassModel classModel,
+                                                          MethodModel methodModel,
+                                                          ValueExpr valueExpr,
+                                                          int lineLimit,
+                                                          JavaModel javaModel,
+                                                          Map<String, MethodModel> methodsById,
+                                                          InjectionRegistry injectionRegistry,
+                                                          int depth,
+                                                          Set<String> visitingMethods,
+                                                          Set<String> visitingVariables,
+                                                          List<PipelineAssemblyArg> out) {
+        if (valueExpr == null) {
+            return;
+        }
+        if (valueExpr.isCall()) {
+            collectPipelineAssemblyArgsFromCallSite(
                     classModel,
                     methodModel,
-                    callSite,
+                    valueExpr.callSite,
+                    lineLimit,
                     javaModel,
                     methodsById,
                     injectionRegistry,
-                    0
+                    depth,
+                    visitingMethods,
+                    visitingVariables,
+                    out
             );
-            for (String targetMethodId : targets.keySet()) {
-                if (methodsById.containsKey(targetMethodId)) {
-                    collectPipelineAssemblyArgsFromMethod(
-                            targetMethodId,
-                            javaModel,
-                            methodsById,
-                            injectionRegistry,
-                            depth + 1,
-                            visiting,
-                            out
+            return;
+        }
+        if (valueExpr.isVariable()) {
+            collectPipelineAssemblyArgsFromVariableState(
+                    classModel,
+                    methodModel,
+                    valueExpr.variableName,
+                    lineLimit,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry,
+                    depth,
+                    visitingMethods,
+                    visitingVariables,
+                    out
+            );
+        }
+    }
+
+    private void collectPipelineAssemblyArgsFromCallSite(ClassModel classModel,
+                                                         MethodModel methodModel,
+                                                         CallSite callSite,
+                                                         int lineLimit,
+                                                         JavaModel javaModel,
+                                                         Map<String, MethodModel> methodsById,
+                                                         InjectionRegistry injectionRegistry,
+                                                         int depth,
+                                                         Set<String> visitingMethods,
+                                                         Set<String> visitingVariables,
+                                                         List<PipelineAssemblyArg> out) {
+        if (callSite == null) {
+            return;
+        }
+        if (callSite.line > 0 && callSite.line > lineLimit) {
+            return;
+        }
+        if (callSite.scopeType == ScopeType.METHOD_CALL && callSite.scopeCall != null) {
+            out.addAll(collectPipelineAssemblyArgs(classModel, callSite.scopeCall));
+        }
+
+        String callMethodName = callSite.methodName == null ? "" : callSite.methodName.toLowerCase(Locale.ROOT);
+        if (PIPELINE_ASSEMBLY_METHOD_NAMES.contains(callMethodName)) {
+            for (String token : callSite.argumentTokens) {
+                String normalized = normalizePipelineArgToken(token);
+                if (!isBlank(normalized)) {
+                    out.add(new PipelineAssemblyArg(normalized, classModel.fqcn));
+                    debugLogger.log(
+                            "PIPELINE_ASSEMBLY_ARG method=%s owner=%s token=%s",
+                            methodModel.id,
+                            classModel.fqcn,
+                            normalized
                     );
                 }
             }
         }
-        visiting.remove(methodId);
+
+        if (callSite.scopeType == ScopeType.NAME && !isBlank(callSite.scopeToken)) {
+            collectPipelineAssemblyArgsFromVariableState(
+                    classModel,
+                    methodModel,
+                    callSite.scopeToken,
+                    lineLimit,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry,
+                    depth,
+                    visitingMethods,
+                    visitingVariables,
+                    out
+            );
+        }
+
+        if (PIPELINE_ASSEMBLY_METHOD_NAMES.contains(callMethodName)) {
+            return;
+        }
+
+        Map<String, String> targets = resolveCallCandidates(
+                classModel,
+                methodModel,
+                callSite,
+                javaModel,
+                methodsById,
+                injectionRegistry,
+                0
+        );
+        for (String targetMethodId : targets.keySet()) {
+            if (!methodsById.containsKey(targetMethodId)) {
+                continue;
+            }
+            collectPipelineAssemblyArgsFromMethodReturn(
+                    targetMethodId,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry,
+                    depth + 1,
+                    visitingMethods,
+                    out
+            );
+        }
+    }
+
+    private List<PipelineAssemblyArg> deduplicatePipelineAssemblyArgs(List<PipelineAssemblyArg> rawArgs) {
+        if (rawArgs == null || rawArgs.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Map<String, PipelineAssemblyArg> unique = new LinkedHashMap<String, PipelineAssemblyArg>();
+        for (PipelineAssemblyArg arg : rawArgs) {
+            if (arg == null || isBlank(arg.token) || isBlank(arg.ownerClassName)) {
+                continue;
+            }
+            unique.put(arg.ownerClassName + "#" + arg.token, arg);
+        }
+        return new ArrayList<PipelineAssemblyArg>(unique.values());
+    }
+
+    private void collectPipelineAssemblyArgsFromVariableState(ClassModel classModel,
+                                                              MethodModel methodModel,
+                                                              String variableName,
+                                                              int lineLimit,
+                                                              JavaModel javaModel,
+                                                              Map<String, MethodModel> methodsById,
+                                                              InjectionRegistry injectionRegistry,
+                                                              int depth,
+                                                              Set<String> visitingMethods,
+                                                              Set<String> visitingVariables,
+                                                              List<PipelineAssemblyArg> out) {
+        if (isBlank(variableName)) {
+            return;
+        }
+        String visitKey = methodModel.id + "#" + variableName + "#" + lineLimit;
+        if (!visitingVariables.add(visitKey)) {
+            return;
+        }
+        try {
+            for (CallSite callSite : methodModel.calls) {
+                if (callSite.scopeType != ScopeType.NAME || !variableName.equals(callSite.scopeToken)) {
+                    continue;
+                }
+                if (callSite.line > 0 && callSite.line > lineLimit) {
+                    continue;
+                }
+                String callMethodName = callSite.methodName == null ? "" : callSite.methodName.toLowerCase(Locale.ROOT);
+                if (PIPELINE_ASSEMBLY_METHOD_NAMES.contains(callMethodName)) {
+                    for (String token : callSite.argumentTokens) {
+                        String normalized = normalizePipelineArgToken(token);
+                        if (!isBlank(normalized)) {
+                            out.add(new PipelineAssemblyArg(normalized, classModel.fqcn));
+                            debugLogger.log(
+                                    "PIPELINE_ASSEMBLY_ARG method=%s owner=%s token=%s",
+                                    methodModel.id,
+                                    classModel.fqcn,
+                                    normalized
+                            );
+                        }
+                    }
+                }
+            }
+
+            for (AssignmentFlow assignment : methodModel.assignments) {
+                if (!variableName.equals(assignment.targetVar)) {
+                    continue;
+                }
+                if (assignment.line > 0 && assignment.line > lineLimit) {
+                    continue;
+                }
+                collectPipelineAssemblyArgsFromValueExpr(
+                        classModel,
+                        methodModel,
+                        assignment.value,
+                        assignment.line <= 0 ? lineLimit : assignment.line,
+                        javaModel,
+                        methodsById,
+                        injectionRegistry,
+                        depth,
+                        visitingMethods,
+                        visitingVariables,
+                        out
+                );
+            }
+        } finally {
+            visitingVariables.remove(visitKey);
+        }
     }
 
     private Map<String, String> resolvePipelineAssemblyTargets(List<PipelineAssemblyArg> assemblyArgs,
@@ -2568,6 +2836,8 @@ public class SpringCallPathAnalyzer {
         public final Set<String> httpMethods = new LinkedHashSet<>();
         public final List<CallSite> calls = new ArrayList<>();
         public final Map<String, String> visibleVariableTypes = new LinkedHashMap<>();
+        public final List<AssignmentFlow> assignments = new ArrayList<AssignmentFlow>();
+        public final List<ReturnFlow> returns = new ArrayList<ReturnFlow>();
 
         public MethodModel(String id, String className, String name, int parameterCount, int line, String returnTypeName) {
             this.id = id;
@@ -2580,6 +2850,54 @@ public class SpringCallPathAnalyzer {
 
         public String display() {
             return className + "#" + name + "(" + parameterCount + ")";
+        }
+    }
+
+    public static class ValueExpr {
+        public final String variableName;
+        public final CallSite callSite;
+
+        private ValueExpr(String variableName, CallSite callSite) {
+            this.variableName = variableName;
+            this.callSite = callSite;
+        }
+
+        public static ValueExpr forVariable(String variableName) {
+            return new ValueExpr(variableName, null);
+        }
+
+        public static ValueExpr forCall(CallSite callSite) {
+            return new ValueExpr(null, callSite);
+        }
+
+        public boolean isVariable() {
+            return !isBlank(variableName);
+        }
+
+        public boolean isCall() {
+            return callSite != null;
+        }
+    }
+
+    public static class AssignmentFlow {
+        public final String targetVar;
+        public final ValueExpr value;
+        public final int line;
+
+        public AssignmentFlow(String targetVar, ValueExpr value, int line) {
+            this.targetVar = targetVar;
+            this.value = value;
+            this.line = line;
+        }
+    }
+
+    public static class ReturnFlow {
+        public final ValueExpr value;
+        public final int line;
+
+        public ReturnFlow(ValueExpr value, int line) {
+            this.value = value;
+            this.line = line;
         }
     }
 
