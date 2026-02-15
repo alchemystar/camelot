@@ -20,6 +20,7 @@
   - `SimpleUrlHandlerMapping` 的 `urlMap`（`<entry key value-ref>` 和 `<prop key>`）
 - 调用图构建与路径搜索
   - 方法级调用边
+  - Pipeline 组装推断（`builder().add(stageBean)...build().execute(...)`）
   - 从注解入口和 XML URL 入口做 DFS
   - 可配置 `max-depth` / `max-paths`
 - 输出
@@ -66,6 +67,17 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 
 树结构只保留“最终命中外部依赖”的分支，纯 Java 内部处理且不触达外部依赖的分支不会展示。
 
+## Pipeline 组装推断
+
+支持在“创建执行流程时动态组装 Pipeline”场景下，补充推断组装后的 stage 调用边：
+
+- 终止调用识别：`execute/run/start/process/handle/invoke/fire`
+- 组装调用识别：`add/addStep/addHandler/append/then/link/register/stage/...`
+- 从注入 Bean 参数（如 `validateStage`）推断 stage 实现类，再结合 Pipeline 终止方法内部的 step 调用签名（如 `apply/1`）补边
+- 支持静态下钻：当组装逻辑分散在父类/子类方法中（如 `AbstractPipeline + 子类 override`），会沿调用链递归收集组装参数并合并推断结果
+
+示例工程中新增了 `/pipeline/{id}` 入口，可用于验证该能力。
+
 ## 示例
 
 仓库内提供了示例工程：`examples/demo-spring-app`。
@@ -76,13 +88,15 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 mvn -q exec:java -Dexec.args="--project ./examples/demo-spring-app --out ./build/reports/demo"
 ```
 
-预期可看到两类入口：
+预期可看到三类入口（含 Pipeline 示例）：
 
 - 注解入口：`/users/{id}`
+- 注解入口：`/pipeline/{id}`
 - XML 入口：`/legacy/users/{id}`
 
 ## 已知限制（当前版本）
 
 - 未处理反射、动态代理细节、SpEL、运行时条件装配
 - 对局部变量类型、重载解析、跨模块依赖解析是“启发式”而非完整类型系统
+- 对内部类/匿名类参与的复杂链式返回类型推断仍有限，建议优先使用顶层类定义 Pipeline Builder
 - `@Bean` 方法产出的 Bean 与复杂 AOP/事务织入尚未完整建模

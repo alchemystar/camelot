@@ -314,8 +314,17 @@ public class DependencyAnalysisModule {
             return "";
         }
         String token = rawToken.trim();
-        while (token.startsWith("CHAIN:")) {
-            token = token.substring("CHAIN:".length()).trim();
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            if (token.startsWith("CHAIN:")) {
+                token = token.substring("CHAIN:".length()).trim();
+                changed = true;
+            }
+            if (token.startsWith("PIPELINE:")) {
+                token = token.substring("PIPELINE:".length()).trim();
+                changed = true;
+            }
         }
         return token;
     }

@@ -22,6 +22,7 @@ import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.expr.ThisExpr;
@@ -65,6 +66,16 @@ public class SpringCallPathAnalyzer {
     private static final Set<String> INJECTION_ANNOTATIONS = setOf("Autowired", "Inject", "Resource");
     private static final Set<String> REQUEST_MAPPING_ANNOTATIONS = setOf(
             "RequestMapping", "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping"
+    );
+    private static final Set<String> PIPELINE_ASSEMBLY_METHOD_NAMES = setOf(
+            "add", "addlast", "addfirst", "append", "then", "link", "register",
+            "stage", "withstage", "pipe", "next", "step", "addstep", "addhandler"
+    );
+    private static final Set<String> PIPELINE_TERMINAL_METHOD_NAMES = setOf(
+            "execute", "run", "start", "process", "handle", "invoke", "fire"
+    );
+    private static final Set<String> PIPELINE_SKIP_STEP_METHOD_NAMES = setOf(
+            "iterator", "hasnext", "next", "size", "add", "get", "set"
     );
 
     public static void main(String[] args) throws Exception {
@@ -422,7 +433,13 @@ public class SpringCallPathAnalyzer {
                 String simpleName = declaration.getNameAsString();
                 String fqcn = isBlank(packageName) ? simpleName : packageName + "." + simpleName;
 
-                ClassModel classModel = new ClassModel(fqcn, simpleName, packageName, importContext);
+                ClassModel classModel = new ClassModel(
+                        fqcn,
+                        simpleName,
+                        packageName,
+                        importContext,
+                        declaration.isInterface()
+                );
                 classModel.annotations.addAll(annotationNames(declaration));
                 classModel.implementedTypes.addAll(declaration.getImplementedTypes().stream().map(t -> t.asString()).collect(Collectors.toList()));
                 declaration.getExtendedTypes().stream().findFirst().ifPresent(t -> classModel.superType = t.asString());
@@ -540,7 +557,35 @@ public class SpringCallPathAnalyzer {
         }
 
         int line = callExpr.getBegin().map(p -> p.line).orElse(-1);
-        return new CallSite(scopeType, scopeToken, scopeCall, callExpr.getNameAsString(), callExpr.getArguments().size(), line);
+        List<String> argumentTokens = new ArrayList<String>();
+        for (Expression argument : callExpr.getArguments()) {
+            String token = toArgumentToken(argument);
+            if (!isBlank(token)) {
+                argumentTokens.add(token);
+            }
+        }
+        return new CallSite(
+                scopeType,
+                scopeToken,
+                scopeCall,
+                callExpr.getNameAsString(),
+                callExpr.getArguments().size(),
+                line,
+                argumentTokens
+        );
+    }
+
+    private String toArgumentToken(Expression argument) {
+        if (argument instanceof NameExpr) {
+            return ((NameExpr) argument).getNameAsString();
+        }
+        if (argument instanceof FieldAccessExpr && ((FieldAccessExpr) argument).getScope() instanceof ThisExpr) {
+            return ((FieldAccessExpr) argument).getNameAsString();
+        }
+        if (argument instanceof ObjectCreationExpr) {
+            return "new " + ((ObjectCreationExpr) argument).getType().asString();
+        }
+        return argument == null ? "" : argument.toString();
     }
 
     private XmlModel parseXml(Path projectRoot) throws IOException {
@@ -859,29 +904,20 @@ public class SpringCallPathAnalyzer {
                         );
                     }
                     for (Map.Entry<String, String> candidate : candidates.entrySet()) {
-                        String key = methodModel.id + "->" + candidate.getKey();
-                        CallEdgeAccumulator accumulator = edgeMap.get(key);
-                        if (accumulator == null) {
-                            accumulator = new CallEdgeAccumulator(methodModel.id, candidate.getKey(), call.line);
-                            edgeMap.put(key, accumulator);
-                        } else {
-                            accumulator.occurrences++;
-                            debugLogger.log(
-                                    "EDGE_DEDUP from=%s to=%s line=%d occurrences=%d",
-                                    accumulator.from,
-                                    accumulator.to,
-                                    call.line,
-                                    accumulator.occurrences
-                            );
-                        }
-                        accumulator.reasons.add(candidate.getValue());
-                        debugLogger.log(
-                                "EDGE_ADD from=%s to=%s reason=%s line=%d",
-                                methodModel.id,
-                                candidate.getKey(),
-                                candidate.getValue(),
-                                call.line
-                        );
+                        addEdge(edgeMap, methodModel.id, candidate.getKey(), candidate.getValue(), call.line);
+                    }
+
+                    Map<String, String> pipelineCandidates = resolvePipelineAssemblyCandidates(
+                            classModel,
+                            methodModel,
+                            call,
+                            javaModel,
+                            methodsById,
+                            injectionRegistry,
+                            candidates
+                    );
+                    for (Map.Entry<String, String> candidate : pipelineCandidates.entrySet()) {
+                        addEdge(edgeMap, methodModel.id, candidate.getKey(), candidate.getValue(), call.line);
                     }
                 }
             }
@@ -908,6 +944,322 @@ public class SpringCallPathAnalyzer {
         return edges;
     }
 
+    private void addEdge(Map<String, CallEdgeAccumulator> edgeMap,
+                         String fromMethodId,
+                         String toMethodId,
+                         String reason,
+                         int line) {
+        String key = fromMethodId + "->" + toMethodId;
+        CallEdgeAccumulator accumulator = edgeMap.get(key);
+        if (accumulator == null) {
+            accumulator = new CallEdgeAccumulator(fromMethodId, toMethodId, line);
+            edgeMap.put(key, accumulator);
+        } else {
+            accumulator.occurrences++;
+            debugLogger.log(
+                    "EDGE_DEDUP from=%s to=%s line=%d occurrences=%d",
+                    accumulator.from,
+                    accumulator.to,
+                    line,
+                    accumulator.occurrences
+            );
+        }
+        accumulator.reasons.add(reason);
+        debugLogger.log(
+                "EDGE_ADD from=%s to=%s reason=%s line=%d",
+                fromMethodId,
+                toMethodId,
+                reason,
+                line
+        );
+    }
+
+    private Map<String, String> resolvePipelineAssemblyCandidates(ClassModel classModel,
+                                                                  MethodModel methodModel,
+                                                                  CallSite call,
+                                                                  JavaModel javaModel,
+                                                                  Map<String, MethodModel> methodsById,
+                                                                  InjectionRegistry injectionRegistry,
+                                                                  Map<String, String> terminalCandidates) {
+        if (!isPipelineTerminalCall(call) || call.scopeCall == null || terminalCandidates.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        List<PipelineAssemblyArg> assemblyArgs = new ArrayList<PipelineAssemblyArg>();
+        assemblyArgs.addAll(collectPipelineAssemblyArgs(classModel, call.scopeCall));
+        assemblyArgs.addAll(collectPipelineAssemblyArgsFromScopeMethods(
+                classModel,
+                methodModel,
+                call,
+                javaModel,
+                methodsById,
+                injectionRegistry
+        ));
+        if (assemblyArgs.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, String> assemblyTargets = resolvePipelineAssemblyTargets(
+                assemblyArgs,
+                injectionRegistry
+        );
+        if (assemblyTargets.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Set<PipelineStepCallSignature> stepSignatures = collectPipelineStepCallSignatures(
+                terminalCandidates.keySet(),
+                methodsById
+        );
+        if (stepSignatures.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, String> resolved = new LinkedHashMap<String, String>();
+        for (Map.Entry<String, String> stageTarget : assemblyTargets.entrySet()) {
+            for (PipelineStepCallSignature signature : stepSignatures) {
+                CallSite syntheticCall = new CallSite(
+                        ScopeType.NAME,
+                        null,
+                        null,
+                        signature.methodName,
+                        signature.argumentCount,
+                        call.line,
+                        listOf()
+                );
+                Set<String> targets = resolveMethodInClassHierarchy(stageTarget.getKey(), syntheticCall, javaModel);
+                for (String target : targets) {
+                    MethodIdInfo targetInfo = MethodIdInfo.parse(target);
+                    if (targetInfo != null) {
+                        ClassModel targetClassModel = javaModel.classesByName.get(targetInfo.className);
+                        if (targetClassModel != null && targetClassModel.isInterface) {
+                            continue;
+                        }
+                    }
+                    String reason = "PIPELINE:" + stageTarget.getValue();
+                    resolved.merge(target, reason, (a, b) -> a.equals(b) ? a : a + "|" + b);
+                    debugLogger.log(
+                            "PIPELINE_EDGE from=%s terminal=%s stageClass=%s call=%s/%d target=%s reason=%s",
+                            methodModel.id,
+                            call.methodName,
+                            stageTarget.getKey(),
+                            signature.methodName,
+                            signature.argumentCount,
+                            target,
+                            reason
+                    );
+                }
+            }
+        }
+        return resolved;
+    }
+
+    private boolean isPipelineTerminalCall(CallSite call) {
+        if (call == null || isBlank(call.methodName)) {
+            return false;
+        }
+        return PIPELINE_TERMINAL_METHOD_NAMES.contains(call.methodName.toLowerCase(Locale.ROOT));
+    }
+
+    private List<PipelineAssemblyArg> collectPipelineAssemblyArgs(ClassModel ownerClass, CallSite scopeCall) {
+        List<PipelineAssemblyArg> args = new ArrayList<PipelineAssemblyArg>();
+        CallSite current = scopeCall;
+        while (current != null) {
+            String methodName = current.methodName == null ? "" : current.methodName.toLowerCase(Locale.ROOT);
+            if (PIPELINE_ASSEMBLY_METHOD_NAMES.contains(methodName)) {
+                for (String token : current.argumentTokens) {
+                    String normalized = normalizePipelineArgToken(token);
+                    if (!isBlank(normalized)) {
+                        args.add(new PipelineAssemblyArg(normalized, ownerClass == null ? "" : ownerClass.fqcn));
+                    }
+                }
+            }
+            current = current.scopeCall;
+        }
+        return args;
+    }
+
+    private List<PipelineAssemblyArg> collectPipelineAssemblyArgsFromScopeMethods(ClassModel classModel,
+                                                                                  MethodModel methodModel,
+                                                                                  CallSite call,
+                                                                                  JavaModel javaModel,
+                                                                                  Map<String, MethodModel> methodsById,
+                                                                                  InjectionRegistry injectionRegistry) {
+        if (call.scopeCall == null) {
+            return Collections.emptyList();
+        }
+        Map<String, String> scopeCandidates = resolveCallCandidates(
+                classModel,
+                methodModel,
+                call.scopeCall,
+                javaModel,
+                methodsById,
+                injectionRegistry,
+                0
+        );
+        if (scopeCandidates.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<PipelineAssemblyArg> args = new ArrayList<PipelineAssemblyArg>();
+        Set<String> visitedMethodIds = new LinkedHashSet<String>();
+        for (String scopeMethodId : scopeCandidates.keySet()) {
+            collectPipelineAssemblyArgsFromMethod(
+                    scopeMethodId,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry,
+                    0,
+                    visitedMethodIds,
+                    args
+            );
+        }
+        return args;
+    }
+
+    private void collectPipelineAssemblyArgsFromMethod(String methodId,
+                                                       JavaModel javaModel,
+                                                       Map<String, MethodModel> methodsById,
+                                                       InjectionRegistry injectionRegistry,
+                                                       int depth,
+                                                       Set<String> visiting,
+                                                       List<PipelineAssemblyArg> out) {
+        if (depth > 8 || !visiting.add(methodId)) {
+            return;
+        }
+        MethodModel methodModel = methodsById.get(methodId);
+        if (methodModel == null) {
+            visiting.remove(methodId);
+            return;
+        }
+        ClassModel classModel = javaModel.classesByName.get(methodModel.className);
+        if (classModel == null) {
+            visiting.remove(methodId);
+            return;
+        }
+
+        for (CallSite callSite : methodModel.calls) {
+            String methodName = callSite.methodName == null ? "" : callSite.methodName.toLowerCase(Locale.ROOT);
+            if (PIPELINE_ASSEMBLY_METHOD_NAMES.contains(methodName)) {
+                for (String token : callSite.argumentTokens) {
+                    String normalized = normalizePipelineArgToken(token);
+                    if (!isBlank(normalized)) {
+                        out.add(new PipelineAssemblyArg(normalized, classModel.fqcn));
+                        debugLogger.log(
+                                "PIPELINE_ASSEMBLY_ARG method=%s owner=%s token=%s",
+                                methodModel.id,
+                                classModel.fqcn,
+                                normalized
+                        );
+                    }
+                }
+            }
+
+            Map<String, String> targets = resolveCallCandidates(
+                    classModel,
+                    methodModel,
+                    callSite,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry,
+                    0
+            );
+            for (String targetMethodId : targets.keySet()) {
+                if (methodsById.containsKey(targetMethodId)) {
+                    collectPipelineAssemblyArgsFromMethod(
+                            targetMethodId,
+                            javaModel,
+                            methodsById,
+                            injectionRegistry,
+                            depth + 1,
+                            visiting,
+                            out
+                    );
+                }
+            }
+        }
+        visiting.remove(methodId);
+    }
+
+    private Map<String, String> resolvePipelineAssemblyTargets(List<PipelineAssemblyArg> assemblyArgs,
+                                                               InjectionRegistry injectionRegistry) {
+        if (assemblyArgs.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<String, String> resolved = new LinkedHashMap<String, String>();
+        for (PipelineAssemblyArg arg : assemblyArgs) {
+            if (isBlank(arg.ownerClassName)) {
+                continue;
+            }
+            Map<String, TargetSet> classTargets = injectionRegistry.targetsByClass.getOrDefault(
+                    arg.ownerClassName,
+                    Collections.<String, TargetSet>emptyMap()
+            );
+            TargetSet targetSet = classTargets.get(arg.token);
+            if (targetSet == null || targetSet.targets.isEmpty()) {
+                continue;
+            }
+            for (String targetClass : targetSet.targets) {
+                resolved.merge(targetClass, targetSet.reasonSummary(), (a, b) -> a.equals(b) ? a : a + "|" + b);
+            }
+        }
+        return resolved;
+    }
+
+    private Set<PipelineStepCallSignature> collectPipelineStepCallSignatures(Set<String> terminalMethodIds,
+                                                                             Map<String, MethodModel> methodsById) {
+        Set<PipelineStepCallSignature> signatures = new LinkedHashSet<PipelineStepCallSignature>();
+        for (String terminalMethodId : terminalMethodIds) {
+            MethodModel terminalMethod = methodsById.get(terminalMethodId);
+            if (terminalMethod == null) {
+                continue;
+            }
+            for (CallSite terminalCall : terminalMethod.calls) {
+                if (terminalCall.scopeType != ScopeType.NAME || isBlank(terminalCall.scopeToken)) {
+                    continue;
+                }
+                String localType = terminalMethod.visibleVariableTypes.get(terminalCall.scopeToken);
+                if (isBlank(localType)) {
+                    continue;
+                }
+                String normalizedType = normalizeTypeName(localType);
+                if (startsWithAnyIgnoreCase(normalizedType, "java.", "javax.", "jakarta.")) {
+                    continue;
+                }
+                String normalizedMethod = terminalCall.methodName == null
+                        ? ""
+                        : terminalCall.methodName.toLowerCase(Locale.ROOT);
+                if (PIPELINE_SKIP_STEP_METHOD_NAMES.contains(normalizedMethod)) {
+                    continue;
+                }
+                signatures.add(new PipelineStepCallSignature(terminalCall.methodName, terminalCall.argumentCount));
+            }
+        }
+        return signatures;
+    }
+
+    private String normalizePipelineArgToken(String raw) {
+        if (isBlank(raw)) {
+            return "";
+        }
+        String token = raw.trim();
+        if (token.startsWith("this.")) {
+            token = token.substring("this.".length()).trim();
+        }
+        if (token.startsWith("new ")) {
+            return "";
+        }
+        return token;
+    }
+
+    private static boolean isLikelyTypeReferenceToken(String token) {
+        if (isBlank(token)) {
+            return false;
+        }
+        char first = token.trim().charAt(0);
+        return Character.isUpperCase(first);
+    }
+
     private Map<String, String> resolveCallCandidates(ClassModel classModel,
                                                       MethodModel methodModel,
                                                       CallSite call,
@@ -923,6 +1275,7 @@ public class SpringCallPathAnalyzer {
         Map<String, String> resolved = new LinkedHashMap<>();
         if (call.scopeType == ScopeType.UNSCOPED || call.scopeType == ScopeType.THIS) {
             addResolvedTargets(resolved, resolveMethodInClassAndParents(classModel, call, javaModel), "JAVA:this");
+            addResolvedTargets(resolved, resolveMethodInDescendants(classModel, call, javaModel), "JAVA:this-override");
             return resolved;
         }
 
@@ -950,6 +1303,15 @@ public class SpringCallPathAnalyzer {
                         Set<String> typeCandidates = resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
                         for (String typeCandidate : typeCandidates) {
                             addResolvedTargets(resolved, resolveMethodInClassHierarchy(typeCandidate, call, javaModel), "JAVA:field-type");
+                        }
+                    } else if (isLikelyTypeReferenceToken(call.scopeToken)) {
+                        Set<String> staticTypeCandidates = resolveClassesByTypeWithContext(call.scopeToken, javaModel, classModel);
+                        for (String staticTypeCandidate : staticTypeCandidates) {
+                            addResolvedTargets(
+                                    resolved,
+                                    resolveMethodInClassHierarchy(staticTypeCandidate, call, javaModel),
+                                    "JAVA:static-type"
+                            );
                         }
                     }
                 }
@@ -1121,6 +1483,23 @@ public class SpringCallPathAnalyzer {
 
     private Set<String> resolveMethodInClassAndParents(ClassModel classModel, CallSite call, JavaModel javaModel) {
         return resolveMethodInClassHierarchy(classModel.fqcn, call, javaModel);
+    }
+
+    private Set<String> resolveMethodInDescendants(ClassModel classModel, CallSite call, JavaModel javaModel) {
+        if (classModel == null) {
+            return setOf();
+        }
+        Set<String> resolved = new LinkedHashSet<String>();
+        for (ClassModel candidate : javaModel.classesByName.values()) {
+            if (candidate.fqcn.equals(classModel.fqcn)) {
+                continue;
+            }
+            if (!isAssignableTo(candidate.fqcn, classModel.fqcn, javaModel, new HashSet<String>())) {
+                continue;
+            }
+            resolved.addAll(resolveMethodByName(candidate.fqcn, call, javaModel));
+        }
+        return resolved;
     }
 
     private Set<String> resolveMethodInClassHierarchy(String className, CallSite call, JavaModel javaModel) {
@@ -1336,6 +1715,19 @@ public class SpringCallPathAnalyzer {
             normalized = parts[parts.length - 1];
         }
         return normalized;
+    }
+
+    private static boolean startsWithAnyIgnoreCase(String raw, String... prefixes) {
+        if (raw == null) {
+            return false;
+        }
+        String lower = raw.toLowerCase(Locale.ROOT);
+        for (String prefix : prefixes) {
+            if (lower.startsWith(prefix.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isLikelyTypeVariable(String typeName) {
@@ -2117,6 +2509,7 @@ public class SpringCallPathAnalyzer {
         public final String simpleName;
         public final String packageName;
         public final ImportContext importContext;
+        public final boolean isInterface;
         public final Set<String> annotations = new LinkedHashSet<>();
         public final Map<String, FieldModel> fields = new LinkedHashMap<>();
         public final Map<String, MethodModel> methodsById = new LinkedHashMap<>();
@@ -2128,11 +2521,16 @@ public class SpringCallPathAnalyzer {
         public String superType;
         public String beanNameFromAnnotation;
 
-        public ClassModel(String fqcn, String simpleName, String packageName, ImportContext importContext) {
+        public ClassModel(String fqcn,
+                          String simpleName,
+                          String packageName,
+                          ImportContext importContext,
+                          boolean isInterface) {
             this.fqcn = fqcn;
             this.simpleName = simpleName;
             this.packageName = packageName;
             this.importContext = importContext;
+            this.isInterface = isInterface;
         }
 
         public boolean isComponent() {
@@ -2192,14 +2590,65 @@ public class SpringCallPathAnalyzer {
         public final String methodName;
         public final int argumentCount;
         public final int line;
+        public final List<String> argumentTokens;
 
-        public CallSite(ScopeType scopeType, String scopeToken, CallSite scopeCall, String methodName, int argumentCount, int line) {
+        public CallSite(ScopeType scopeType,
+                        String scopeToken,
+                        CallSite scopeCall,
+                        String methodName,
+                        int argumentCount,
+                        int line,
+                        List<String> argumentTokens) {
             this.scopeType = scopeType;
             this.scopeToken = scopeToken;
             this.scopeCall = scopeCall;
             this.methodName = methodName;
             this.argumentCount = argumentCount;
             this.line = line;
+            this.argumentTokens = argumentTokens == null ? new ArrayList<String>() : argumentTokens;
+        }
+    }
+
+    private static class PipelineAssemblyArg {
+        public final String token;
+        public final String ownerClassName;
+
+        private PipelineAssemblyArg(String token, String ownerClassName) {
+            this.token = token;
+            this.ownerClassName = ownerClassName;
+        }
+    }
+
+    private static class PipelineStepCallSignature {
+        public final String methodName;
+        public final int argumentCount;
+
+        private PipelineStepCallSignature(String methodName, int argumentCount) {
+            this.methodName = methodName;
+            this.argumentCount = argumentCount;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof PipelineStepCallSignature)) {
+                return false;
+            }
+            PipelineStepCallSignature other = (PipelineStepCallSignature) obj;
+            if (argumentCount != other.argumentCount) {
+                return false;
+            }
+            if (methodName == null) {
+                return other.methodName == null;
+            }
+            return methodName.equals(other.methodName);
+        }
+
+        @Override
+        public int hashCode() {
+            return (methodName == null ? 0 : methodName.hashCode()) * 31 + argumentCount;
         }
     }
 
