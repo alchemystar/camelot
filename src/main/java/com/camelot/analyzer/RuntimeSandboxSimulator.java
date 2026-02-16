@@ -66,7 +66,8 @@ public class RuntimeSandboxSimulator {
         CliOptions options = CliOptions.parse(args);
         Files.createDirectories(options.outputDir);
 
-        URLClassLoader classLoader = buildClassLoader(options);
+        ProjectClassIndex projectClassIndex = buildProjectClassIndex(options.classesRoots, options.debugRuntime);
+        ProjectAwareClassLoader classLoader = buildClassLoader(options, projectClassIndex);
         installTracingAgent(options);
 
         RuntimeTraceCollector collector = new RuntimeTraceCollector(options.maxCalls);
@@ -80,14 +81,15 @@ public class RuntimeSandboxSimulator {
         report.classesRoots = toStringList(options.classesRoots);
         report.classpathEntries = toStringList(options.classpathEntries);
         report.arguments = new ArrayList<String>(options.arguments);
+        report.discoveredProjectClassCount = projectClassIndex.classNames.size();
 
         long startedAt = System.currentTimeMillis();
         SandboxBeanFactory beanFactory = null;
         try {
             if (options.debugRuntime) {
-                printRuntimeStartDebug(options, classLoader);
+                printRuntimeStartDebug(options, classLoader, projectClassIndex);
             }
-            beanFactory = new SandboxBeanFactory(classLoader, options);
+            beanFactory = new SandboxBeanFactory(classLoader, options, projectClassIndex);
             Class<?> entryClass = Class.forName(options.entryClass, true, classLoader);
             Method entryMethod = resolveEntryMethod(entryClass, options.entryMethod, options.arguments.size());
             Object entryBean = beanFactory.getBean(entryClass);
@@ -118,6 +120,8 @@ public class RuntimeSandboxSimulator {
             report.callCount = collector.getCallCount();
             report.edges = collector.snapshotEdges();
             report.durationMs = System.currentTimeMillis() - startedAt;
+            report.loadedProjectClasses = classLoader.snapshotLoadedProjectClasses();
+            report.skippedProjectClasses = classLoader.snapshotFailedProjectClasses();
             ACTIVE_COLLECTOR = null;
             classLoader.close();
         }
@@ -148,7 +152,8 @@ public class RuntimeSandboxSimulator {
         }
     }
 
-    private static URLClassLoader buildClassLoader(CliOptions options) throws IOException {
+    private static ProjectAwareClassLoader buildClassLoader(CliOptions options,
+                                                            ProjectClassIndex projectClassIndex) throws IOException {
         List<URL> urls = new ArrayList<URL>();
         for (Path path : options.classesRoots) {
             urls.add(path.toUri().toURL());
@@ -156,13 +161,56 @@ public class RuntimeSandboxSimulator {
         for (Path path : options.classpathEntries) {
             urls.add(path.toUri().toURL());
         }
-        return new URLClassLoader(urls.toArray(new URL[0]), RuntimeSandboxSimulator.class.getClassLoader());
+        return new ProjectAwareClassLoader(
+                urls.toArray(new URL[0]),
+                RuntimeSandboxSimulator.class.getClassLoader(),
+                projectClassIndex,
+                options.tracePrefixes,
+                options.debugRuntime
+        );
     }
 
-    private static void printRuntimeStartDebug(CliOptions options, URLClassLoader classLoader) {
+    private static ProjectClassIndex buildProjectClassIndex(List<Path> classRoots, boolean debugRuntime) {
+        ProjectClassIndex index = new ProjectClassIndex();
+        int discovered = 0;
+        for (Path root : classRoots) {
+            if (root == null || !Files.isDirectory(root)) {
+                continue;
+            }
+            try (Stream<Path> stream = Files.walk(root)) {
+                List<Path> classFiles = stream
+                        .filter(Files::isRegularFile)
+                        .filter(path -> path.toString().endsWith(".class"))
+                        .collect(Collectors.toList());
+                for (Path classFile : classFiles) {
+                    String fqcn = toClassName(root, classFile);
+                    if (fqcn.contains("$")) {
+                        continue;
+                    }
+                    discovered++;
+                    index.add(fqcn, classFile);
+                }
+            } catch (IOException error) {
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] PROJECT_CLASS_INDEX_SCAN_FAIL root="
+                            + root + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
+            }
+        }
+        if (debugRuntime) {
+            System.out.println("[RUNTIME_DEBUG] PROJECT_CLASS_INDEX_DISCOVER total="
+                    + discovered + " unique=" + index.classNames.size());
+        }
+        return index;
+    }
+
+    private static void printRuntimeStartDebug(CliOptions options,
+                                               URLClassLoader classLoader,
+                                               ProjectClassIndex projectClassIndex) {
         System.out.println("[RUNTIME_DEBUG] projectDir=" + options.projectDir);
         System.out.println("[RUNTIME_DEBUG] entryClass=" + options.entryClass + " entryMethod=" + options.entryMethod);
         System.out.println("[RUNTIME_DEBUG] classesRoots=" + options.classesRoots.size() + " classpathEntries=" + options.classpathEntries.size());
+        System.out.println("[RUNTIME_DEBUG] projectClassDiscovered=" + projectClassIndex.classNames.size());
         URL[] urls = classLoader.getURLs();
         for (int i = 0; i < urls.length; i++) {
             System.out.println("[RUNTIME_DEBUG] CLASSPATH[" + i + "] " + urls[i]);
@@ -656,6 +704,144 @@ public class RuntimeSandboxSimulator {
         public long durationMs;
         public int callCount;
         public List<RuntimeEdge> edges;
+        public int discoveredProjectClassCount;
+        public List<String> loadedProjectClasses;
+        public List<String> skippedProjectClasses;
+    }
+
+    public static class ProjectClassIndex {
+        public final Set<String> classNames = new LinkedHashSet<String>();
+        public final Map<String, String> sourceByClassName = new LinkedHashMap<String, String>();
+
+        public void add(String className, Path classFile) {
+            if (className == null || className.isEmpty()) {
+                return;
+            }
+            classNames.add(className);
+            if (classFile != null) {
+                sourceByClassName.put(className, classFile.toAbsolutePath().toString());
+            }
+        }
+
+        public boolean contains(String className) {
+            return classNames.contains(className);
+        }
+    }
+
+    public static class ProjectAwareClassLoader extends URLClassLoader {
+        private final ProjectClassIndex projectClassIndex;
+        private final List<String> tracePrefixes;
+        private final boolean debugRuntime;
+        private final Set<String> loadedProjectClasses =
+                Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+        private final Set<String> failedProjectClasses =
+                Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+        public ProjectAwareClassLoader(URL[] urls,
+                                       ClassLoader parent,
+                                       ProjectClassIndex projectClassIndex,
+                                       List<String> tracePrefixes,
+                                       boolean debugRuntime) {
+            super(urls, parent);
+            this.projectClassIndex = projectClassIndex == null ? new ProjectClassIndex() : projectClassIndex;
+            this.tracePrefixes = tracePrefixes == null ? Collections.<String>emptyList() : new ArrayList<String>(tracePrefixes);
+            this.debugRuntime = debugRuntime;
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            synchronized (getClassLoadingLock(name)) {
+                Class<?> alreadyLoaded = findLoadedClass(name);
+                if (alreadyLoaded != null) {
+                    if (resolve) {
+                        resolveClass(alreadyLoaded);
+                    }
+                    return alreadyLoaded;
+                }
+
+                boolean projectClass = isProjectClass(name);
+                if (projectClass) {
+                    try {
+                        Class<?> loaded = findClass(name);
+                        if (resolve) {
+                            resolveClass(loaded);
+                        }
+                        loadedProjectClasses.add(name);
+                        if (debugRuntime) {
+                            String source = projectClassIndex.sourceByClassName.getOrDefault(name, "unknown");
+                            System.out.println("[RUNTIME_DEBUG] PROJECT_CLASS_LOAD_OK class=" + name + " source=" + source);
+                        }
+                        return loaded;
+                    } catch (ClassNotFoundException ignored) {
+                        failedProjectClasses.add(name);
+                        if (debugRuntime) {
+                            System.out.println("[RUNTIME_DEBUG] PROJECT_CLASS_LOAD_FALLBACK class=" + name);
+                        }
+                    } catch (LinkageError linkageError) {
+                        failedProjectClasses.add(name);
+                        if (debugRuntime) {
+                            System.out.println("[RUNTIME_DEBUG] PROJECT_CLASS_LOAD_SKIP class=" + name
+                                    + " error=" + linkageError.getClass().getName() + ": " + linkageError.getMessage());
+                        }
+                    }
+                }
+
+                try {
+                    Class<?> loaded = super.loadClass(name, resolve);
+                    if (projectClass) {
+                        loadedProjectClasses.add(name);
+                    }
+                    return loaded;
+                } catch (ClassNotFoundException error) {
+                    if (projectClass) {
+                        failedProjectClasses.add(name);
+                        if (debugRuntime) {
+                            System.out.println("[RUNTIME_DEBUG] PROJECT_CLASS_LOAD_SKIP class="
+                                    + name + " error=ClassNotFoundException");
+                        }
+                    }
+                    throw error;
+                }
+            }
+        }
+
+        public List<String> snapshotLoadedProjectClasses() {
+            List<String> values = new ArrayList<String>(loadedProjectClasses);
+            Collections.sort(values);
+            return values;
+        }
+
+        public List<String> snapshotFailedProjectClasses() {
+            Set<String> unresolved = new LinkedHashSet<String>(failedProjectClasses);
+            unresolved.removeAll(loadedProjectClasses);
+            List<String> values = new ArrayList<String>(unresolved);
+            Collections.sort(values);
+            return values;
+        }
+
+        private boolean isProjectClass(String className) {
+            if (className == null || className.isEmpty()) {
+                return false;
+            }
+            if (isParentFirstRuntimeClass(className)) {
+                return false;
+            }
+            if (projectClassIndex.contains(className)) {
+                return true;
+            }
+            for (String prefix : tracePrefixes) {
+                if (className.startsWith(prefix)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private boolean isParentFirstRuntimeClass(String className) {
+            String runtimeClassName = RuntimeSandboxSimulator.class.getName();
+            return className.equals(runtimeClassName)
+                    || className.startsWith(runtimeClassName + "$");
+        }
     }
 
     public static class MethodSelector {
@@ -700,22 +886,33 @@ public class RuntimeSandboxSimulator {
     public static class SandboxBeanFactory {
         private final ClassLoader classLoader;
         private final CliOptions options;
-        private final List<Class<?>> scannedClasses;
+        private final List<String> discoveredClassNames;
+        private final Map<String, Class<?>> loadedByClassName = new LinkedHashMap<String, Class<?>>();
+        private final Set<String> failedClassNames = new LinkedHashSet<String>();
         private final Map<Class<?>, Object> singletonByConcreteClass = new LinkedHashMap<Class<?>, Object>();
         private final Set<Class<?>> creating = new LinkedHashSet<Class<?>>();
+        private int classLoadFailLogs = 0;
+        private static final int MAX_CLASS_LOAD_FAIL_LOGS = 60;
 
-        public SandboxBeanFactory(ClassLoader classLoader, CliOptions options) throws IOException {
+        public SandboxBeanFactory(ClassLoader classLoader,
+                                  CliOptions options,
+                                  ProjectClassIndex projectClassIndex) throws IOException {
             this.classLoader = classLoader;
             this.options = options;
-            this.scannedClasses = scanClasses(classLoader, options.classesRoots, options.debugRuntime);
+            if (projectClassIndex != null && !projectClassIndex.classNames.isEmpty()) {
+                this.discoveredClassNames = new ArrayList<String>(projectClassIndex.classNames);
+                Collections.sort(this.discoveredClassNames);
+            } else {
+                this.discoveredClassNames = scanClassNames(options.classesRoots, options.debugRuntime);
+            }
         }
 
         public int getScannedClassCount() {
-            return scannedClasses.size();
+            return discoveredClassNames.size();
         }
 
         public List<String> suggestClassNames(String missingClass, int limit) {
-            if (missingClass == null || missingClass.trim().isEmpty() || scannedClasses.isEmpty()) {
+            if (missingClass == null || missingClass.trim().isEmpty() || discoveredClassNames.isEmpty()) {
                 return Collections.emptyList();
             }
             String normalized = missingClass.trim().replace('/', '.');
@@ -728,13 +925,17 @@ public class RuntimeSandboxSimulator {
             String simpleLower = simpleName.toLowerCase(Locale.ROOT);
 
             LinkedHashSet<String> results = new LinkedHashSet<String>();
-            for (Class<?> clazz : scannedClasses) {
+            for (String candidate : discoveredClassNames) {
                 if (results.size() >= limit) {
                     break;
                 }
-                String candidate = clazz.getName();
                 String candidateLower = candidate.toLowerCase(Locale.ROOT);
-                String candidateSimpleLower = clazz.getSimpleName().toLowerCase(Locale.ROOT);
+                String candidateSimple = candidate;
+                int candidateDot = candidate.lastIndexOf('.');
+                if (candidateDot >= 0 && candidateDot + 1 < candidate.length()) {
+                    candidateSimple = candidate.substring(candidateDot + 1);
+                }
+                String candidateSimpleLower = candidateSimple.toLowerCase(Locale.ROOT);
                 if (candidateLower.equals(normalizedLower)
                         || candidateSimpleLower.equals(simpleLower)
                         || candidateLower.contains(simpleLower)
@@ -862,7 +1063,11 @@ public class RuntimeSandboxSimulator {
                 return requestedType;
             }
             List<Class<?>> candidates = new ArrayList<Class<?>>();
-            for (Class<?> candidate : scannedClasses) {
+            for (String className : discoveredClassNames) {
+                Class<?> candidate = loadClassByName(className);
+                if (candidate == null) {
+                    continue;
+                }
                 if (candidate.isInterface() || Modifier.isAbstract(candidate.getModifiers())) {
                     continue;
                 }
@@ -894,12 +1099,37 @@ public class RuntimeSandboxSimulator {
             return Proxy.newProxyInstance(classLoader, new Class[]{iface}, handler);
         }
 
-        private static List<Class<?>> scanClasses(ClassLoader classLoader,
-                                                  List<Path> classRoots,
-                                                  boolean debugRuntime) throws IOException {
-            List<Class<?>> classes = new ArrayList<Class<?>>();
-            int loadFailed = 0;
-            final int maxFailLogs = 40;
+        private Class<?> loadClassByName(String className) {
+            if (className == null || className.isEmpty()) {
+                return null;
+            }
+            Class<?> cached = loadedByClassName.get(className);
+            if (cached != null) {
+                return cached;
+            }
+            if (failedClassNames.contains(className)) {
+                return null;
+            }
+            try {
+                Class<?> loaded = Class.forName(className, false, classLoader);
+                loadedByClassName.put(className, loaded);
+                return loaded;
+            } catch (Throwable error) {
+                failedClassNames.add(className);
+                if (options.debugRuntime && classLoadFailLogs < MAX_CLASS_LOAD_FAIL_LOGS) {
+                    System.out.println("[RUNTIME_DEBUG] BEAN_CLASS_LOAD_SKIP class="
+                            + className + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                } else if (options.debugRuntime && classLoadFailLogs == MAX_CLASS_LOAD_FAIL_LOGS) {
+                    System.out.println("[RUNTIME_DEBUG] BEAN_CLASS_LOAD_SKIP additional errors suppressed");
+                }
+                classLoadFailLogs++;
+                return null;
+            }
+        }
+
+        private static List<String> scanClassNames(List<Path> classRoots,
+                                                   boolean debugRuntime) throws IOException {
+            LinkedHashSet<String> classes = new LinkedHashSet<String>();
             for (Path root : classRoots) {
                 if (!Files.exists(root)) {
                     if (debugRuntime) {
@@ -917,30 +1147,13 @@ public class RuntimeSandboxSimulator {
                         if (fqcn.contains("$")) {
                             continue;
                         }
-                        try {
-                            Class<?> clazz = Class.forName(fqcn, false, classLoader);
-                            classes.add(clazz);
-                        } catch (Throwable error) {
-                            loadFailed++;
-                            if (debugRuntime && loadFailed <= maxFailLogs) {
-                                System.out.println("[RUNTIME_DEBUG] SCAN_LOAD_FAIL class="
-                                        + fqcn + " error=" + error.getClass().getName() + ": " + error.getMessage());
-                            }
-                        }
+                        classes.add(fqcn);
                     }
                 }
             }
-            if (debugRuntime && loadFailed > maxFailLogs) {
-                System.out.println("[RUNTIME_DEBUG] SCAN_LOAD_FAIL additional=" + (loadFailed - maxFailLogs));
-            }
-            classes.sort(Comparator.comparing(Class::getName));
-            return classes;
-        }
-
-        private static String toClassName(Path root, Path classFile) {
-            String relative = root.relativize(classFile).toString();
-            String normalized = relative.substring(0, relative.length() - ".class".length());
-            return normalized.replace(File.separatorChar, '.');
+            List<String> sorted = new ArrayList<String>(classes);
+            Collections.sort(sorted);
+            return sorted;
         }
     }
 
@@ -1087,6 +1300,12 @@ public class RuntimeSandboxSimulator {
                 }
             }
         }
+    }
+
+    private static String toClassName(Path root, Path classFile) {
+        String relative = root.relativize(classFile).toString();
+        String normalized = relative.substring(0, relative.length() - ".class".length());
+        return normalized.replace(File.separatorChar, '.');
     }
 
     private static void collectTokens(List<String> out, String raw) {
