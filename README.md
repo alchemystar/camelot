@@ -79,6 +79,20 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 
 示例工程中新增了 `/pipeline/{id}` 入口，可用于验证该能力。
 
+## Runtime Sandbox（极简运行）
+
+如果你要跑“模拟执行 + 运行时调用追踪”，可以直接用脚本，只传两个核心参数：
+
+```bash
+./scripts/runtime-sandbox.sh /path/to/your-project com.foo.UserService#findUser/1
+```
+
+说明：
+
+- 第 1 个参数：目标工程目录（会自动探测 `target/classes` 与常见 jar 依赖）
+- 第 2 个参数：`entry-method`，建议写成 `全限定类名#方法名/参数个数`
+- 其他参数可选追加（例如 `--arg`、`--out`、`--trace-prefix`、`--debug-runtime`）
+
 ## 示例
 
 仓库内提供了示例工程：`examples/demo-spring-app`。

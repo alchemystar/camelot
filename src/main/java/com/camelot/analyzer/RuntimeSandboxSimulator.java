@@ -285,14 +285,49 @@ public class RuntimeSandboxSimulator {
 
     private static Object[] buildInvokeArgs(Method method, List<String> rawArgs) {
         Class<?>[] types = method.getParameterTypes();
-        if (types.length != rawArgs.size()) {
-            throw new IllegalArgumentException("Argument count mismatch. required=" + types.length + " provided=" + rawArgs.size());
+        if (rawArgs.size() > types.length) {
+            throw new IllegalArgumentException("Argument count mismatch. required<=" + types.length + " provided=" + rawArgs.size());
         }
         Object[] values = new Object[types.length];
         for (int i = 0; i < types.length; i++) {
-            values[i] = convertArg(types[i], rawArgs.get(i));
+            if (i < rawArgs.size()) {
+                values[i] = convertArg(types[i], rawArgs.get(i));
+            } else {
+                values[i] = defaultArgumentValue(types[i]);
+            }
         }
         return values;
+    }
+
+    private static Object defaultArgumentValue(Class<?> targetType) {
+        if (!targetType.isPrimitive()) {
+            return null;
+        }
+        if (targetType == boolean.class) {
+            return false;
+        }
+        if (targetType == char.class) {
+            return '\0';
+        }
+        if (targetType == byte.class) {
+            return (byte) 0;
+        }
+        if (targetType == short.class) {
+            return (short) 0;
+        }
+        if (targetType == int.class) {
+            return 0;
+        }
+        if (targetType == long.class) {
+            return 0L;
+        }
+        if (targetType == float.class) {
+            return 0.0f;
+        }
+        if (targetType == double.class) {
+            return 0.0d;
+        }
+        return null;
     }
 
     private static Object convertArg(Class<?> targetType, String raw) {
@@ -760,6 +795,7 @@ public class RuntimeSandboxSimulator {
     }
 
     public static class CliOptions {
+        public final Path projectDir;
         public final List<Path> classesRoots;
         public final List<Path> classpathEntries;
         public final String entryClass;
@@ -770,7 +806,8 @@ public class RuntimeSandboxSimulator {
         public final int maxCalls;
         public final boolean debugRuntime;
 
-        public CliOptions(List<Path> classesRoots,
+        public CliOptions(Path projectDir,
+                          List<Path> classesRoots,
                           List<Path> classpathEntries,
                           String entryClass,
                           String entryMethod,
@@ -779,6 +816,7 @@ public class RuntimeSandboxSimulator {
                           Path outputDir,
                           int maxCalls,
                           boolean debugRuntime) {
+            this.projectDir = projectDir;
             this.classesRoots = classesRoots;
             this.classpathEntries = classpathEntries;
             this.entryClass = entryClass;
@@ -791,6 +829,7 @@ public class RuntimeSandboxSimulator {
         }
 
         public static CliOptions parse(String[] args) {
+            Path projectDir = null;
             List<Path> classesRoots = new ArrayList<Path>();
             List<Path> classpathEntries = new ArrayList<Path>();
             String entryClass = null;
@@ -800,10 +839,13 @@ public class RuntimeSandboxSimulator {
             Path outputDir = Paths.get(".").toAbsolutePath().normalize().resolve("build/reports/runtime-sandbox");
             int maxCalls = 200000;
             boolean debugRuntime = false;
+            boolean outExplicitlySpecified = false;
 
             for (int i = 0; i < args.length; i++) {
                 String arg = args[i];
-                if ("--classes".equals(arg) && i + 1 < args.length) {
+                if (("--project".equals(arg) || "--project-dir".equals(arg)) && i + 1 < args.length) {
+                    projectDir = Paths.get(args[++i]).toAbsolutePath().normalize();
+                } else if ("--classes".equals(arg) && i + 1 < args.length) {
                     collectPaths(classesRoots, args[++i]);
                 } else if ("--classpath".equals(arg) && i + 1 < args.length) {
                     collectPaths(classpathEntries, args[++i]);
@@ -817,6 +859,7 @@ public class RuntimeSandboxSimulator {
                     collectTokens(tracePrefixes, args[++i]);
                 } else if ("--out".equals(arg) && i + 1 < args.length) {
                     outputDir = Paths.get(args[++i]).toAbsolutePath().normalize();
+                    outExplicitlySpecified = true;
                 } else if ("--max-calls".equals(arg) && i + 1 < args.length) {
                     maxCalls = Integer.parseInt(args[++i]);
                 } else if ("--debug-runtime".equals(arg)) {
@@ -824,20 +867,38 @@ public class RuntimeSandboxSimulator {
                 }
             }
 
+            if (entryMethod == null || entryMethod.trim().isEmpty()) {
+                throw new IllegalArgumentException("Missing --entry-method");
+            }
+            EntryMethodInput parsedMethod = EntryMethodInput.parse(entryMethod);
+            entryMethod = parsedMethod.methodPart;
+            if ((entryClass == null || entryClass.trim().isEmpty()) && parsedMethod.classPart != null) {
+                entryClass = parsedMethod.classPart;
+            }
+
+            if (projectDir != null) {
+                if (!outExplicitlySpecified) {
+                    outputDir = projectDir.resolve("build/reports/runtime-sandbox").toAbsolutePath().normalize();
+                }
+                if (classesRoots.isEmpty()) {
+                    classesRoots.addAll(discoverClassesRoots(projectDir));
+                }
+                if (classpathEntries.isEmpty()) {
+                    classpathEntries.addAll(discoverClasspathEntries(projectDir));
+                }
+            }
             if (classesRoots.isEmpty()) {
                 classesRoots.add(Paths.get("target/classes").toAbsolutePath().normalize());
             }
             if (entryClass == null || entryClass.trim().isEmpty()) {
-                throw new IllegalArgumentException("Missing --entry-class");
-            }
-            if (entryMethod == null || entryMethod.trim().isEmpty()) {
-                throw new IllegalArgumentException("Missing --entry-method");
+                throw new IllegalArgumentException("Missing entry class. Use --entry-class, or pass --entry-method as Class#method[/arity].");
             }
             if (tracePrefixes.isEmpty()) {
                 tracePrefixes.add(defaultTracePrefix(entryClass));
             }
 
             return new CliOptions(
+                    projectDir,
                     normalizePaths(classesRoots),
                     normalizePaths(classpathEntries),
                     entryClass,
@@ -905,6 +966,47 @@ public class RuntimeSandboxSimulator {
             normalized.add(path.toAbsolutePath().normalize());
         }
         return normalized;
+    }
+
+    private static List<Path> discoverClassesRoots(Path projectDir) {
+        LinkedHashSet<Path> roots = new LinkedHashSet<Path>();
+        Path mavenMain = projectDir.resolve("target/classes").toAbsolutePath().normalize();
+        if (Files.isDirectory(mavenMain)) {
+            roots.add(mavenMain);
+        }
+        try (Stream<Path> stream = Files.walk(projectDir, 8)) {
+            List<Path> detected = stream
+                    .filter(Files::isDirectory)
+                    .filter(path -> path.toString().endsWith(File.separator + "target" + File.separator + "classes")
+                            || path.toString().endsWith(File.separator + "build" + File.separator + "classes" + File.separator + "java" + File.separator + "main"))
+                    .collect(Collectors.toList());
+            for (Path path : detected) {
+                roots.add(path.toAbsolutePath().normalize());
+            }
+        } catch (IOException ignored) {
+            // best effort auto-discovery
+        }
+        return new ArrayList<Path>(roots);
+    }
+
+    private static List<Path> discoverClasspathEntries(Path projectDir) {
+        LinkedHashSet<Path> entries = new LinkedHashSet<Path>();
+        try (Stream<Path> stream = Files.walk(projectDir, 8)) {
+            List<Path> jars = stream
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.toString().endsWith(".jar"))
+                    .filter(path -> {
+                        String normalized = path.toString().replace('\\', '/');
+                        return normalized.contains("/target/") || normalized.contains("/lib/");
+                    })
+                    .collect(Collectors.toList());
+            for (Path jar : jars) {
+                entries.add(jar.toAbsolutePath().normalize());
+            }
+        } catch (IOException ignored) {
+            // best effort auto-discovery
+        }
+        return new ArrayList<Path>(entries);
     }
 
     private static List<String> normalizeTokens(List<String> raw) {
@@ -979,5 +1081,32 @@ public class RuntimeSandboxSimulator {
         public final AtomicInteger transformed = new AtomicInteger(0);
         public final AtomicInteger ignored = new AtomicInteger(0);
         public final AtomicInteger errors = new AtomicInteger(0);
+    }
+
+    public static class EntryMethodInput {
+        public final String classPart;
+        public final String methodPart;
+
+        public EntryMethodInput(String classPart, String methodPart) {
+            this.classPart = classPart;
+            this.methodPart = methodPart;
+        }
+
+        public static EntryMethodInput parse(String raw) {
+            if (raw == null) {
+                return new EntryMethodInput(null, "");
+            }
+            String value = raw.trim();
+            if (value.isEmpty()) {
+                return new EntryMethodInput(null, "");
+            }
+            int hash = value.lastIndexOf('#');
+            if (hash <= 0 || hash + 1 >= value.length()) {
+                return new EntryMethodInput(null, value);
+            }
+            String classPart = value.substring(0, hash).trim();
+            String methodPart = value.substring(hash + 1).trim();
+            return new EntryMethodInput(classPart.isEmpty() ? null : classPart, methodPart);
+        }
     }
 }
