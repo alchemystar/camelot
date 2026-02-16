@@ -48,6 +48,7 @@ import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -901,6 +902,7 @@ public class SpringCallPathAnalyzer {
             for (FieldModel fieldModel : classModel.fields.values()) {
                 boolean isInjectionPoint = !Collections.disjoint(fieldModel.annotations, INJECTION_ANNOTATIONS);
                 boolean isResource = fieldModel.annotations.contains("Resource");
+                boolean resolvedByResourceName = false;
 
                 if (isResource) {
                     String resourceName = fieldModel.resourceName;
@@ -910,13 +912,21 @@ public class SpringCallPathAnalyzer {
                     Set<String> byBean = resolveClassesByBeanId(resourceName, beanRegistry, javaModel);
                     if (!byBean.isEmpty()) {
                         targetsByField.computeIfAbsent(fieldModel.name, k -> new TargetSet()).addAll(byBean, "XML/ANNOTATION:resource");
+                        resolvedByResourceName = true;
                     }
                 }
 
-                if (isInjectionPoint) {
+                if (isInjectionPoint && !resolvedByResourceName) {
                     Set<String> byType = resolveClassesByType(fieldModel.typeName, javaModel);
                     if (!byType.isEmpty()) {
-                        targetsByField.computeIfAbsent(fieldModel.name, k -> new TargetSet()).addAll(byType, "ANNOTATION:type");
+                        NarrowedInjectionTargets narrowed = narrowInjectionTargets(
+                                fieldModel.name,
+                                byType,
+                                javaModel,
+                                beanRegistry
+                        );
+                        targetsByField.computeIfAbsent(fieldModel.name, k -> new TargetSet())
+                                .addAll(narrowed.targets, narrowed.reason);
                     }
                 }
             }
@@ -924,7 +934,18 @@ public class SpringCallPathAnalyzer {
             for (Map.Entry<String, String> ctorEntry : classModel.constructorInjectedFieldTypes.entrySet()) {
                 Set<String> byType = resolveClassesByType(ctorEntry.getValue(), javaModel);
                 if (!byType.isEmpty()) {
-                    targetsByField.computeIfAbsent(ctorEntry.getKey(), k -> new TargetSet()).addAll(byType, "ANNOTATION:ctor");
+                    NarrowedInjectionTargets narrowed = narrowInjectionTargets(
+                            ctorEntry.getKey(),
+                            byType,
+                            javaModel,
+                            beanRegistry
+                    );
+                    String reason = "ANNOTATION:ctor";
+                    if (!"ANNOTATION:type".equals(narrowed.reason)) {
+                        reason = reason + "+" + narrowed.reason;
+                    }
+                    targetsByField.computeIfAbsent(ctorEntry.getKey(), k -> new TargetSet())
+                            .addAll(narrowed.targets, reason);
                 }
             }
         }
@@ -949,6 +970,71 @@ public class SpringCallPathAnalyzer {
         }
 
         return registry;
+    }
+
+    private NarrowedInjectionTargets narrowInjectionTargets(String fieldName,
+                                                            Set<String> typeCandidates,
+                                                            JavaModel javaModel,
+                                                            BeanRegistry beanRegistry) {
+        if (typeCandidates == null || typeCandidates.isEmpty()) {
+            return new NarrowedInjectionTargets(Collections.<String>emptySet(), "ANNOTATION:type");
+        }
+        if (typeCandidates.size() == 1) {
+            return new NarrowedInjectionTargets(typeCandidates, "ANNOTATION:type");
+        }
+
+        Set<String> byName = resolveClassesByBeanId(fieldName, beanRegistry, javaModel);
+        Set<String> nameMatched = intersect(typeCandidates, byName);
+        if (!nameMatched.isEmpty()) {
+            return new NarrowedInjectionTargets(nameMatched, "ANNOTATION:name");
+        }
+
+        Set<String> primaryMatched = new LinkedHashSet<String>();
+        for (String candidate : typeCandidates) {
+            ClassModel model = javaModel.classesByName.get(candidate);
+            if (model != null && model.annotations.contains("Primary")) {
+                primaryMatched.add(candidate);
+            }
+        }
+        if (primaryMatched.size() == 1) {
+            return new NarrowedInjectionTargets(primaryMatched, "ANNOTATION:primary");
+        }
+
+        Set<String> simpleNameMatched = new LinkedHashSet<String>();
+        String normalizedField = fieldName == null ? "" : fieldName.trim();
+        for (String candidate : typeCandidates) {
+            String simple = simpleName(candidate);
+            if (isBlank(simple)) {
+                continue;
+            }
+            String beanId = decapitalize(simple);
+            if (normalizedField.equals(beanId)) {
+                simpleNameMatched.add(candidate);
+                continue;
+            }
+            if (normalizedField.equals(beanId + "Impl")
+                    || normalizedField.equals(beanId + "Service")
+                    || normalizedField.equals(beanId + "Client")) {
+                simpleNameMatched.add(candidate);
+            }
+        }
+        if (simpleNameMatched.size() == 1) {
+            return new NarrowedInjectionTargets(simpleNameMatched, "ANNOTATION:field-name");
+        }
+        return new NarrowedInjectionTargets(typeCandidates, "ANNOTATION:type");
+    }
+
+    private Set<String> intersect(Set<String> left, Set<String> right) {
+        if (left == null || left.isEmpty() || right == null || right.isEmpty()) {
+            return Collections.emptySet();
+        }
+        Set<String> intersection = new LinkedHashSet<String>();
+        for (String value : left) {
+            if (right.contains(value)) {
+                intersection.add(value);
+            }
+        }
+        return intersection;
     }
 
     private Map<String, MethodModel> collectMethods(JavaModel javaModel) {
@@ -977,6 +1063,7 @@ public class SpringCallPathAnalyzer {
             TypeFlowContext rootContext = TypeFlowContext.forRoot(entryMethod.className);
             Deque<String> visitingMethods = new ArrayDeque<String>();
             Set<String> visitingFrames = new LinkedHashSet<String>();
+            Deque<InvocationFrame> frameStack = new ArrayDeque<InvocationFrame>();
             traverseMethodWithContext(
                     entryMethodId,
                     rootContext,
@@ -988,6 +1075,7 @@ public class SpringCallPathAnalyzer {
                     visitingMethods,
                     visitingFrames,
                     expandedFrameDepth,
+                    frameStack,
                     edgeMap
             );
         }
@@ -1017,6 +1105,7 @@ public class SpringCallPathAnalyzer {
                                            Deque<String> visitingMethods,
                                            Set<String> visitingFrames,
                                            Map<String, Integer> expandedFrameDepth,
+                                           Deque<InvocationFrame> frameStack,
                                            Map<String, CallEdgeAccumulator> edgeMap) {
         if (depth > Math.max(maxDepth, 0)) {
             return;
@@ -1032,7 +1121,7 @@ public class SpringCallPathAnalyzer {
         debugLogger.log("TRAVERSE_ENTER method=%s depth=%d", methodId, depth);
 
         TypeFlowContext methodContext = initializeMethodContext(classModel, methodModel, incomingContext, javaModel);
-        String frameKey = methodId + "@" + methodContext.signature();
+        String frameKey = methodId + "@" + methodContext.signature() + "@stack=" + stackDispatchSignature(frameStack);
         Integer expandedDepth = expandedFrameDepth.get(frameKey);
         if (expandedDepth != null && expandedDepth.intValue() <= depth) {
             debugLogger.log(
@@ -1054,6 +1143,14 @@ public class SpringCallPathAnalyzer {
             return;
         }
         visitingMethods.addLast(methodId);
+        InvocationFrame invocationFrame = new InvocationFrame(methodId, classModel.fqcn, depth, methodContext);
+        frameStack.addLast(invocationFrame);
+        debugLogger.log(
+                "FRAME_PUSH method=%s depth=%d stack=%s",
+                methodId,
+                depth,
+                stackSignature(frameStack)
+        );
         try {
             List<CallSite> calls = new ArrayList<CallSite>(methodModel.calls);
             calls.sort(Comparator.comparingInt(c -> c.line <= 0 ? Integer.MAX_VALUE : c.line));
@@ -1080,13 +1177,15 @@ public class SpringCallPathAnalyzer {
                         methodContext,
                         javaModel,
                         methodsById,
-                        injectionRegistry
+                        injectionRegistry,
+                        frameStack
                 );
                 List<ResolvedCallTarget> candidates = resolveCallTargetsWithContext(
                         classModel,
                         methodModel,
                         call,
                         methodContext,
+                        frameStack,
                         javaModel,
                         methodsById,
                         injectionRegistry,
@@ -1123,17 +1222,19 @@ public class SpringCallPathAnalyzer {
                 if (depth >= Math.max(maxDepth, 0) && candidates.size() > MAX_DEPTH_FRONTIER_EDGE_LIMIT) {
                     candidates = limitFrontierCandidatesAtMaxDepth(candidates, methodModel.id, call, depth, maxDepth);
                 }
+                bindSelectedReceiverType(call, methodContext, candidates, methodModel, javaModel);
 
                 if (candidates.isEmpty()) {
                     debugLogger.log(
-                            "TRAVERSE_CALL_UNRESOLVED from=%s line=%d call=%s/%d scope=%s scopeToken=%s contextTypes=%s",
+                            "TRAVERSE_CALL_UNRESOLVED from=%s line=%d call=%s/%d scope=%s scopeToken=%s contextTypes=%s stack=%s",
                             methodModel.id,
                             call.line,
                             call.methodName,
                             call.argumentCount,
                             call.scopeType,
                             call.scopeToken,
-                            methodContext.signature()
+                            methodContext.signature(),
+                            stackSignature(frameStack)
                     );
                     String stopReason = detectUnsupportedStopReason(call);
                     if (!isBlank(stopReason)) {
@@ -1155,12 +1256,13 @@ public class SpringCallPathAnalyzer {
                     if (depth >= Math.max(maxDepth, 0)) {
                         continue;
                     }
+                    String runtimeReceiverClass = selectRuntimeReceiverClass(candidate, calleeMethod, javaModel);
                     TypeFlowContext calleeContext = buildCalleeContext(
                             classModel,
                             methodModel,
                             call,
                             calleeMethod,
-                            candidate.receiverClassName,
+                            runtimeReceiverClass,
                             methodContext,
                             javaModel,
                             methodsById,
@@ -1177,11 +1279,19 @@ public class SpringCallPathAnalyzer {
                             visitingMethods,
                             visitingFrames,
                             expandedFrameDepth,
+                            frameStack,
                             edgeMap
                     );
                 }
             }
         } finally {
+            InvocationFrame exitedFrame = frameStack.removeLast();
+            debugLogger.log(
+                    "FRAME_POP method=%s depth=%d stack=%s",
+                    exitedFrame.methodId,
+                    depth,
+                    stackSignature(frameStack)
+            );
             debugLogger.log("TRAVERSE_EXIT method=%s depth=%d", methodId, depth);
             visitingMethods.removeLast();
             visitingFrames.remove(frameKey);
@@ -1196,7 +1306,8 @@ public class SpringCallPathAnalyzer {
                                            TypeFlowContext methodContext,
                                            JavaModel javaModel,
                                            Map<String, MethodModel> methodsById,
-                                           InjectionRegistry injectionRegistry) {
+                                           InjectionRegistry injectionRegistry,
+                                           Deque<InvocationFrame> frameStack) {
         if (assignments == null || assignments.isEmpty()) {
             return assignmentIdx;
         }
@@ -1217,7 +1328,8 @@ public class SpringCallPathAnalyzer {
                     methodContext,
                     javaModel,
                     methodsById,
-                    injectionRegistry
+                    injectionRegistry,
+                    frameStack
             );
             if (!inferredTypes.isEmpty()) {
                 methodContext.variableTypes.put(assignment.targetVar, inferredTypes);
@@ -1240,7 +1352,8 @@ public class SpringCallPathAnalyzer {
                                             TypeFlowContext methodContext,
                                             JavaModel javaModel,
                                             Map<String, MethodModel> methodsById,
-                                            InjectionRegistry injectionRegistry) {
+                                            InjectionRegistry injectionRegistry,
+                                            Deque<InvocationFrame> frameStack) {
         if (valueExpr == null) {
             return Collections.emptySet();
         }
@@ -1267,6 +1380,7 @@ public class SpringCallPathAnalyzer {
                 methodModel,
                 valueExpr.callSite,
                 methodContext,
+                frameStack,
                 javaModel,
                 methodsById,
                 injectionRegistry,
@@ -1393,6 +1507,7 @@ public class SpringCallPathAnalyzer {
                                                                    MethodModel methodModel,
                                                                    CallSite call,
                                                                    TypeFlowContext context,
+                                                                   Deque<InvocationFrame> frameStack,
                                                                    JavaModel javaModel,
                                                                    Map<String, MethodModel> methodsById,
                                                                    InjectionRegistry injectionRegistry,
@@ -1423,7 +1538,15 @@ public class SpringCallPathAnalyzer {
                         classModel.fqcn
                 );
             }
-            return deduplicateResolvedTargets(resolved);
+            return narrowAmbiguousTargets(
+                    deduplicateResolvedTargets(resolved),
+                    classModel,
+                    methodModel,
+                    call,
+                    context,
+                    frameStack,
+                    javaModel
+            );
         }
 
         if (call.scopeType == ScopeType.NAME && call.scopeToken != null) {
@@ -1452,7 +1575,15 @@ public class SpringCallPathAnalyzer {
                 }
             }
             if (resolvedByInjection) {
-                return deduplicateResolvedTargets(resolved);
+                return narrowAmbiguousTargets(
+                        deduplicateResolvedTargets(resolved),
+                        classModel,
+                        methodModel,
+                        call,
+                        context,
+                        frameStack,
+                        javaModel
+                );
             }
 
             Set<String> runtimeTypes = context == null ? Collections.<String>emptySet()
@@ -1467,7 +1598,15 @@ public class SpringCallPathAnalyzer {
                     );
                 }
                 if (!resolved.isEmpty()) {
-                    return deduplicateResolvedTargets(resolved);
+                    return narrowAmbiguousTargets(
+                            deduplicateResolvedTargets(resolved),
+                            classModel,
+                            methodModel,
+                            call,
+                            context,
+                            frameStack,
+                            javaModel
+                    );
                 }
             }
 
@@ -1490,7 +1629,15 @@ public class SpringCallPathAnalyzer {
                     );
                 }
                 if (!resolved.isEmpty()) {
-                    return deduplicateResolvedTargets(resolved);
+                    return narrowAmbiguousTargets(
+                            deduplicateResolvedTargets(resolved),
+                            classModel,
+                            methodModel,
+                            call,
+                            context,
+                            frameStack,
+                            javaModel
+                    );
                 }
             }
 
@@ -1501,7 +1648,15 @@ public class SpringCallPathAnalyzer {
                     addResolvedTargets(resolved, resolveMethodByReceiverDispatch(localCandidate, call, javaModel), "JAVA:local-var", localCandidate);
                 }
                 if (!resolved.isEmpty()) {
-                    return deduplicateResolvedTargets(resolved);
+                    return narrowAmbiguousTargets(
+                            deduplicateResolvedTargets(resolved),
+                            classModel,
+                            methodModel,
+                            call,
+                            context,
+                            frameStack,
+                            javaModel
+                    );
                 }
             }
 
@@ -1512,7 +1667,15 @@ public class SpringCallPathAnalyzer {
                     addResolvedTargets(resolved, resolveMethodByReceiverDispatch(typeCandidate, call, javaModel), "JAVA:field-type", typeCandidate);
                 }
                 if (!resolved.isEmpty()) {
-                    return deduplicateResolvedTargets(resolved);
+                    return narrowAmbiguousTargets(
+                            deduplicateResolvedTargets(resolved),
+                            classModel,
+                            methodModel,
+                            call,
+                            context,
+                            frameStack,
+                            javaModel
+                    );
                 }
             }
 
@@ -1527,7 +1690,15 @@ public class SpringCallPathAnalyzer {
                     );
                 }
             }
-            return deduplicateResolvedTargets(resolved);
+            return narrowAmbiguousTargets(
+                    deduplicateResolvedTargets(resolved),
+                    classModel,
+                    methodModel,
+                    call,
+                    context,
+                    frameStack,
+                    javaModel
+            );
         }
 
         if (call.scopeType == ScopeType.METHOD_CALL && call.scopeCall != null) {
@@ -1536,6 +1707,7 @@ public class SpringCallPathAnalyzer {
                     methodModel,
                     call.scopeCall,
                     context,
+                    frameStack,
                     javaModel,
                     methodsById,
                     injectionRegistry,
@@ -1564,7 +1736,15 @@ public class SpringCallPathAnalyzer {
                     );
                 }
             }
-            return deduplicateResolvedTargets(resolved);
+            return narrowAmbiguousTargets(
+                    deduplicateResolvedTargets(resolved),
+                    classModel,
+                    methodModel,
+                    call,
+                    context,
+                    frameStack,
+                    javaModel
+            );
         }
         return Collections.emptyList();
     }
@@ -1599,6 +1779,372 @@ public class SpringCallPathAnalyzer {
             unique.put(key, new ResolvedCallTarget(existing.methodId, mergedReason, existing.receiverClassName));
         }
         return new ArrayList<ResolvedCallTarget>(unique.values());
+    }
+
+    private List<ResolvedCallTarget> narrowAmbiguousTargets(List<ResolvedCallTarget> candidates,
+                                                            ClassModel callerClass,
+                                                            MethodModel callerMethod,
+                                                            CallSite call,
+                                                            TypeFlowContext context,
+                                                            Deque<InvocationFrame> frameStack,
+                                                            JavaModel javaModel) {
+        if (candidates == null || candidates.size() <= 1) {
+            return candidates == null ? Collections.<ResolvedCallTarget>emptyList() : candidates;
+        }
+        int bestScore = Integer.MIN_VALUE;
+        List<ResolvedCallTarget> best = new ArrayList<ResolvedCallTarget>();
+        for (ResolvedCallTarget candidate : candidates) {
+            int score = scoreResolvedTarget(candidate, callerClass, call, context, frameStack, javaModel);
+            if (score > bestScore) {
+                bestScore = score;
+                best.clear();
+                best.add(candidate);
+            } else if (score == bestScore) {
+                best.add(candidate);
+            }
+        }
+        if (best.isEmpty()) {
+            return candidates;
+        }
+        best.sort(Comparator
+                .comparing((ResolvedCallTarget c) -> c.methodId == null ? "" : c.methodId)
+                .thenComparing(c -> c.receiverClassName == null ? "" : c.receiverClassName)
+                .thenComparing(c -> c.reason == null ? "" : c.reason));
+        ResolvedCallTarget selected = best.get(0);
+        if (candidates.size() > 1) {
+            debugLogger.log(
+                    "AMBIGUOUS_DISPATCH_PRUNE from=%s line=%d call=%s/%d scopeToken=%s candidates=%d selected=%s score=%d stack=%s",
+                    callerMethod == null ? "" : callerMethod.id,
+                    call == null ? -1 : call.line,
+                    call == null ? "" : call.methodName,
+                    call == null ? -1 : call.argumentCount,
+                    call == null ? "" : call.scopeToken,
+                    candidates.size(),
+                    selected.methodId,
+                    bestScore,
+                    stackSignature(frameStack)
+            );
+        }
+        return Collections.singletonList(selected);
+    }
+
+    private int scoreResolvedTarget(ResolvedCallTarget candidate,
+                                    ClassModel callerClass,
+                                    CallSite call,
+                                    TypeFlowContext context,
+                                    Deque<InvocationFrame> frameStack,
+                                    JavaModel javaModel) {
+        if (candidate == null) {
+            return Integer.MIN_VALUE / 2;
+        }
+        int score = 0;
+        String reason = candidate.reason == null ? "" : candidate.reason.toLowerCase(Locale.ROOT);
+        if (reason.contains("annotation:name")
+                || reason.contains("xml/annotation:resource")
+                || reason.contains("annotation:primary")
+                || reason.contains("annotation:field-name")) {
+            score += 500;
+        }
+        if (reason.contains("ctx:runtime-var")) {
+            score += 280;
+        }
+        if (reason.contains("ctx:token-infer")) {
+            score += 240;
+        }
+        if (reason.contains("annotation:type")) {
+            score += 120;
+        }
+        if (reason.contains("java:field-type")) {
+            score += 100;
+        }
+        if (reason.contains("chain:")) {
+            score += 80;
+        }
+
+        String targetClass = extractClassName(candidate.methodId);
+        String receiverClass = selectRuntimeReceiverClass(candidate, null, javaModel);
+        ClassModel targetModel = javaModel.classesByName.get(targetClass);
+        if (targetModel != null) {
+            if (targetModel.isInterface) {
+                score -= 180;
+            }
+            if (targetModel.isAbstract) {
+                score -= 140;
+            }
+        }
+
+        if (!isBlank(candidate.receiverClassName) && candidate.receiverClassName.equals(targetClass)) {
+            score += 120;
+        }
+        if (context != null && context.thisTypeNames.contains(targetClass)) {
+            score += 60;
+        }
+        if (callerClass != null && !isBlank(callerClass.packageName) && !isBlank(targetClass)) {
+            String callerPrefix = packagePrefix(callerClass.packageName);
+            String targetPackage = packageName(targetClass);
+            if (!isBlank(callerPrefix) && targetPackage.startsWith(callerPrefix)) {
+                score += 30;
+            }
+        }
+        Set<String> expectedReceiverTypes = collectExpectedReceiverTypes(call, context, frameStack);
+        if (!expectedReceiverTypes.isEmpty() && !isBlank(receiverClass)) {
+            int distance = bestHierarchyDistance(receiverClass, expectedReceiverTypes, javaModel);
+            if (distance == 0) {
+                score += 300;
+            } else if (distance < Integer.MAX_VALUE / 4) {
+                score += Math.max(120, 260 - (distance * 35));
+            } else {
+                score -= 160;
+            }
+        }
+        if (call != null && (call.scopeType == ScopeType.THIS || call.scopeType == ScopeType.UNSCOPED) && !isBlank(targetClass)) {
+            InvocationFrame currentFrame = currentFrame(frameStack);
+            if (currentFrame != null && currentFrame.runtimeThisTypes.contains(targetClass)) {
+                score += 140;
+            }
+        }
+        if (call != null && !isBlank(call.scopeToken) && !isBlank(targetClass)) {
+            String token = call.scopeToken.toLowerCase(Locale.ROOT);
+            String simple = simpleName(targetClass).toLowerCase(Locale.ROOT);
+            if (simple.equals(token) || simple.equals(token + "impl") || token.equals(decapitalize(simple))) {
+                score += 90;
+            } else if (simple.contains(token)) {
+                score += 20;
+            }
+        }
+        return score;
+    }
+
+    private String extractClassName(String methodId) {
+        MethodIdInfo info = MethodIdInfo.parse(methodId);
+        return info == null ? "" : info.className;
+    }
+
+    private String packageName(String fqcn) {
+        if (isBlank(fqcn)) {
+            return "";
+        }
+        int idx = fqcn.lastIndexOf('.');
+        return idx < 0 ? "" : fqcn.substring(0, idx);
+    }
+
+    private String packagePrefix(String packageName) {
+        if (isBlank(packageName)) {
+            return "";
+        }
+        String[] parts = packageName.split("\\.");
+        if (parts.length <= 2) {
+            return packageName;
+        }
+        return parts[0] + "." + parts[1];
+    }
+
+    private Set<String> collectExpectedReceiverTypes(CallSite call,
+                                                     TypeFlowContext context,
+                                                     Deque<InvocationFrame> frameStack) {
+        Set<String> expected = new LinkedHashSet<String>();
+        if (call == null) {
+            return expected;
+        }
+        if (call.scopeType == ScopeType.THIS || call.scopeType == ScopeType.UNSCOPED) {
+            if (context != null) {
+                expected.addAll(context.thisTypeNames);
+            }
+            InvocationFrame frame = currentFrame(frameStack);
+            if (frame != null) {
+                expected.addAll(frame.runtimeThisTypes);
+            }
+            return expected;
+        }
+        if (call.scopeType == ScopeType.NAME && !isBlank(call.scopeToken)) {
+            if (context != null) {
+                Set<String> local = context.variableTypes.get(call.scopeToken);
+                if (local != null) {
+                    expected.addAll(local);
+                }
+            }
+            Iterator<InvocationFrame> iterator = frameStack == null
+                    ? Collections.<InvocationFrame>emptyList().iterator()
+                    : frameStack.descendingIterator();
+            while (iterator.hasNext()) {
+                InvocationFrame frame = iterator.next();
+                Set<String> frameTypes = frame.context.variableTypes.get(call.scopeToken);
+                if (frameTypes != null && !frameTypes.isEmpty()) {
+                    expected.addAll(frameTypes);
+                    break;
+                }
+            }
+        }
+        return expected;
+    }
+
+    private int bestHierarchyDistance(String candidateType,
+                                      Set<String> expectedTypes,
+                                      JavaModel javaModel) {
+        if (isBlank(candidateType) || expectedTypes == null || expectedTypes.isEmpty()) {
+            return Integer.MAX_VALUE / 4;
+        }
+        int best = Integer.MAX_VALUE / 4;
+        for (String expected : expectedTypes) {
+            if (isBlank(expected)) {
+                continue;
+            }
+            int upwardDistance = hierarchyDistance(candidateType, expected, javaModel, 24);
+            int downwardDistance = hierarchyDistance(expected, candidateType, javaModel, 24);
+            int distance = Math.min(upwardDistance, downwardDistance);
+            if (distance < best) {
+                best = distance;
+            }
+        }
+        return best;
+    }
+
+    private int hierarchyDistance(String fromType,
+                                  String toType,
+                                  JavaModel javaModel,
+                                  int maxDepth) {
+        if (isBlank(fromType) || isBlank(toType)) {
+            return Integer.MAX_VALUE / 4;
+        }
+        if (fromType.equals(toType)) {
+            return 0;
+        }
+        Deque<String> queue = new ArrayDeque<String>();
+        Map<String, Integer> distance = new LinkedHashMap<String, Integer>();
+        queue.add(fromType);
+        distance.put(fromType, Integer.valueOf(0));
+        while (!queue.isEmpty()) {
+            String current = queue.removeFirst();
+            Integer currentDistance = distance.get(current);
+            if (currentDistance == null || currentDistance.intValue() >= maxDepth) {
+                continue;
+            }
+            ClassModel classModel = javaModel.classesByName.get(current);
+            if (classModel == null) {
+                continue;
+            }
+            Set<String> nextTypes = new LinkedHashSet<String>();
+            if (!isBlank(classModel.superType)) {
+                nextTypes.addAll(resolveDirectTypeNames(classModel.superType, javaModel));
+            }
+            for (String iface : classModel.implementedTypes) {
+                nextTypes.addAll(resolveDirectTypeNames(iface, javaModel));
+            }
+            for (String nextType : nextTypes) {
+                if (isBlank(nextType) || distance.containsKey(nextType)) {
+                    continue;
+                }
+                int nextDistance = currentDistance.intValue() + 1;
+                if (nextType.equals(toType)) {
+                    return nextDistance;
+                }
+                distance.put(nextType, Integer.valueOf(nextDistance));
+                queue.addLast(nextType);
+            }
+        }
+        return Integer.MAX_VALUE / 4;
+    }
+
+    private InvocationFrame currentFrame(Deque<InvocationFrame> frameStack) {
+        if (frameStack == null || frameStack.isEmpty()) {
+            return null;
+        }
+        return frameStack.peekLast();
+    }
+
+    private void bindSelectedReceiverType(CallSite call,
+                                          TypeFlowContext methodContext,
+                                          List<ResolvedCallTarget> candidates,
+                                          MethodModel methodModel,
+                                          JavaModel javaModel) {
+        if (call == null || methodContext == null || candidates == null || candidates.size() != 1) {
+            return;
+        }
+        if (call.scopeType != ScopeType.NAME || isBlank(call.scopeToken)) {
+            return;
+        }
+        if (isLikelyTypeReferenceToken(call.scopeToken)) {
+            return;
+        }
+        ResolvedCallTarget selected = candidates.get(0);
+        if (selected == null) {
+            return;
+        }
+        String resolvedType = selectRuntimeReceiverClass(selected, null, javaModel);
+        if (isBlank(resolvedType)) {
+            return;
+        }
+        Set<String> narrowed = new LinkedHashSet<String>();
+        narrowed.add(resolvedType);
+        methodContext.variableTypes.put(call.scopeToken, narrowed);
+        debugLogger.log(
+                "TYPE_FLOW_BIND_CALL method=%s line=%d var=%s type=%s target=%s",
+                methodModel == null ? "" : methodModel.id,
+                call.line,
+                call.scopeToken,
+                resolvedType,
+                selected.methodId
+        );
+    }
+
+    private String selectRuntimeReceiverClass(ResolvedCallTarget candidate,
+                                              MethodModel calleeMethod,
+                                              JavaModel javaModel) {
+        if (candidate == null) {
+            return "";
+        }
+        String ownerClass = calleeMethod == null ? extractClassName(candidate.methodId) : calleeMethod.className;
+        String receiverClass = candidate.receiverClassName;
+        if (isBlank(receiverClass)) {
+            return ownerClass;
+        }
+        if (isBlank(ownerClass)) {
+            return receiverClass;
+        }
+        if (receiverClass.equals(ownerClass)) {
+            return receiverClass;
+        }
+        ClassModel receiverModel = javaModel == null ? null : javaModel.classesByName.get(receiverClass);
+        ClassModel ownerModel = javaModel == null ? null : javaModel.classesByName.get(ownerClass);
+        if (receiverModel != null
+                && (receiverModel.isInterface || receiverModel.isAbstract)
+                && ownerModel != null
+                && !ownerModel.isInterface
+                && !ownerModel.isAbstract
+                && isAssignableTo(ownerClass, receiverClass, javaModel, new HashSet<String>())) {
+            return ownerClass;
+        }
+        return receiverClass;
+    }
+
+    private String stackSignature(Deque<InvocationFrame> frameStack) {
+        if (frameStack == null || frameStack.isEmpty()) {
+            return "[]";
+        }
+        StringBuilder sb = new StringBuilder("[");
+        int index = 0;
+        for (InvocationFrame frame : frameStack) {
+            if (index++ > 0) {
+                sb.append(" -> ");
+            }
+            sb.append(frame.methodId)
+                    .append("{this=")
+                    .append(String.join(",", frame.runtimeThisTypes))
+                    .append("}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private String stackDispatchSignature(Deque<InvocationFrame> frameStack) {
+        if (frameStack == null || frameStack.isEmpty()) {
+            return "ROOT";
+        }
+        List<String> signatures = new ArrayList<String>();
+        for (InvocationFrame frame : frameStack) {
+            signatures.add(frame.dispatchSignature());
+        }
+        return String.join("->", signatures);
     }
 
     private List<ResolvedCallTarget> limitFrontierCandidatesAtMaxDepth(List<ResolvedCallTarget> candidates,
@@ -4413,6 +4959,16 @@ public class SpringCallPathAnalyzer {
         }
     }
 
+    private static class NarrowedInjectionTargets {
+        private final Set<String> targets;
+        private final String reason;
+
+        private NarrowedInjectionTargets(Set<String> targets, String reason) {
+            this.targets = targets == null ? Collections.<String>emptySet() : new LinkedHashSet<String>(targets);
+            this.reason = isBlank(reason) ? "ANNOTATION:type" : reason;
+        }
+    }
+
     public static class ClassModel {
         public final String fqcn;
         public final String simpleName;
@@ -4599,6 +5155,31 @@ public class SpringCallPathAnalyzer {
                 parts.add(key + "=" + String.join(",", sortedTypes));
             }
             return String.join(";", parts);
+        }
+    }
+
+    private static class InvocationFrame {
+        public final String methodId;
+        public final String ownerClassName;
+        public final int depth;
+        public final Set<String> runtimeThisTypes = new LinkedHashSet<String>();
+        public final TypeFlowContext context;
+
+        private InvocationFrame(String methodId, String ownerClassName, int depth, TypeFlowContext context) {
+            this.methodId = methodId;
+            this.ownerClassName = ownerClassName;
+            this.depth = depth;
+            this.context = context == null ? new TypeFlowContext() : context;
+            this.runtimeThisTypes.addAll(this.context.thisTypeNames);
+            if (this.runtimeThisTypes.isEmpty() && !isBlank(ownerClassName)) {
+                this.runtimeThisTypes.add(ownerClassName);
+            }
+        }
+
+        private String dispatchSignature() {
+            List<String> sortedTypes = new ArrayList<String>(runtimeThisTypes);
+            Collections.sort(sortedTypes);
+            return methodId + "{this=" + String.join(",", sortedTypes) + "}";
         }
     }
 
