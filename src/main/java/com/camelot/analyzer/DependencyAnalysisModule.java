@@ -10,6 +10,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Set;
 
 public class DependencyAnalysisModule {
@@ -61,16 +63,152 @@ public class DependencyAnalysisModule {
                 codeResult.methodDisplay,
                 logger
         );
+        List<SpringCallPathAnalyzer.BeanDependencyEdge> beanDependencies = buildBeanDependencyEdges(
+                codeResult,
+                enrichedEdges,
+                logger
+        );
 
-        logger.log("DEPENDENCY_ANALYSIS_DONE edges=%d trees=%d", enrichedEdges.size(), trees.size());
+        logger.log("DEPENDENCY_ANALYSIS_DONE edges=%d trees=%d beanDeps=%d",
+                enrichedEdges.size(),
+                trees.size(),
+                beanDependencies.size());
         return new SpringCallPathAnalyzer.AnalysisReport(
                 Instant.now().toString(),
                 codeResult.projectRoot,
                 codeResult.methodDisplay,
                 enrichedEdges,
                 codeResult.endpoints,
+                beanDependencies,
                 trees
         );
+    }
+
+    private List<SpringCallPathAnalyzer.BeanDependencyEdge> buildBeanDependencyEdges(
+            SpringCallPathAnalyzer.CodeAnalysisResult codeResult,
+            List<SpringCallPathAnalyzer.CallEdge> edges,
+            SpringCallPathAnalyzer.DebugLogger debugLogger) {
+        if (codeResult == null || edges == null || edges.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Set<String> beanClasses = codeResult.beanClassNames == null
+                ? Collections.<String>emptySet()
+                : codeResult.beanClassNames;
+        if (beanClasses.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        Map<String, List<SpringCallPathAnalyzer.CallEdge>> edgesFrom =
+                new LinkedHashMap<String, List<SpringCallPathAnalyzer.CallEdge>>();
+        for (SpringCallPathAnalyzer.CallEdge edge : edges) {
+            edgesFrom.computeIfAbsent(edge.from, k -> new ArrayList<SpringCallPathAnalyzer.CallEdge>()).add(edge);
+        }
+        for (List<SpringCallPathAnalyzer.CallEdge> outgoing : edgesFrom.values()) {
+            outgoing.sort((a, b) -> {
+                int lineCompare = Integer.compare(a.line, b.line);
+                if (lineCompare != 0) {
+                    return lineCompare;
+                }
+                int toCompare = a.to.compareTo(b.to);
+                if (toCompare != 0) {
+                    return toCompare;
+                }
+                return a.reason.compareTo(b.reason);
+            });
+        }
+
+        Map<String, BeanDependencyAccumulator> accumulators = new LinkedHashMap<String, BeanDependencyAccumulator>();
+        Map<String, List<String>> methodsByClass = new LinkedHashMap<String, List<String>>();
+        for (SpringCallPathAnalyzer.MethodModel method : codeResult.methodsById.values()) {
+            methodsByClass.computeIfAbsent(method.className, k -> new ArrayList<String>()).add(method.id);
+        }
+
+        for (String sourceBean : beanClasses) {
+            List<String> startMethods = methodsByClass.get(sourceBean);
+            if (startMethods == null || startMethods.isEmpty()) {
+                continue;
+            }
+            for (String startMethod : startMethods) {
+                Deque<MethodHop> queue = new ArrayDeque<MethodHop>();
+                Map<String, Integer> bestDepth = new LinkedHashMap<String, Integer>();
+                queue.addLast(new MethodHop(startMethod, 0));
+                bestDepth.put(startMethod, Integer.valueOf(0));
+
+                while (!queue.isEmpty()) {
+                    MethodHop current = queue.removeFirst();
+                    List<SpringCallPathAnalyzer.CallEdge> outgoing = edgesFrom.get(current.methodId);
+                    if (outgoing == null || outgoing.isEmpty()) {
+                        continue;
+                    }
+                    for (SpringCallPathAnalyzer.CallEdge edge : outgoing) {
+                        String targetClass = toClassName(edge.to, codeResult.methodsById);
+                        if (isBlank(targetClass)) {
+                            continue;
+                        }
+                        int nextDepth = current.depth + 1;
+                        if (beanClasses.contains(targetClass)) {
+                            if (!sourceBean.equals(targetClass)) {
+                                String key = sourceBean + "->" + targetClass;
+                                BeanDependencyAccumulator acc = accumulators.get(key);
+                                if (acc == null) {
+                                    acc = new BeanDependencyAccumulator(sourceBean, targetClass);
+                                    accumulators.put(key, acc);
+                                }
+                                acc.pathCount++;
+                                acc.minHops = Math.min(acc.minHops, nextDepth);
+                                if (!isBlank(edge.reason) && acc.sampleReasons.size() < 5) {
+                                    acc.sampleReasons.add(edge.reason);
+                                }
+                            }
+                            continue;
+                        }
+
+                        Integer previousBest = bestDepth.get(edge.to);
+                        if (previousBest != null && previousBest.intValue() <= nextDepth) {
+                            continue;
+                        }
+                        bestDepth.put(edge.to, Integer.valueOf(nextDepth));
+                        queue.addLast(new MethodHop(edge.to, nextDepth));
+                    }
+                }
+            }
+        }
+
+        List<SpringCallPathAnalyzer.BeanDependencyEdge> result = new ArrayList<SpringCallPathAnalyzer.BeanDependencyEdge>();
+        for (BeanDependencyAccumulator acc : accumulators.values()) {
+            if (acc.pathCount <= 0 || acc.minHops == Integer.MAX_VALUE) {
+                continue;
+            }
+            result.add(new SpringCallPathAnalyzer.BeanDependencyEdge(
+                    acc.fromBeanClass,
+                    acc.toBeanClass,
+                    acc.minHops,
+                    acc.pathCount,
+                    new ArrayList<String>(acc.sampleReasons)
+            ));
+        }
+        result.sort((a, b) -> {
+            int fromCompare = a.fromBeanClass.compareTo(b.fromBeanClass);
+            if (fromCompare != 0) {
+                return fromCompare;
+            }
+            int toCompare = a.toBeanClass.compareTo(b.toBeanClass);
+            if (toCompare != 0) {
+                return toCompare;
+            }
+            return Integer.compare(a.minHops, b.minHops);
+        });
+        debugLogger.log("BEAN_DEP_GRAPH edges=%d beans=%d", result.size(), beanClasses.size());
+        return result;
+    }
+
+    private String toClassName(String methodId, Map<String, SpringCallPathAnalyzer.MethodModel> methodsById) {
+        SpringCallPathAnalyzer.MethodModel methodModel = methodsById.get(methodId);
+        if (methodModel != null) {
+            return methodModel.className;
+        }
+        SpringCallPathAnalyzer.MethodIdInfo info = SpringCallPathAnalyzer.MethodIdInfo.parse(methodId);
+        return info == null ? "" : info.className;
     }
 
     private List<SpringCallPathAnalyzer.CallEdge> enrichDependencyTypes(
@@ -418,6 +556,29 @@ public class DependencyAnalysisModule {
 
     private static boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    private static class MethodHop {
+        private final String methodId;
+        private final int depth;
+
+        private MethodHop(String methodId, int depth) {
+            this.methodId = methodId;
+            this.depth = depth;
+        }
+    }
+
+    private static class BeanDependencyAccumulator {
+        private final String fromBeanClass;
+        private final String toBeanClass;
+        private int minHops = Integer.MAX_VALUE;
+        private int pathCount = 0;
+        private final Set<String> sampleReasons = new LinkedHashSet<String>();
+
+        private BeanDependencyAccumulator(String fromBeanClass, String toBeanClass) {
+            this.fromBeanClass = fromBeanClass;
+            this.toBeanClass = toBeanClass;
+        }
     }
 
     private static class MutableDependencyNode {

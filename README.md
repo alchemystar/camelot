@@ -28,6 +28,7 @@
 - 输出
   - `analysis-report.json`
   - `call-graph.dot`
+  - `bean-dependency-graph.dot`（仅 Bean 依赖链）
   - `external-dependency-tree.txt`（仅外部依赖分支）
 
 ## 运行

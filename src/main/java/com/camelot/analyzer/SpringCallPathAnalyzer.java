@@ -85,6 +85,7 @@ public class SpringCallPathAnalyzer {
     );
     private static final int CALL_RESOLVE_MAX_DEPTH = 16;
     private static final int FLOW_TRACE_MAX_DEPTH = 50;
+    private static final int MAX_DEPTH_FRONTIER_EDGE_LIMIT = 10;
 
     public static void main(String[] args) throws Exception {
         CliOptions options = CliOptions.parse(args);
@@ -107,20 +108,24 @@ public class SpringCallPathAnalyzer {
         );
         Path jsonPath = options.outputDir.resolve("analysis-report.json");
         Path dotPath = options.outputDir.resolve("call-graph.dot");
+        Path beanDotPath = options.outputDir.resolve("bean-dependency-graph.dot");
         Path dependencyTreePath = options.outputDir.resolve("external-dependency-tree.txt");
 
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         mapper.writeValue(jsonPath.toFile(), report);
         Files.write(dotPath, report.toDot().getBytes(StandardCharsets.UTF_8));
+        Files.write(beanDotPath, report.toBeanDot().getBytes(StandardCharsets.UTF_8));
         Files.write(dependencyTreePath, report.toDependencyTreeText().getBytes(StandardCharsets.UTF_8));
 
         System.out.println("Analysis finished.");
         System.out.println("JSON report: " + jsonPath.toAbsolutePath());
         System.out.println("DOT graph:   " + dotPath.toAbsolutePath());
+        System.out.println("Bean DOT:    " + beanDotPath.toAbsolutePath());
         System.out.println("Dep tree:    " + dependencyTreePath.toAbsolutePath());
         System.out.println("Endpoints:   " + report.endpoints.size());
         System.out.println("Methods:     " + report.methodDisplay.size());
         System.out.println("Edges:       " + report.edges.size());
+        System.out.println("Bean edges:  " + report.beanDependencies.size());
         System.out.println("Ext trees:   " + report.externalDependencyTrees.size());
         if (!options.externalRpcPrefixes.isEmpty()) {
             System.out.println("External RPC prefixes: " + options.externalRpcPrefixes);
@@ -319,11 +324,26 @@ public class SpringCallPathAnalyzer {
                 methodsById,
                 methodDisplay,
                 filteredEdges,
-                endpointPaths
+                endpointPaths,
+                collectBeanClasses(beanRegistry)
         );
         } finally {
             this.debugLogger = previousLogger;
         }
+    }
+
+    private Set<String> collectBeanClasses(BeanRegistry beanRegistry) {
+        if (beanRegistry == null || beanRegistry.beanIdToClasses.isEmpty()) {
+            return Collections.emptySet();
+        }
+        Set<String> beans = new LinkedHashSet<String>();
+        for (Set<String> classes : beanRegistry.beanIdToClasses.values()) {
+            if (classes == null || classes.isEmpty()) {
+                continue;
+            }
+            beans.addAll(classes);
+        }
+        return beans;
     }
 
     private List<Endpoint> selectEndpoints(List<Endpoint> endpoints, String endpointPathFilter) {
@@ -1100,6 +1120,9 @@ public class SpringCallPathAnalyzer {
                     ));
                 }
                 candidates = deduplicateResolvedTargets(candidates);
+                if (depth >= Math.max(maxDepth, 0) && candidates.size() > MAX_DEPTH_FRONTIER_EDGE_LIMIT) {
+                    candidates = limitFrontierCandidatesAtMaxDepth(candidates, methodModel.id, call, depth, maxDepth);
+                }
 
                 if (candidates.isEmpty()) {
                     debugLogger.log(
@@ -1576,6 +1599,35 @@ public class SpringCallPathAnalyzer {
             unique.put(key, new ResolvedCallTarget(existing.methodId, mergedReason, existing.receiverClassName));
         }
         return new ArrayList<ResolvedCallTarget>(unique.values());
+    }
+
+    private List<ResolvedCallTarget> limitFrontierCandidatesAtMaxDepth(List<ResolvedCallTarget> candidates,
+                                                                        String fromMethodId,
+                                                                        CallSite call,
+                                                                        int depth,
+                                                                        int maxDepth) {
+        if (candidates == null || candidates.size() <= MAX_DEPTH_FRONTIER_EDGE_LIMIT) {
+            return candidates;
+        }
+        List<ResolvedCallTarget> sorted = new ArrayList<ResolvedCallTarget>(candidates);
+        sorted.sort(Comparator
+                .comparing((ResolvedCallTarget c) -> c.methodId == null ? "" : c.methodId)
+                .thenComparing(c -> c.receiverClassName == null ? "" : c.receiverClassName));
+        List<ResolvedCallTarget> limited = new ArrayList<ResolvedCallTarget>(
+                sorted.subList(0, MAX_DEPTH_FRONTIER_EDGE_LIMIT)
+        );
+        debugLogger.log(
+                "MAX_DEPTH_FRONTIER_TRIM from=%s line=%d call=%s/%d depth=%d maxDepth=%d kept=%d dropped=%d",
+                fromMethodId,
+                call == null ? -1 : call.line,
+                call == null ? "" : call.methodName,
+                call == null ? -1 : call.argumentCount,
+                depth,
+                maxDepth,
+                limited.size(),
+                sorted.size() - limited.size()
+        );
+        return limited;
     }
 
     private Set<String> inferMethodReturnTypes(String methodId,
@@ -3091,11 +3143,13 @@ public class SpringCallPathAnalyzer {
         }
         ClassModel startModel = javaModel.classesByName.get(className);
         if (startModel != null && (startModel.isInterface || startModel.isAbstract)) {
-            Set<String> expanded = new LinkedHashSet<String>();
-            expanded.addAll(resolveMethodByName(className, call, javaModel));
-            expanded.addAll(resolveMethodInDescendants(startModel, call, javaModel));
-            if (!expanded.isEmpty()) {
-                return expanded;
+            Set<String> descendants = resolveMethodInDescendants(startModel, call, javaModel);
+            if (!descendants.isEmpty()) {
+                return descendants;
+            }
+            Set<String> declarationOnly = resolveMethodByName(className, call, javaModel);
+            if (!declarationOnly.isEmpty()) {
+                return declarationOnly;
             }
         }
 
@@ -4032,19 +4086,24 @@ public class SpringCallPathAnalyzer {
         public final Map<String, String> methodDisplay;
         public final List<CallEdge> edges;
         public final List<EndpointPaths> endpoints;
+        public final Set<String> beanClassNames;
 
         public CodeAnalysisResult(String projectRoot,
                                   JavaModel javaModel,
                                   Map<String, MethodModel> methodsById,
                                   Map<String, String> methodDisplay,
                                   List<CallEdge> edges,
-                                  List<EndpointPaths> endpoints) {
+                                  List<EndpointPaths> endpoints,
+                                  Set<String> beanClassNames) {
             this.projectRoot = projectRoot;
             this.javaModel = javaModel;
             this.methodsById = methodsById;
             this.methodDisplay = methodDisplay;
             this.edges = edges;
             this.endpoints = endpoints;
+            this.beanClassNames = beanClassNames == null
+                    ? Collections.<String>emptySet()
+                    : new LinkedHashSet<String>(beanClassNames);
         }
     }
 
@@ -4054,6 +4113,7 @@ public class SpringCallPathAnalyzer {
         public final Map<String, String> methodDisplay;
         public final List<CallEdge> edges;
         public final List<EndpointPaths> endpoints;
+        public final List<BeanDependencyEdge> beanDependencies;
         public final List<ExternalDependencyTree> externalDependencyTrees;
 
         public AnalysisReport(String generatedAt,
@@ -4061,12 +4121,16 @@ public class SpringCallPathAnalyzer {
                               Map<String, String> methodDisplay,
                               List<CallEdge> edges,
                               List<EndpointPaths> endpoints,
+                              List<BeanDependencyEdge> beanDependencies,
                               List<ExternalDependencyTree> externalDependencyTrees) {
             this.generatedAt = generatedAt;
             this.projectRoot = projectRoot;
             this.methodDisplay = methodDisplay;
             this.edges = edges;
             this.endpoints = endpoints;
+            this.beanDependencies = beanDependencies == null
+                    ? new ArrayList<BeanDependencyEdge>()
+                    : beanDependencies;
             this.externalDependencyTrees = externalDependencyTrees;
         }
 
@@ -4117,6 +4181,44 @@ public class SpringCallPathAnalyzer {
                 appendDependencyNode(sb, tree.root, "  ");
                 sb.append("\n");
             }
+            return sb.toString();
+        }
+
+        public String toBeanDot() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("digraph BeanDependencyGraph {\n");
+            sb.append("  rankdir=LR;\n");
+            sb.append("  node [shape=box, fontsize=10];\n");
+            if (beanDependencies == null || beanDependencies.isEmpty()) {
+                sb.append("}\n");
+                return sb.toString();
+            }
+            Set<String> beanNodes = new LinkedHashSet<String>();
+            for (BeanDependencyEdge edge : beanDependencies) {
+                if (edge == null) {
+                    continue;
+                }
+                if (!isBlank(edge.fromBeanClass)) {
+                    beanNodes.add(edge.fromBeanClass);
+                }
+                if (!isBlank(edge.toBeanClass)) {
+                    beanNodes.add(edge.toBeanClass);
+                }
+            }
+            for (String bean : beanNodes) {
+                sb.append("  \"").append(escape(bean)).append("\" [label=\"")
+                        .append(escape(bean)).append("\"];\n");
+            }
+            for (BeanDependencyEdge edge : beanDependencies) {
+                if (edge == null || isBlank(edge.fromBeanClass) || isBlank(edge.toBeanClass)) {
+                    continue;
+                }
+                String label = "hops=" + edge.minHops + ",paths=" + edge.pathCount;
+                sb.append("  \"").append(escape(edge.fromBeanClass)).append("\" -> \"")
+                        .append(escape(edge.toBeanClass)).append("\" [label=\"")
+                        .append(escape(label)).append("\"];\n");
+            }
+            sb.append("}\n");
             return sb.toString();
         }
 
@@ -4219,6 +4321,26 @@ public class SpringCallPathAnalyzer {
             this.callReason = callReason;
             this.line = line;
             this.child = child;
+        }
+    }
+
+    public static class BeanDependencyEdge {
+        public final String fromBeanClass;
+        public final String toBeanClass;
+        public final int minHops;
+        public final int pathCount;
+        public final List<String> sampleReasons;
+
+        public BeanDependencyEdge(String fromBeanClass,
+                                  String toBeanClass,
+                                  int minHops,
+                                  int pathCount,
+                                  List<String> sampleReasons) {
+            this.fromBeanClass = fromBeanClass;
+            this.toBeanClass = toBeanClass;
+            this.minHops = minHops;
+            this.pathCount = pathCount;
+            this.sampleReasons = sampleReasons == null ? new ArrayList<String>() : sampleReasons;
         }
     }
 
