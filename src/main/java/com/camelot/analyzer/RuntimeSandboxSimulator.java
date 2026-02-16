@@ -1173,10 +1173,13 @@ public class RuntimeSandboxSimulator {
         private final Set<Class<?>> creating = new LinkedHashSet<Class<?>>();
         private final Map<String, List<Class<?>>> beanClassesByName = new LinkedHashMap<String, List<Class<?>>>();
         private final Map<Class<?>, Set<String>> beanNamesByClass = new LinkedHashMap<Class<?>, Set<String>>();
+        private final Map<String, Set<String>> beanNameSources = new LinkedHashMap<String, Set<String>>();
         private final Set<Class<?>> primaryBeanClasses = new LinkedHashSet<Class<?>>();
         private final Map<String, String> xmlAliasToName = new LinkedHashMap<String, String>();
         private int classLoadFailLogs = 0;
+        private int beanDebugLines = 0;
         private static final int MAX_CLASS_LOAD_FAIL_LOGS = 60;
+        private static final int MAX_BEAN_DEBUG_LINES = 800;
         private static final Set<String> COMPONENT_ANNOTATION_NAMES = new LinkedHashSet<String>(
                 Arrays.asList("Component", "Service", "Repository", "Controller", "RestController", "Configuration")
         );
@@ -1197,6 +1200,24 @@ public class RuntimeSandboxSimulator {
 
         public int getScannedClassCount() {
             return discoveredClassNames.size();
+        }
+
+        private void debugBean(String pattern, Object... args) {
+            if (!options.debugRuntime) {
+                return;
+            }
+            if (beanDebugLines < MAX_BEAN_DEBUG_LINES) {
+                String message = (args == null || args.length == 0)
+                        ? pattern
+                        : String.format(Locale.ROOT, pattern, args);
+                System.out.println("[RUNTIME_DEBUG] " + message);
+                beanDebugLines++;
+                return;
+            }
+            if (beanDebugLines == MAX_BEAN_DEBUG_LINES) {
+                System.out.println("[RUNTIME_DEBUG] BEAN_DEBUG_LOG_SUPPRESSED additional logs omitted");
+                beanDebugLines++;
+            }
         }
 
         public List<String> suggestClassNames(String missingClass, int limit) {
@@ -1235,24 +1256,30 @@ public class RuntimeSandboxSimulator {
         }
 
         public Object getBean(Class<?> requestedType) {
+            debugBean("BEAN_GET requestType=%s", requestedType == null ? "null" : requestedType.getName());
             Class<?> targetClass = resolveImplementationClass(requestedType, "", "");
             if (targetClass == null) {
                 if (requestedType.isInterface()) {
+                    debugBean("BEAN_GET_MOCK requestType=%s reason=no-impl", requestedType.getName());
                     return createInterfaceMock(requestedType);
                 }
                 throw new IllegalStateException("No implementation for type: " + requestedType.getName());
             }
             Object existing = singletonByConcreteClass.get(targetClass);
             if (existing != null) {
+                debugBean("BEAN_GET_HIT class=%s", targetClass.getName());
                 return existing;
             }
             if (!creating.add(targetClass)) {
+                debugBean("BEAN_GET_REENTRANT class=%s", targetClass.getName());
                 return singletonByConcreteClass.get(targetClass);
             }
             try {
+                debugBean("BEAN_CREATE class=%s", targetClass.getName());
                 Object instance = instantiate(targetClass);
                 singletonByConcreteClass.put(targetClass, instance);
                 injectFields(instance, targetClass);
+                debugBean("BEAN_CREATE_DONE class=%s", targetClass.getName());
                 return instance;
             } catch (Exception e) {
                 throw new RuntimeException("Create bean failed: " + targetClass.getName(), e);
@@ -1277,9 +1304,30 @@ public class RuntimeSandboxSimulator {
                         continue;
                     }
                     InjectionHint hint = resolveInjectionHint(field);
+                    debugBean(
+                            "BEAN_INJECT_FIELD owner=%s field=%s fieldType=%s hintName=%s qualifier=%s explicit=%s",
+                            type.getName(),
+                            field.getName(),
+                            field.getType().getName(),
+                            hint.preferredBeanName,
+                            hint.qualifier,
+                            String.valueOf(hint.explicitInjection)
+                    );
                     Object dependency = resolveDependency(field.getType(), field.getName(), hint);
                     if (dependency != null) {
                         field.set(instance, dependency);
+                        debugBean(
+                                "BEAN_INJECT_FIELD_OK owner=%s field=%s impl=%s",
+                                type.getName(),
+                                field.getName(),
+                                dependency.getClass().getName()
+                        );
+                    } else {
+                        debugBean(
+                                "BEAN_INJECT_FIELD_SKIP owner=%s field=%s reason=dependency-null",
+                                type.getName(),
+                                field.getName()
+                        );
                     }
                 }
                 current = current.getSuperclass();
@@ -1287,6 +1335,14 @@ public class RuntimeSandboxSimulator {
         }
 
         private Object resolveDependency(Class<?> dependencyType, String fieldName, InjectionHint hint) {
+            debugBean(
+                    "BEAN_RESOLVE type=%s field=%s hintName=%s qualifier=%s explicit=%s",
+                    dependencyType == null ? "null" : dependencyType.getName(),
+                    fieldName,
+                    hint == null ? "" : hint.preferredBeanName,
+                    hint == null ? "" : hint.qualifier,
+                    String.valueOf(hint != null && hint.explicitInjection)
+            );
             String preferredName = hint == null ? "" : hint.preferredBeanName;
             if (isBlank(preferredName)) {
                 preferredName = fieldName;
@@ -1294,30 +1350,41 @@ public class RuntimeSandboxSimulator {
             if (hint != null && !isBlank(hint.preferredBeanName)) {
                 Class<?> namedClass = resolveBeanClassByName(hint.preferredBeanName, dependencyType);
                 if (namedClass != null) {
+                    debugBean("BEAN_RESOLVE_HIT strategy=by-resource-name bean=%s type=%s",
+                            hint.preferredBeanName, namedClass.getName());
                     return getBean(namedClass);
                 }
             }
             if (hint != null && !isBlank(hint.qualifier)) {
                 Class<?> qualifierClass = resolveBeanClassByName(hint.qualifier, dependencyType);
                 if (qualifierClass != null) {
+                    debugBean("BEAN_RESOLVE_HIT strategy=by-qualifier bean=%s type=%s",
+                            hint.qualifier, qualifierClass.getName());
                     return getBean(qualifierClass);
                 }
             }
             if (dependencyType.isInterface()) {
                 Class<?> impl = resolveImplementationClass(dependencyType, fieldName, preferredName);
                 if (impl == null) {
+                    debugBean("BEAN_RESOLVE_MOCK type=%s reason=no-impl", dependencyType.getName());
                     return createInterfaceMock(dependencyType);
                 }
+                debugBean("BEAN_RESOLVE_HIT strategy=interface-impl type=%s impl=%s",
+                        dependencyType.getName(), impl.getName());
                 return getBean(impl);
             }
 
             if (Modifier.isAbstract(dependencyType.getModifiers())) {
                 Class<?> impl = resolveImplementationClass(dependencyType, fieldName, preferredName);
                 if (impl == null) {
+                    debugBean("BEAN_RESOLVE_SKIP type=%s reason=abstract-no-impl", dependencyType.getName());
                     return null;
                 }
+                debugBean("BEAN_RESOLVE_HIT strategy=abstract-impl type=%s impl=%s",
+                        dependencyType.getName(), impl.getName());
                 return getBean(impl);
             }
+            debugBean("BEAN_RESOLVE_HIT strategy=concrete type=%s", dependencyType.getName());
             return getBean(dependencyType);
         }
 
@@ -1386,6 +1453,13 @@ public class RuntimeSandboxSimulator {
             if (!isBlank(preferredBeanName)) {
                 Class<?> byName = resolveBeanClassByName(preferredBeanName, requestedType);
                 if (byName != null) {
+                    debugBean(
+                            "BEAN_IMPL_SELECT strategy=bean-name requested=%s field=%s bean=%s selected=%s",
+                            requestedType.getName(),
+                            fieldName,
+                            preferredBeanName,
+                            byName.getName()
+                    );
                     return byName;
                 }
             }
@@ -1404,10 +1478,21 @@ public class RuntimeSandboxSimulator {
                 candidates.add(candidate);
             }
             if (candidates.isEmpty()) {
+                debugBean(
+                        "BEAN_IMPL_SELECT_FAIL requested=%s field=%s preferred=%s candidates=0",
+                        requestedType.getName(),
+                        fieldName,
+                        preferredBeanName
+                );
                 return null;
             }
             String normalizedFieldName = normalizeBeanName(fieldName);
             String normalizedPreferredName = normalizeBeanName(preferredBeanName);
+            List<String> candidateWithScores = new ArrayList<String>();
+            for (Class<?> candidate : candidates) {
+                int score = scoreBeanCandidate(candidate, normalizedFieldName, normalizedPreferredName);
+                candidateWithScores.add(candidate.getName() + "(" + score + ")");
+            }
             candidates.sort((left, right) -> {
                 int scoreDiff = Integer.compare(
                         scoreBeanCandidate(right, normalizedFieldName, normalizedPreferredName),
@@ -1418,6 +1503,20 @@ public class RuntimeSandboxSimulator {
                 }
                 return left.getName().compareTo(right.getName());
             });
+            debugBean(
+                    "BEAN_IMPL_CANDIDATES requested=%s field=%s preferred=%s candidates=%s",
+                    requestedType.getName(),
+                    fieldName,
+                    preferredBeanName,
+                    candidateWithScores
+            );
+            debugBean(
+                    "BEAN_IMPL_SELECT strategy=scored requested=%s field=%s preferred=%s selected=%s",
+                    requestedType.getName(),
+                    fieldName,
+                    preferredBeanName,
+                    candidates.get(0).getName()
+            );
             return candidates.get(0);
         }
 
@@ -1473,6 +1572,7 @@ public class RuntimeSandboxSimulator {
                 System.out.println("[RUNTIME_DEBUG] SPRING_BEAN_METADATA names="
                         + beanClassesByName.size() + " primary=" + primaryBeanClasses.size());
             }
+            logBeanRegistrySnapshot();
         }
 
         private void registerClassLevelSpringBeans(Class<?> clazz) {
@@ -1486,9 +1586,10 @@ public class RuntimeSandboxSimulator {
             if (isBlank(explicitName)) {
                 explicitName = decapitalize(clazz.getSimpleName());
             }
-            registerBeanName(explicitName, clazz);
+            registerBeanName(explicitName, clazz, "ANNOTATION:class");
             if (hasAnnotation(clazz.getAnnotations(), "Primary")) {
                 primaryBeanClasses.add(clazz);
+                debugBean("BEAN_PRIMARY class=%s source=ANNOTATION:class", clazz.getName());
             }
         }
 
@@ -1510,10 +1611,20 @@ public class RuntimeSandboxSimulator {
                     beanNames.add(method.getName());
                 }
                 for (String beanName : beanNames) {
-                    registerBeanName(beanName, beanType);
+                    registerBeanName(
+                            beanName,
+                            beanType,
+                            "ANNOTATION:bean-method:" + method.getDeclaringClass().getName() + "#" + method.getName()
+                    );
                 }
                 if (hasAnnotation(method.getAnnotations(), "Primary")) {
                     primaryBeanClasses.add(beanType);
+                    debugBean(
+                            "BEAN_PRIMARY class=%s source=ANNOTATION:bean-method:%s#%s",
+                            beanType.getName(),
+                            method.getDeclaringClass().getName(),
+                            method.getName()
+                    );
                 }
             }
         }
@@ -1575,12 +1686,12 @@ public class RuntimeSandboxSimulator {
                     }
                     String id = normalizeBeanName(beanElement.getAttribute("id"));
                     if (!isBlank(id)) {
-                        registerBeanName(id, beanClass);
+                        registerBeanName(id, beanClass, "XML:" + xmlFile.toAbsolutePath());
                     }
                     String names = beanElement.getAttribute("name");
                     if (!isBlank(names)) {
                         for (String token : names.split("[,;\\s]+")) {
-                            registerBeanName(token, beanClass);
+                            registerBeanName(token, beanClass, "XML:" + xmlFile.toAbsolutePath());
                         }
                     }
                 }
@@ -1595,6 +1706,7 @@ public class RuntimeSandboxSimulator {
                     String alias = normalizeBeanName(aliasElement.getAttribute("alias"));
                     if (!isBlank(name) && !isBlank(alias)) {
                         xmlAliasToName.put(alias, name);
+                        debugBean("BEAN_ALIAS alias=%s name=%s source=XML:%s", alias, name, xmlFile.toAbsolutePath());
                     }
                 }
             } catch (Throwable error) {
@@ -1611,10 +1723,30 @@ public class RuntimeSandboxSimulator {
                 return null;
             }
             List<Class<?>> candidates = beanClassesByName.getOrDefault(normalized, Collections.<Class<?>>emptyList());
+            debugBean(
+                    "BEAN_NAME_LOOKUP bean=%s resolved=%s required=%s candidates=%s",
+                    beanName,
+                    normalized,
+                    requiredType == null ? "null" : requiredType.getName(),
+                    describeClassNames(candidates)
+            );
             Class<?> matched = chooseAssignableCandidate(candidates, requiredType);
             if (matched != null) {
+                debugBean(
+                        "BEAN_NAME_LOOKUP_HIT bean=%s resolved=%s required=%s selected=%s",
+                        beanName,
+                        normalized,
+                        requiredType == null ? "null" : requiredType.getName(),
+                        matched.getName()
+                );
                 return matched;
             }
+            debugBean(
+                    "BEAN_NAME_LOOKUP_MISS bean=%s resolved=%s required=%s",
+                    beanName,
+                    normalized,
+                    requiredType == null ? "null" : requiredType.getName()
+            );
             return null;
         }
 
@@ -1809,7 +1941,7 @@ public class RuntimeSandboxSimulator {
             return names;
         }
 
-        private void registerBeanName(String beanName, Class<?> beanClass) {
+        private void registerBeanName(String beanName, Class<?> beanClass, String source) {
             String normalized = normalizeBeanName(beanName);
             if (isBlank(normalized) || beanClass == null) {
                 return;
@@ -1820,6 +1952,15 @@ public class RuntimeSandboxSimulator {
             }
             Set<String> names = beanNamesByClass.computeIfAbsent(beanClass, k -> new LinkedHashSet<String>());
             names.add(normalized);
+            if (!isBlank(source)) {
+                beanNameSources.computeIfAbsent(normalized, k -> new LinkedHashSet<String>()).add(source);
+            }
+            debugBean(
+                    "BEAN_META_REGISTER name=%s class=%s source=%s",
+                    normalized,
+                    beanClass.getName(),
+                    isBlank(source) ? "unknown" : source
+            );
         }
 
         private String resolveAlias(String beanName) {
@@ -1832,6 +1973,45 @@ public class RuntimeSandboxSimulator {
                 current = xmlAliasToName.get(current);
             }
             return current;
+        }
+
+        private void logBeanRegistrySnapshot() {
+            if (!options.debugRuntime) {
+                return;
+            }
+            List<String> names = new ArrayList<String>(beanClassesByName.keySet());
+            Collections.sort(names);
+            debugBean("BEAN_META_SNAPSHOT totalNames=%d", names.size());
+            int printed = 0;
+            for (String name : names) {
+                if (printed >= 250) {
+                    debugBean("BEAN_META_SNAPSHOT_MORE remaining=%d", names.size() - printed);
+                    break;
+                }
+                List<Class<?>> classes = beanClassesByName.getOrDefault(name, Collections.<Class<?>>emptyList());
+                Set<String> sources = beanNameSources.getOrDefault(name, Collections.<String>emptySet());
+                debugBean(
+                        "BEAN_META name=%s classes=%s sources=%s",
+                        name,
+                        describeClassNames(classes),
+                        new ArrayList<String>(sources)
+                );
+                printed++;
+            }
+        }
+
+        private String describeClassNames(List<Class<?>> classes) {
+            if (classes == null || classes.isEmpty()) {
+                return "[]";
+            }
+            List<String> names = new ArrayList<String>();
+            for (Class<?> clazz : classes) {
+                if (clazz != null) {
+                    names.add(clazz.getName());
+                }
+            }
+            Collections.sort(names);
+            return names.toString();
         }
 
         private static String normalizeBeanName(String value) {
