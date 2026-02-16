@@ -80,8 +80,12 @@ public class RuntimeSandboxSimulator {
         report.arguments = new ArrayList<String>(options.arguments);
 
         long startedAt = System.currentTimeMillis();
+        SandboxBeanFactory beanFactory = null;
         try {
-            SandboxBeanFactory beanFactory = new SandboxBeanFactory(classLoader, options);
+            if (options.debugRuntime) {
+                printRuntimeStartDebug(options, classLoader);
+            }
+            beanFactory = new SandboxBeanFactory(classLoader, options);
             Class<?> entryClass = Class.forName(options.entryClass, true, classLoader);
             Method entryMethod = resolveEntryMethod(entryClass, options.entryMethod, options.arguments.size());
             Object entryBean = beanFactory.getBean(entryClass);
@@ -100,6 +104,13 @@ public class RuntimeSandboxSimulator {
             report.result = stringify(result);
         } catch (Throwable error) {
             report.error = rootErrorMessage(error);
+            Throwable missingClassCause = findMissingClassCause(error);
+            if (missingClassCause != null) {
+                System.out.println("[RUNTIME_DEBUG] Missing class detected: " + missingClassCause);
+                printMissingClassDiagnostics(options, classLoader, beanFactory, missingClassCause);
+            } else if (options.debugRuntime) {
+                printErrorChain(error);
+            }
         } finally {
             report.callCount = collector.getCallCount();
             report.edges = collector.snapshotEdges();
@@ -141,6 +152,79 @@ public class RuntimeSandboxSimulator {
             urls.add(path.toUri().toURL());
         }
         return new URLClassLoader(urls.toArray(new URL[0]), RuntimeSandboxSimulator.class.getClassLoader());
+    }
+
+    private static void printRuntimeStartDebug(CliOptions options, URLClassLoader classLoader) {
+        System.out.println("[RUNTIME_DEBUG] projectDir=" + options.projectDir);
+        System.out.println("[RUNTIME_DEBUG] entryClass=" + options.entryClass + " entryMethod=" + options.entryMethod);
+        System.out.println("[RUNTIME_DEBUG] classesRoots=" + options.classesRoots.size() + " classpathEntries=" + options.classpathEntries.size());
+        URL[] urls = classLoader.getURLs();
+        for (int i = 0; i < urls.length; i++) {
+            System.out.println("[RUNTIME_DEBUG] CLASSPATH[" + i + "] " + urls[i]);
+        }
+    }
+
+    private static void printErrorChain(Throwable error) {
+        Throwable current = error;
+        int depth = 0;
+        while (current != null && depth < 12) {
+            System.out.println("[RUNTIME_DEBUG] ERROR_CHAIN[" + depth + "] "
+                    + current.getClass().getName() + ": " + current.getMessage());
+            current = current.getCause();
+            depth++;
+        }
+    }
+
+    private static Throwable findMissingClassCause(Throwable error) {
+        Throwable current = error;
+        int depth = 0;
+        while (current != null && depth < 20) {
+            if (current instanceof ClassNotFoundException || current instanceof NoClassDefFoundError) {
+                return current;
+            }
+            current = current.getCause();
+            depth++;
+        }
+        return null;
+    }
+
+    private static void printMissingClassDiagnostics(CliOptions options,
+                                                     URLClassLoader classLoader,
+                                                     SandboxBeanFactory beanFactory,
+                                                     Throwable missingClassCause) {
+        String missingClass = extractMissingClassName(missingClassCause);
+        System.out.println("[RUNTIME_DEBUG] missingClass=" + missingClass);
+        System.out.println("[RUNTIME_DEBUG] entryClass=" + options.entryClass + " entryMethod=" + options.entryMethod);
+        System.out.println("[RUNTIME_DEBUG] classesRoots=" + options.classesRoots);
+        System.out.println("[RUNTIME_DEBUG] classpathEntries=" + options.classpathEntries);
+        URL[] urls = classLoader.getURLs();
+        System.out.println("[RUNTIME_DEBUG] effectiveClassLoaderUrls=" + urls.length);
+        for (int i = 0; i < urls.length; i++) {
+            System.out.println("[RUNTIME_DEBUG] effectiveUrl[" + i + "] " + urls[i]);
+        }
+
+        if (beanFactory != null) {
+            System.out.println("[RUNTIME_DEBUG] scannedClassCount=" + beanFactory.getScannedClassCount());
+            List<String> suggestions = beanFactory.suggestClassNames(missingClass, 12);
+            if (!suggestions.isEmpty()) {
+                System.out.println("[RUNTIME_DEBUG] classSuggestions=");
+                for (String suggestion : suggestions) {
+                    System.out.println("[RUNTIME_DEBUG]   - " + suggestion);
+                }
+            }
+        }
+        System.out.println("[RUNTIME_DEBUG] hint: check target/classes exists, or pass --classes/--classpath explicitly.");
+    }
+
+    private static String extractMissingClassName(Throwable missingClassCause) {
+        if (missingClassCause == null) {
+            return "";
+        }
+        String raw = missingClassCause.getMessage();
+        if (raw == null) {
+            return missingClassCause.toString();
+        }
+        return raw.replace('/', '.');
     }
 
     private static synchronized void installTracingAgent(CliOptions options) {
@@ -606,7 +690,42 @@ public class RuntimeSandboxSimulator {
         public SandboxBeanFactory(ClassLoader classLoader, CliOptions options) throws IOException {
             this.classLoader = classLoader;
             this.options = options;
-            this.scannedClasses = scanClasses(classLoader, options.classesRoots);
+            this.scannedClasses = scanClasses(classLoader, options.classesRoots, options.debugRuntime);
+        }
+
+        public int getScannedClassCount() {
+            return scannedClasses.size();
+        }
+
+        public List<String> suggestClassNames(String missingClass, int limit) {
+            if (missingClass == null || missingClass.trim().isEmpty() || scannedClasses.isEmpty()) {
+                return Collections.emptyList();
+            }
+            String normalized = missingClass.trim().replace('/', '.');
+            String normalizedLower = normalized.toLowerCase(Locale.ROOT);
+            String simpleName = normalized;
+            int dot = normalized.lastIndexOf('.');
+            if (dot >= 0 && dot + 1 < normalized.length()) {
+                simpleName = normalized.substring(dot + 1);
+            }
+            String simpleLower = simpleName.toLowerCase(Locale.ROOT);
+
+            LinkedHashSet<String> results = new LinkedHashSet<String>();
+            for (Class<?> clazz : scannedClasses) {
+                if (results.size() >= limit) {
+                    break;
+                }
+                String candidate = clazz.getName();
+                String candidateLower = candidate.toLowerCase(Locale.ROOT);
+                String candidateSimpleLower = clazz.getSimpleName().toLowerCase(Locale.ROOT);
+                if (candidateLower.equals(normalizedLower)
+                        || candidateSimpleLower.equals(simpleLower)
+                        || candidateLower.contains(simpleLower)
+                        || candidateLower.contains(normalizedLower)) {
+                    results.add(candidate);
+                }
+            }
+            return new ArrayList<String>(results);
         }
 
         public Object getBean(Class<?> requestedType) {
@@ -758,10 +877,17 @@ public class RuntimeSandboxSimulator {
             return Proxy.newProxyInstance(classLoader, new Class[]{iface}, handler);
         }
 
-        private static List<Class<?>> scanClasses(ClassLoader classLoader, List<Path> classRoots) throws IOException {
+        private static List<Class<?>> scanClasses(ClassLoader classLoader,
+                                                  List<Path> classRoots,
+                                                  boolean debugRuntime) throws IOException {
             List<Class<?>> classes = new ArrayList<Class<?>>();
+            int loadFailed = 0;
+            final int maxFailLogs = 40;
             for (Path root : classRoots) {
                 if (!Files.exists(root)) {
+                    if (debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SCAN_SKIP_MISSING_ROOT " + root);
+                    }
                     continue;
                 }
                 try (Stream<Path> stream = Files.walk(root)) {
@@ -777,11 +903,18 @@ public class RuntimeSandboxSimulator {
                         try {
                             Class<?> clazz = Class.forName(fqcn, false, classLoader);
                             classes.add(clazz);
-                        } catch (Throwable ignored) {
-                            // skip classes that cannot be loaded in sandbox mode
+                        } catch (Throwable error) {
+                            loadFailed++;
+                            if (debugRuntime && loadFailed <= maxFailLogs) {
+                                System.out.println("[RUNTIME_DEBUG] SCAN_LOAD_FAIL class="
+                                        + fqcn + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                            }
                         }
                     }
                 }
+            }
+            if (debugRuntime && loadFailed > maxFailLogs) {
+                System.out.println("[RUNTIME_DEBUG] SCAN_LOAD_FAIL additional=" + (loadFailed - maxFailLogs));
             }
             classes.sort(Comparator.comparing(Class::getName));
             return classes;
