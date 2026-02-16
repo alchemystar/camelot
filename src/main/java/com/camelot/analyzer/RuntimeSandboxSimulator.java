@@ -13,6 +13,8 @@ import net.bytebuddy.utility.JavaModule;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
@@ -104,6 +106,7 @@ public class RuntimeSandboxSimulator {
             report.result = stringify(result);
         } catch (Throwable error) {
             report.error = rootErrorMessage(error);
+            report.errorStack = stackTraceToString(error);
             Throwable missingClassCause = findMissingClassCause(error);
             if (missingClassCause != null) {
                 System.out.println("[RUNTIME_DEBUG] Missing class detected: " + missingClassCause);
@@ -140,6 +143,8 @@ public class RuntimeSandboxSimulator {
         }
         if (report.error != null) {
             System.out.println("Error:      " + report.error);
+            System.out.println("ErrorStack:");
+            System.out.println(report.errorStack);
         }
     }
 
@@ -460,6 +465,17 @@ public class RuntimeSandboxSimulator {
         return current.getClass().getName() + ": " + current.getMessage();
     }
 
+    private static String stackTraceToString(Throwable throwable) {
+        if (throwable == null) {
+            return "";
+        }
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        throwable.printStackTrace(pw);
+        pw.flush();
+        return sw.toString();
+    }
+
     private static List<String> toStringList(Collection<Path> paths) {
         List<String> list = new ArrayList<String>();
         for (Path path : paths) {
@@ -636,6 +652,7 @@ public class RuntimeSandboxSimulator {
         public List<String> arguments;
         public String result;
         public String error;
+        public String errorStack;
         public long durationMs;
         public int callCount;
         public List<RuntimeEdge> edges;
