@@ -12,6 +12,10 @@ public class DynamicPipeline {
     public static DynamicPipelineBuilder builder() {
         return DynamicPipelineBuilder.builder();
     }
+    
+    public void addHandler(PipelineStage stage){
+        this.stages.add(stage);
+    }
 
     public String execute(String input) {
         String current = input;

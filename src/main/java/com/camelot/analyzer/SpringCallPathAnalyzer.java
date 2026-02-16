@@ -1435,6 +1435,9 @@ public class SpringCallPathAnalyzer {
                                                               Set<String> visitingMethods,
                                                               Set<String> visitingVariables,
                                                               List<PipelineAssemblyArg> out) {
+        if (depth > 8) {
+            return;
+        }
         if (isBlank(variableName)) {
             return;
         }
@@ -1495,9 +1498,78 @@ public class SpringCallPathAnalyzer {
                         out
                 );
             }
+
+            // If the tracked variable is passed as an argument, continue tracing in callee parameter scope.
+            for (CallSite callSite : methodModel.calls) {
+                if (callSite.line > 0 && callSite.line > lineLimit) {
+                    continue;
+                }
+                List<Integer> boundIndexes = resolveArgumentIndexes(callSite.argumentTokens, variableName);
+                if (boundIndexes.isEmpty()) {
+                    continue;
+                }
+                Map<String, String> targets = resolveCallCandidates(
+                        classModel,
+                        methodModel,
+                        callSite,
+                        javaModel,
+                        methodsById,
+                        injectionRegistry,
+                        0
+                );
+                for (String targetMethodId : targets.keySet()) {
+                    MethodModel calleeMethod = methodsById.get(targetMethodId);
+                    if (calleeMethod == null || calleeMethod.parameterNames.isEmpty()) {
+                        continue;
+                    }
+                    ClassModel calleeClass = javaModel.classesByName.get(calleeMethod.className);
+                    if (calleeClass == null) {
+                        continue;
+                    }
+                    for (Integer index : boundIndexes) {
+                        if (index == null || index.intValue() < 0 || index.intValue() >= calleeMethod.parameterNames.size()) {
+                            continue;
+                        }
+                        String calleeParam = calleeMethod.parameterNames.get(index.intValue());
+                        if (isBlank(calleeParam)) {
+                            continue;
+                        }
+                        collectPipelineAssemblyArgsFromVariableState(
+                                calleeClass,
+                                calleeMethod,
+                                calleeParam,
+                                Integer.MAX_VALUE,
+                                javaModel,
+                                methodsById,
+                                injectionRegistry,
+                                depth + 1,
+                                visitingMethods,
+                                visitingVariables,
+                                out
+                        );
+                    }
+                }
+            }
         } finally {
             visitingVariables.remove(visitKey);
         }
+    }
+
+    private List<Integer> resolveArgumentIndexes(List<String> argumentTokens, String variableName) {
+        if (argumentTokens == null || argumentTokens.isEmpty() || isBlank(variableName)) {
+            return Collections.emptyList();
+        }
+        List<Integer> indexes = new ArrayList<Integer>();
+        for (int i = 0; i < argumentTokens.size(); i++) {
+            String token = normalizePipelineArgToken(argumentTokens.get(i));
+            if (isBlank(token)) {
+                continue;
+            }
+            if (variableName.equals(token)) {
+                indexes.add(i);
+            }
+        }
+        return indexes;
     }
 
     private Map<String, String> resolvePipelineAssemblyTargets(List<PipelineAssemblyArg> assemblyArgs,

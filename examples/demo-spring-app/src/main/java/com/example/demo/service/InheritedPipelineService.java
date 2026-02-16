@@ -1,5 +1,6 @@
 package com.example.demo.service;
 
+import com.example.demo.pipeline.DynamicPipeline;
 import com.example.demo.pipeline.DynamicPipelineBuilder;
 import com.example.demo.pipeline.EnrichStage;
 import com.example.demo.pipeline.LoadUserStage;
@@ -16,10 +17,9 @@ public class InheritedPipelineService extends AbstractInheritedPipelineService {
     private EnrichStage enrichStage;
 
     @Override
-    protected DynamicPipelineBuilder appendCustomStages(DynamicPipelineBuilder builder) {
-        return builder
-                .add(loadUserStage)
-                .add(enrichStage);
+    protected void assemblyPipeline(DynamicPipeline dynamicPipeline) {
+        dynamicPipeline.addHandler(loadUserStage);
+        dynamicPipeline.addHandler(enrichStage);
     }
 
     public String run(String id) {

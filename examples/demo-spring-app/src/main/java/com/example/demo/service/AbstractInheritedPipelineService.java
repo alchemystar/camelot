@@ -7,19 +7,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 
 public abstract class AbstractInheritedPipelineService {
 
-    @Autowired
-    protected ValidateStage validateStage;
-
-    protected DynamicPipelineBuilder appendBaseStages(DynamicPipelineBuilder builder) {
-        return builder.add(validateStage);
-    }
-
-    protected abstract DynamicPipelineBuilder appendCustomStages(DynamicPipelineBuilder builder);
+    protected abstract void assemblyPipeline(DynamicPipeline dynamicPipeline);
 
     protected DynamicPipeline buildPipeline() {
         DynamicPipelineBuilder builder = DynamicPipeline.builder();
-        builder = appendBaseStages(builder);
-        builder = appendCustomStages(builder);
-        return builder.build();
+        DynamicPipeline dynamicPipeline =builder.build();
+        assemblyPipeline(dynamicPipeline);
+        return dynamicPipeline;
     }
 }
