@@ -16,6 +16,6 @@ public class InheritedPipelineController {
 
     @GetMapping("/{id}")
     public String run(@PathVariable("id") String id) {
-        return inheritedPipelineService.run(id);
+        return inheritedPipelineService.buildPipeline().execute(id);
     }
 }

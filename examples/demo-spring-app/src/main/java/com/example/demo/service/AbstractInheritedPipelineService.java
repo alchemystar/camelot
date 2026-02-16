@@ -9,7 +9,7 @@ public abstract class AbstractInheritedPipelineService {
 
     protected abstract void assemblyPipeline(DynamicPipeline dynamicPipeline);
 
-    protected DynamicPipeline buildPipeline() {
+    public DynamicPipeline buildPipeline() {
         DynamicPipelineBuilder builder = DynamicPipeline.builder();
         DynamicPipeline dynamicPipeline =builder.build();
         assemblyPipeline(dynamicPipeline);
