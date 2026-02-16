@@ -10,11 +10,15 @@ import net.bytebuddy.dynamic.DynamicType;
 import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 import net.bytebuddy.utility.JavaModule;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
 
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.lang.annotation.Annotation;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -48,6 +52,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
+import javax.xml.parsers.DocumentBuilderFactory;
 
 import static net.bytebuddy.matcher.ElementMatchers.isAbstract;
 import static net.bytebuddy.matcher.ElementMatchers.isConstructor;
@@ -1165,8 +1171,15 @@ public class RuntimeSandboxSimulator {
         private final Set<String> failedClassNames = new LinkedHashSet<String>();
         private final Map<Class<?>, Object> singletonByConcreteClass = new LinkedHashMap<Class<?>, Object>();
         private final Set<Class<?>> creating = new LinkedHashSet<Class<?>>();
+        private final Map<String, List<Class<?>>> beanClassesByName = new LinkedHashMap<String, List<Class<?>>>();
+        private final Map<Class<?>, Set<String>> beanNamesByClass = new LinkedHashMap<Class<?>, Set<String>>();
+        private final Set<Class<?>> primaryBeanClasses = new LinkedHashSet<Class<?>>();
+        private final Map<String, String> xmlAliasToName = new LinkedHashMap<String, String>();
         private int classLoadFailLogs = 0;
         private static final int MAX_CLASS_LOAD_FAIL_LOGS = 60;
+        private static final Set<String> COMPONENT_ANNOTATION_NAMES = new LinkedHashSet<String>(
+                Arrays.asList("Component", "Service", "Repository", "Controller", "RestController", "Configuration")
+        );
 
         public SandboxBeanFactory(ClassLoader classLoader,
                                   CliOptions options,
@@ -1179,6 +1192,7 @@ public class RuntimeSandboxSimulator {
             } else {
                 this.discoveredClassNames = scanClassNames(options.classesRoots, options.debugRuntime);
             }
+            initializeSpringBeanMetadata();
         }
 
         public int getScannedClassCount() {
@@ -1221,7 +1235,7 @@ public class RuntimeSandboxSimulator {
         }
 
         public Object getBean(Class<?> requestedType) {
-            Class<?> targetClass = resolveImplementationClass(requestedType);
+            Class<?> targetClass = resolveImplementationClass(requestedType, "", "");
             if (targetClass == null) {
                 if (requestedType.isInterface()) {
                     return createInterfaceMock(requestedType);
@@ -1262,7 +1276,8 @@ public class RuntimeSandboxSimulator {
                     if (currentValue != null) {
                         continue;
                     }
-                    Object dependency = resolveDependency(field.getType());
+                    InjectionHint hint = resolveInjectionHint(field);
+                    Object dependency = resolveDependency(field.getType(), field.getName(), hint);
                     if (dependency != null) {
                         field.set(instance, dependency);
                     }
@@ -1271,9 +1286,25 @@ public class RuntimeSandboxSimulator {
             }
         }
 
-        private Object resolveDependency(Class<?> dependencyType) {
+        private Object resolveDependency(Class<?> dependencyType, String fieldName, InjectionHint hint) {
+            String preferredName = hint == null ? "" : hint.preferredBeanName;
+            if (isBlank(preferredName)) {
+                preferredName = fieldName;
+            }
+            if (hint != null && !isBlank(hint.preferredBeanName)) {
+                Class<?> namedClass = resolveBeanClassByName(hint.preferredBeanName, dependencyType);
+                if (namedClass != null) {
+                    return getBean(namedClass);
+                }
+            }
+            if (hint != null && !isBlank(hint.qualifier)) {
+                Class<?> qualifierClass = resolveBeanClassByName(hint.qualifier, dependencyType);
+                if (qualifierClass != null) {
+                    return getBean(qualifierClass);
+                }
+            }
             if (dependencyType.isInterface()) {
-                Class<?> impl = resolveImplementationClass(dependencyType);
+                Class<?> impl = resolveImplementationClass(dependencyType, fieldName, preferredName);
                 if (impl == null) {
                     return createInterfaceMock(dependencyType);
                 }
@@ -1281,7 +1312,7 @@ public class RuntimeSandboxSimulator {
             }
 
             if (Modifier.isAbstract(dependencyType.getModifiers())) {
-                Class<?> impl = resolveImplementationClass(dependencyType);
+                Class<?> impl = resolveImplementationClass(dependencyType, fieldName, preferredName);
                 if (impl == null) {
                     return null;
                 }
@@ -1307,16 +1338,30 @@ public class RuntimeSandboxSimulator {
             constructors = constructors.stream()
                     .sorted(Comparator.comparingInt(Constructor::getParameterCount))
                     .collect(Collectors.toList());
+            Constructor<?> autowired = findAnnotatedConstructor(constructors, "Autowired");
+            if (autowired == null) {
+                autowired = findAnnotatedConstructor(constructors, "Inject");
+            }
+            if (autowired != null) {
+                constructors = new ArrayList<Constructor<?>>(constructors);
+                constructors.remove(autowired);
+                constructors.add(0, autowired);
+            }
             for (Constructor<?> constructor : constructors) {
                 Object[] args = new Object[constructor.getParameterCount()];
                 boolean failed = false;
                 for (int i = 0; i < constructor.getParameterCount(); i++) {
                     Class<?> parameterType = constructor.getParameterTypes()[i];
                     if (isSimpleType(parameterType)) {
-                        failed = true;
-                        break;
+                        Object primitiveDefault = defaultValue(parameterType);
+                        if (primitiveDefault == null && parameterType.isPrimitive()) {
+                            failed = true;
+                            break;
+                        }
+                        args[i] = primitiveDefault;
+                        continue;
                     }
-                    Object dep = resolveDependency(parameterType);
+                    Object dep = resolveDependency(parameterType, parameterType.getSimpleName(), InjectionHint.none());
                     if (dep == null && parameterType.isPrimitive()) {
                         failed = true;
                         break;
@@ -1332,9 +1377,17 @@ public class RuntimeSandboxSimulator {
             throw new IllegalStateException("No suitable constructor for " + targetClass.getName());
         }
 
-        private Class<?> resolveImplementationClass(Class<?> requestedType) {
+        private Class<?> resolveImplementationClass(Class<?> requestedType,
+                                                    String fieldName,
+                                                    String preferredBeanName) {
             if (!requestedType.isInterface() && !Modifier.isAbstract(requestedType.getModifiers())) {
                 return requestedType;
+            }
+            if (!isBlank(preferredBeanName)) {
+                Class<?> byName = resolveBeanClassByName(preferredBeanName, requestedType);
+                if (byName != null) {
+                    return byName;
+                }
             }
             List<Class<?>> candidates = new ArrayList<Class<?>>();
             for (String className : discoveredClassNames) {
@@ -1353,13 +1406,18 @@ public class RuntimeSandboxSimulator {
             if (candidates.isEmpty()) {
                 return null;
             }
-            candidates.sort(Comparator.comparing(Class::getName));
-            for (Class<?> candidate : candidates) {
-                String lower = candidate.getSimpleName().toLowerCase(Locale.ROOT);
-                if (lower.endsWith("impl")) {
-                    return candidate;
+            String normalizedFieldName = normalizeBeanName(fieldName);
+            String normalizedPreferredName = normalizeBeanName(preferredBeanName);
+            candidates.sort((left, right) -> {
+                int scoreDiff = Integer.compare(
+                        scoreBeanCandidate(right, normalizedFieldName, normalizedPreferredName),
+                        scoreBeanCandidate(left, normalizedFieldName, normalizedPreferredName)
+                );
+                if (scoreDiff != 0) {
+                    return scoreDiff;
                 }
-            }
+                return left.getName().compareTo(right.getName());
+            });
             return candidates.get(0);
         }
 
@@ -1398,6 +1456,465 @@ public class RuntimeSandboxSimulator {
                 }
                 classLoadFailLogs++;
                 return null;
+            }
+        }
+
+        private void initializeSpringBeanMetadata() {
+            for (String className : discoveredClassNames) {
+                Class<?> candidate = loadClassByName(className);
+                if (candidate == null) {
+                    continue;
+                }
+                registerClassLevelSpringBeans(candidate);
+                registerBeanMethods(candidate);
+            }
+            loadXmlBeanMetadata();
+            if (options.debugRuntime) {
+                System.out.println("[RUNTIME_DEBUG] SPRING_BEAN_METADATA names="
+                        + beanClassesByName.size() + " primary=" + primaryBeanClasses.size());
+            }
+        }
+
+        private void registerClassLevelSpringBeans(Class<?> clazz) {
+            if (clazz == null) {
+                return;
+            }
+            if (!isComponentClass(clazz)) {
+                return;
+            }
+            String explicitName = extractComponentName(clazz);
+            if (isBlank(explicitName)) {
+                explicitName = decapitalize(clazz.getSimpleName());
+            }
+            registerBeanName(explicitName, clazz);
+            if (hasAnnotation(clazz.getAnnotations(), "Primary")) {
+                primaryBeanClasses.add(clazz);
+            }
+        }
+
+        private void registerBeanMethods(Class<?> clazz) {
+            if (clazz == null) {
+                return;
+            }
+            for (Method method : clazz.getDeclaredMethods()) {
+                Annotation beanAnnotation = findAnnotation(method.getAnnotations(), "Bean");
+                if (beanAnnotation == null) {
+                    continue;
+                }
+                Class<?> beanType = method.getReturnType();
+                if (beanType == null || beanType == Void.TYPE) {
+                    continue;
+                }
+                List<String> beanNames = extractBeanMethodNames(beanAnnotation, method.getName());
+                if (beanNames.isEmpty()) {
+                    beanNames.add(method.getName());
+                }
+                for (String beanName : beanNames) {
+                    registerBeanName(beanName, beanType);
+                }
+                if (hasAnnotation(method.getAnnotations(), "Primary")) {
+                    primaryBeanClasses.add(beanType);
+                }
+            }
+        }
+
+        private void loadXmlBeanMetadata() {
+            if (options.projectDir == null || !Files.isDirectory(options.projectDir)) {
+                return;
+            }
+            try (Stream<Path> stream = Files.walk(options.projectDir, 10)) {
+                List<Path> xmlFiles = stream
+                        .filter(Files::isRegularFile)
+                        .filter(path -> path.toString().toLowerCase(Locale.ROOT).endsWith(".xml"))
+                        .filter(path -> !isIgnoredXml(path))
+                        .collect(Collectors.toList());
+                for (Path xmlFile : xmlFiles) {
+                    parseBeanXml(xmlFile);
+                }
+            } catch (IOException error) {
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_XML_SCAN_FAIL error="
+                            + error.getClass().getName() + ": " + error.getMessage());
+                }
+            }
+        }
+
+        private boolean isIgnoredXml(Path xmlFile) {
+            if (xmlFile == null) {
+                return true;
+            }
+            String normalized = xmlFile.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+            return normalized.contains("log4j")
+                    || normalized.contains("logback")
+                    || normalized.endsWith("/pom.xml")
+                    || normalized.contains("/target/");
+        }
+
+        private void parseBeanXml(Path xmlFile) {
+            try {
+                DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+                factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+                factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+                factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+                factory.setExpandEntityReferences(false);
+                Document document = factory.newDocumentBuilder().parse(xmlFile.toFile());
+
+                NodeList beanNodes = document.getElementsByTagName("bean");
+                for (int i = 0; i < beanNodes.getLength(); i++) {
+                    Element beanElement = (Element) beanNodes.item(i);
+                    if (beanElement == null) {
+                        continue;
+                    }
+                    String className = normalizeTypeName(beanElement.getAttribute("class"));
+                    if (isBlank(className)) {
+                        continue;
+                    }
+                    Class<?> beanClass = loadClassByName(className);
+                    if (beanClass == null) {
+                        continue;
+                    }
+                    String id = normalizeBeanName(beanElement.getAttribute("id"));
+                    if (!isBlank(id)) {
+                        registerBeanName(id, beanClass);
+                    }
+                    String names = beanElement.getAttribute("name");
+                    if (!isBlank(names)) {
+                        for (String token : names.split("[,;\\s]+")) {
+                            registerBeanName(token, beanClass);
+                        }
+                    }
+                }
+
+                NodeList aliasNodes = document.getElementsByTagName("alias");
+                for (int i = 0; i < aliasNodes.getLength(); i++) {
+                    Element aliasElement = (Element) aliasNodes.item(i);
+                    if (aliasElement == null) {
+                        continue;
+                    }
+                    String name = normalizeBeanName(aliasElement.getAttribute("name"));
+                    String alias = normalizeBeanName(aliasElement.getAttribute("alias"));
+                    if (!isBlank(name) && !isBlank(alias)) {
+                        xmlAliasToName.put(alias, name);
+                    }
+                }
+            } catch (Throwable error) {
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_XML_PARSE_SKIP file=" + xmlFile
+                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
+            }
+        }
+
+        private Class<?> resolveBeanClassByName(String beanName, Class<?> requiredType) {
+            String normalized = resolveAlias(normalizeBeanName(beanName));
+            if (isBlank(normalized)) {
+                return null;
+            }
+            List<Class<?>> candidates = beanClassesByName.getOrDefault(normalized, Collections.<Class<?>>emptyList());
+            Class<?> matched = chooseAssignableCandidate(candidates, requiredType);
+            if (matched != null) {
+                return matched;
+            }
+            return null;
+        }
+
+        private Class<?> chooseAssignableCandidate(List<Class<?>> candidates, Class<?> requiredType) {
+            if (candidates == null || candidates.isEmpty()) {
+                return null;
+            }
+            List<Class<?>> filtered = new ArrayList<Class<?>>();
+            for (Class<?> candidate : candidates) {
+                if (candidate == null) {
+                    continue;
+                }
+                if (requiredType == null || requiredType.isAssignableFrom(candidate)) {
+                    filtered.add(candidate);
+                }
+            }
+            if (filtered.isEmpty()) {
+                return null;
+            }
+            if (filtered.size() == 1) {
+                return filtered.get(0);
+            }
+            List<Class<?>> primary = new ArrayList<Class<?>>();
+            for (Class<?> candidate : filtered) {
+                if (primaryBeanClasses.contains(candidate)) {
+                    primary.add(candidate);
+                }
+            }
+            if (primary.size() == 1) {
+                return primary.get(0);
+            }
+            filtered.sort(Comparator.comparing(Class::getName));
+            return filtered.get(0);
+        }
+
+        private int scoreBeanCandidate(Class<?> candidate, String fieldName, String preferredBeanName) {
+            int score = 0;
+            if (candidate == null) {
+                return score;
+            }
+            if (primaryBeanClasses.contains(candidate)) {
+                score += 500;
+            }
+            Set<String> beanNames = beanNamesByClass.getOrDefault(candidate, Collections.<String>emptySet());
+            if (!isBlank(preferredBeanName)) {
+                if (beanNames.contains(preferredBeanName)) {
+                    score += 800;
+                }
+            }
+            if (!isBlank(fieldName)) {
+                if (beanNames.contains(fieldName)) {
+                    score += 420;
+                }
+            }
+            String candidateSimple = decapitalize(candidate.getSimpleName());
+            if (!isBlank(fieldName) && fieldName.equals(candidateSimple)) {
+                score += 180;
+            }
+            if (candidate.getSimpleName().toLowerCase(Locale.ROOT).endsWith("impl")) {
+                score += 40;
+            }
+            if (isComponentClass(candidate)) {
+                score += 25;
+            }
+            return score;
+        }
+
+        private InjectionHint resolveInjectionHint(Field field) {
+            if (field == null) {
+                return InjectionHint.none();
+            }
+            Annotation[] annotations = field.getAnnotations();
+            String preferredBeanName = "";
+            String qualifier = "";
+            boolean explicitInjection = false;
+
+            Annotation resource = findAnnotation(annotations, "Resource");
+            if (resource != null) {
+                explicitInjection = true;
+                preferredBeanName = readAnnotationString(resource, "name");
+                if (isBlank(preferredBeanName)) {
+                    preferredBeanName = readAnnotationString(resource, "value");
+                }
+                if (isBlank(preferredBeanName)) {
+                    preferredBeanName = field.getName();
+                }
+            }
+
+            Annotation qualifierAnnotation = findAnnotation(annotations, "Qualifier");
+            if (qualifierAnnotation != null) {
+                qualifier = readAnnotationString(qualifierAnnotation, "value");
+            }
+            if (isBlank(qualifier)) {
+                Annotation named = findAnnotation(annotations, "Named");
+                if (named != null) {
+                    qualifier = readAnnotationString(named, "value");
+                }
+            }
+
+            if (hasAnnotation(annotations, "Autowired") || hasAnnotation(annotations, "Inject")) {
+                explicitInjection = true;
+            }
+
+            return new InjectionHint(
+                    normalizeBeanName(preferredBeanName),
+                    normalizeBeanName(qualifier),
+                    explicitInjection
+            );
+        }
+
+        private Constructor<?> findAnnotatedConstructor(List<Constructor<?>> constructors, String annotationSimpleName) {
+            if (constructors == null || constructors.isEmpty()) {
+                return null;
+            }
+            for (Constructor<?> constructor : constructors) {
+                if (constructor == null) {
+                    continue;
+                }
+                if (hasAnnotation(constructor.getAnnotations(), annotationSimpleName)) {
+                    return constructor;
+                }
+            }
+            return null;
+        }
+
+        private boolean isComponentClass(Class<?> clazz) {
+            if (clazz == null) {
+                return false;
+            }
+            for (Annotation annotation : clazz.getAnnotations()) {
+                if (annotation == null) {
+                    continue;
+                }
+                String simple = annotation.annotationType().getSimpleName();
+                if (COMPONENT_ANNOTATION_NAMES.contains(simple)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private String extractComponentName(Class<?> clazz) {
+            if (clazz == null) {
+                return "";
+            }
+            for (Annotation annotation : clazz.getAnnotations()) {
+                if (annotation == null) {
+                    continue;
+                }
+                String simple = annotation.annotationType().getSimpleName();
+                if (!COMPONENT_ANNOTATION_NAMES.contains(simple)) {
+                    continue;
+                }
+                String value = readAnnotationString(annotation, "value");
+                if (!isBlank(value)) {
+                    return value;
+                }
+            }
+            return "";
+        }
+
+        private List<String> extractBeanMethodNames(Annotation beanAnnotation, String defaultMethodName) {
+            List<String> names = new ArrayList<String>();
+            if (beanAnnotation == null) {
+                return names;
+            }
+            Object value = readAnnotationAttribute(beanAnnotation, "name");
+            if (value instanceof String[]) {
+                String[] arr = (String[]) value;
+                for (String item : arr) {
+                    String normalized = normalizeBeanName(item);
+                    if (!isBlank(normalized)) {
+                        names.add(normalized);
+                    }
+                }
+            }
+            if (names.isEmpty()) {
+                Object v = readAnnotationAttribute(beanAnnotation, "value");
+                if (v instanceof String[]) {
+                    String[] arr = (String[]) v;
+                    for (String item : arr) {
+                        String normalized = normalizeBeanName(item);
+                        if (!isBlank(normalized)) {
+                            names.add(normalized);
+                        }
+                    }
+                }
+            }
+            if (names.isEmpty() && !isBlank(defaultMethodName)) {
+                names.add(normalizeBeanName(defaultMethodName));
+            }
+            return names;
+        }
+
+        private void registerBeanName(String beanName, Class<?> beanClass) {
+            String normalized = normalizeBeanName(beanName);
+            if (isBlank(normalized) || beanClass == null) {
+                return;
+            }
+            List<Class<?>> classes = beanClassesByName.computeIfAbsent(normalized, k -> new ArrayList<Class<?>>());
+            if (!classes.contains(beanClass)) {
+                classes.add(beanClass);
+            }
+            Set<String> names = beanNamesByClass.computeIfAbsent(beanClass, k -> new LinkedHashSet<String>());
+            names.add(normalized);
+        }
+
+        private String resolveAlias(String beanName) {
+            if (isBlank(beanName)) {
+                return "";
+            }
+            String current = beanName;
+            Set<String> visiting = new LinkedHashSet<String>();
+            while (xmlAliasToName.containsKey(current) && visiting.add(current)) {
+                current = xmlAliasToName.get(current);
+            }
+            return current;
+        }
+
+        private static String normalizeBeanName(String value) {
+            if (value == null) {
+                return "";
+            }
+            String normalized = value.trim();
+            if (normalized.isEmpty()) {
+                return "";
+            }
+            if (normalized.startsWith("\"") && normalized.endsWith("\"") && normalized.length() > 1) {
+                normalized = normalized.substring(1, normalized.length() - 1).trim();
+            }
+            return normalized;
+        }
+
+        private static String normalizeTypeName(String value) {
+            if (value == null) {
+                return "";
+            }
+            String normalized = value.trim();
+            if (normalized.isEmpty()) {
+                return "";
+            }
+            return normalized;
+        }
+
+        private static boolean hasAnnotation(Annotation[] annotations, String simpleName) {
+            return findAnnotation(annotations, simpleName) != null;
+        }
+
+        private static Annotation findAnnotation(Annotation[] annotations, String simpleName) {
+            if (annotations == null || annotations.length == 0 || isBlank(simpleName)) {
+                return null;
+            }
+            for (Annotation annotation : annotations) {
+                if (annotation == null) {
+                    continue;
+                }
+                if (simpleName.equals(annotation.annotationType().getSimpleName())) {
+                    return annotation;
+                }
+            }
+            return null;
+        }
+
+        private static String readAnnotationString(Annotation annotation, String attributeName) {
+            Object value = readAnnotationAttribute(annotation, attributeName);
+            if (value == null) {
+                return "";
+            }
+            if (value instanceof String) {
+                return (String) value;
+            }
+            return String.valueOf(value);
+        }
+
+        private static Object readAnnotationAttribute(Annotation annotation, String attributeName) {
+            if (annotation == null || isBlank(attributeName)) {
+                return null;
+            }
+            try {
+                Method method = annotation.annotationType().getMethod(attributeName);
+                method.setAccessible(true);
+                return method.invoke(annotation);
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+
+        private static class InjectionHint {
+            public final String preferredBeanName;
+            public final String qualifier;
+            public final boolean explicitInjection;
+
+            private InjectionHint(String preferredBeanName, String qualifier, boolean explicitInjection) {
+                this.preferredBeanName = preferredBeanName;
+                this.qualifier = qualifier;
+                this.explicitInjection = explicitInjection;
+            }
+
+            private static InjectionHint none() {
+                return new InjectionHint("", "", false);
             }
         }
 
@@ -1574,6 +2091,20 @@ public class RuntimeSandboxSimulator {
                 }
             }
         }
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
+    private static String decapitalize(String value) {
+        if (isBlank(value)) {
+            return "";
+        }
+        if (value.length() == 1) {
+            return value.toLowerCase(Locale.ROOT);
+        }
+        return Character.toLowerCase(value.charAt(0)) + value.substring(1);
     }
 
     private static String toClassName(Path root, Path classFile) {
