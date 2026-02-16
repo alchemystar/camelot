@@ -13,6 +13,12 @@ import net.bytebuddy.utility.JavaModule;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
+import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.CannotLoadBeanClassException;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
+import org.springframework.beans.factory.xml.XmlBeanDefinitionReader;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.core.io.FileSystemResource;
 
 import java.io.File;
 import java.io.IOException;
@@ -90,18 +96,35 @@ public class RuntimeSandboxSimulator {
         report.classpathEntries = toStringList(options.classpathEntries);
         report.arguments = new ArrayList<String>(options.arguments);
         report.discoveredProjectClassCount = projectClassIndex.classNames.size();
+        report.useSpringContext = options.useSpringContext;
 
         long startedAt = System.currentTimeMillis();
         SandboxBeanFactory beanFactory = null;
+        SpringContextRuntime springRuntime = null;
+        BeanProvider beanProvider = null;
         try {
             if (options.debugRuntime) {
                 printRuntimeStartDebug(options, classLoader, projectClassIndex);
             }
             beanFactory = new SandboxBeanFactory(classLoader, options, projectClassIndex);
+            beanProvider = beanFactory;
+
+            if (options.useSpringContext) {
+                springRuntime = SpringContextRuntime.tryStart(options, classLoader);
+                if (springRuntime != null) {
+                    beanProvider = springRuntime;
+                    report.springContextActive = true;
+                    report.springBeanDefinitionCount = springRuntime.getBeanDefinitionCount();
+                    report.springBeanDefinitions = springRuntime.snapshotBeanDefinitions(200);
+                } else {
+                    report.springContextActive = false;
+                }
+            }
+
             Class<?> entryClass = Class.forName(options.entryClass, true, classLoader);
             Method entryMethod = resolveEntryMethod(entryClass, options.entryMethod, options.arguments.size());
-            Object entryBean = beanFactory.getBean(entryClass);
-            Object[] invokeArgs = buildInvokeArgs(entryMethod, options.arguments, beanFactory, options.debugRuntime);
+            Object entryBean = resolveEntryBean(entryClass, beanProvider, beanFactory, options.debugRuntime);
+            Object[] invokeArgs = buildInvokeArgs(entryMethod, options.arguments, beanProvider, options.debugRuntime);
             if (options.debugRuntime) {
                 System.out.println("[RUNTIME_DEBUG] MainClassLoader=" + RuntimeSandboxSimulator.class.getClassLoader());
                 System.out.println("[RUNTIME_DEBUG] EntryClassLoader=" + entryClass.getClassLoader());
@@ -131,6 +154,9 @@ public class RuntimeSandboxSimulator {
             report.loadedProjectClasses = classLoader.snapshotLoadedProjectClasses();
             report.skippedProjectClasses = classLoader.snapshotFailedProjectClasses();
             ACTIVE_COLLECTOR = null;
+            if (springRuntime != null) {
+                springRuntime.close();
+            }
             classLoader.close();
         }
 
@@ -217,6 +243,7 @@ public class RuntimeSandboxSimulator {
                                                ProjectClassIndex projectClassIndex) {
         System.out.println("[RUNTIME_DEBUG] projectDir=" + options.projectDir);
         System.out.println("[RUNTIME_DEBUG] entryClass=" + options.entryClass + " entryMethod=" + options.entryMethod);
+        System.out.println("[RUNTIME_DEBUG] useSpringContext=" + options.useSpringContext);
         System.out.println("[RUNTIME_DEBUG] classesRoots=" + options.classesRoots.size() + " classpathEntries=" + options.classpathEntries.size());
         System.out.println("[RUNTIME_DEBUG] projectClassDiscovered=" + projectClassIndex.classNames.size());
         URL[] urls = classLoader.getURLs();
@@ -428,16 +455,43 @@ public class RuntimeSandboxSimulator {
         throw new IllegalArgumentException("Entry method not found: " + methodRaw + " in class " + entryClass.getName());
     }
 
+    private static Object resolveEntryBean(Class<?> entryClass,
+                                           BeanProvider beanProvider,
+                                           SandboxBeanFactory fallbackBeanFactory,
+                                           boolean debugRuntime) {
+        if (beanProvider != null) {
+            try {
+                Object bean = beanProvider.getBean(entryClass);
+                if (bean != null) {
+                    return bean;
+                }
+            } catch (Throwable error) {
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] ENTRY_BEAN_PROVIDER_FAIL provider="
+                            + beanProvider.providerName() + " type=" + entryClass.getName()
+                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
+            }
+        }
+        if (fallbackBeanFactory != null) {
+            if (debugRuntime) {
+                System.out.println("[RUNTIME_DEBUG] ENTRY_BEAN_FALLBACK provider=SandboxBeanFactory type=" + entryClass.getName());
+            }
+            return fallbackBeanFactory.getBean(entryClass);
+        }
+        throw new IllegalStateException("Cannot resolve entry bean: " + entryClass.getName());
+    }
+
     private static Object[] buildInvokeArgs(Method method,
                                             List<String> rawArgs,
-                                            SandboxBeanFactory beanFactory,
+                                            BeanProvider beanProvider,
                                             boolean debugRuntime) {
         Class<?>[] types = method.getParameterTypes();
         if (rawArgs.size() > types.length) {
             throw new IllegalArgumentException("Argument count mismatch. required<=" + types.length + " provided=" + rawArgs.size());
         }
         Object[] values = new Object[types.length];
-        AutoArgumentGenerator generator = new AutoArgumentGenerator(beanFactory, debugRuntime);
+        AutoArgumentGenerator generator = new AutoArgumentGenerator(beanProvider, debugRuntime);
         for (int i = 0; i < types.length; i++) {
             if (i < rawArgs.size()) {
                 String raw = rawArgs.get(i);
@@ -532,12 +586,12 @@ public class RuntimeSandboxSimulator {
 
     private static class AutoArgumentGenerator {
         private static final int MAX_DEPTH = 6;
-        private final SandboxBeanFactory beanFactory;
+        private final BeanProvider beanProvider;
         private final boolean debugRuntime;
         private final Map<Class<?>, Object> cache = new LinkedHashMap<Class<?>, Object>();
 
-        private AutoArgumentGenerator(SandboxBeanFactory beanFactory, boolean debugRuntime) {
-            this.beanFactory = beanFactory;
+        private AutoArgumentGenerator(BeanProvider beanProvider, boolean debugRuntime) {
+            this.beanProvider = beanProvider;
             this.debugRuntime = debugRuntime;
         }
 
@@ -671,9 +725,9 @@ public class RuntimeSandboxSimulator {
                     // try next constructor
                 }
             }
-            if (beanFactory != null) {
+            if (beanProvider != null) {
                 try {
-                    return beanFactory.getBean(targetType);
+                    return beanProvider.getBean(targetType);
                 } catch (Throwable ignored) {
                     // give up
                 }
@@ -714,9 +768,9 @@ public class RuntimeSandboxSimulator {
         }
 
         private Object buildPolymorphicValue(Class<?> targetType) {
-            if (beanFactory != null) {
+            if (beanProvider != null) {
                 try {
-                    return beanFactory.getBean(targetType);
+                    return beanProvider.getBean(targetType);
                 } catch (Throwable ignored) {
                     // continue
                 }
@@ -866,6 +920,225 @@ public class RuntimeSandboxSimulator {
         visiting.remove(current);
     }
 
+    private interface BeanProvider {
+        Object getBean(Class<?> type);
+
+        String providerName();
+    }
+
+    private static class SpringContextRuntime implements BeanProvider {
+        private final AnnotationConfigApplicationContext context;
+        private final boolean debugRuntime;
+
+        private SpringContextRuntime(AnnotationConfigApplicationContext context, boolean debugRuntime) {
+            this.context = context;
+            this.debugRuntime = debugRuntime;
+        }
+
+        private static SpringContextRuntime tryStart(CliOptions options, ClassLoader classLoader) {
+            AnnotationConfigApplicationContext context = null;
+            try {
+                context = new AnnotationConfigApplicationContext();
+                context.setClassLoader(classLoader);
+                context.getDefaultListableBeanFactory().setAllowBeanDefinitionOverriding(true);
+                context.getDefaultListableBeanFactory().setAllowCircularReferences(true);
+
+                if (options.tracePrefixes != null && !options.tracePrefixes.isEmpty()) {
+                    String[] scanPackages = options.tracePrefixes.toArray(new String[0]);
+                    context.scan(scanPackages);
+                    if (options.debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_SCAN packages=" + Arrays.toString(scanPackages));
+                    }
+                }
+
+                List<Path> xmlFiles = discoverSpringXmlFiles(options.projectDir);
+                if (!xmlFiles.isEmpty()) {
+                    XmlBeanDefinitionReader reader = new XmlBeanDefinitionReader(context);
+                    for (Path xmlFile : xmlFiles) {
+                        if (!isLoadableSpringBeanXml(xmlFile, classLoader, options.debugRuntime)) {
+                            continue;
+                        }
+                        try {
+                            int loaded = reader.loadBeanDefinitions(new FileSystemResource(xmlFile.toFile()));
+                            if (options.debugRuntime) {
+                                System.out.println("[RUNTIME_DEBUG] SPRING_CTX_XML file="
+                                        + xmlFile.toAbsolutePath() + " beanDefs=" + loaded);
+                            }
+                        } catch (Throwable xmlError) {
+                            if (options.debugRuntime) {
+                                System.out.println("[RUNTIME_DEBUG] SPRING_CTX_XML_SKIP file="
+                                        + xmlFile.toAbsolutePath() + " error="
+                                        + xmlError.getClass().getName() + ": " + xmlError.getMessage());
+                            }
+                        }
+                    }
+                }
+
+                try {
+                    context.refresh();
+                } catch (CannotLoadBeanClassException missingClassError) {
+                    if (options.debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_REFRESH_SKIP bean="
+                                + missingClassError.getBeanName() + " class="
+                                + missingClassError.getBeanClassName() + " reason="
+                                + missingClassError.getClass().getName() + ": " + missingClassError.getMessage());
+                    }
+                    throw missingClassError;
+                }
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_READY beanDefs=" + context.getBeanDefinitionCount());
+                }
+                return new SpringContextRuntime(context, options.debugRuntime);
+            } catch (Throwable error) {
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_START_FAIL error="
+                            + error.getClass().getName() + ": " + error.getMessage());
+                    printErrorChain(error);
+                }
+                if (context != null) {
+                    try {
+                        context.close();
+                    } catch (Throwable ignored) {
+                        // ignore
+                    }
+                }
+                return null;
+            }
+        }
+
+        private static List<Path> discoverSpringXmlFiles(Path projectDir) {
+            if (projectDir == null || !Files.isDirectory(projectDir)) {
+                return Collections.emptyList();
+            }
+            try (Stream<Path> stream = Files.walk(projectDir, 10)) {
+                return stream
+                        .filter(Files::isRegularFile)
+                        .filter(path -> path.toString().toLowerCase(Locale.ROOT).endsWith(".xml"))
+                        .filter(path -> !isIgnoredSpringXml(path))
+                        .collect(Collectors.toList());
+            } catch (IOException ignored) {
+                return Collections.emptyList();
+            }
+        }
+
+        private static boolean isIgnoredSpringXml(Path xmlFile) {
+            if (xmlFile == null) {
+                return true;
+            }
+            String normalized = xmlFile.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+            return normalized.contains("log4j")
+                    || normalized.contains("logback")
+                    || normalized.endsWith("/pom.xml")
+                    || normalized.contains("/.m2repo/")
+                    || normalized.contains("/.idea/")
+                    || normalized.contains("/build/")
+                    || normalized.contains("/target/");
+        }
+
+        private static boolean isLoadableSpringBeanXml(Path xmlFile,
+                                                       ClassLoader classLoader,
+                                                       boolean debugRuntime) {
+            if (xmlFile == null) {
+                return false;
+            }
+            try {
+                DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+                factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+                factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+                factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+                factory.setExpandEntityReferences(false);
+                Document document = factory.newDocumentBuilder().parse(xmlFile.toFile());
+                NodeList beanNodes = document.getElementsByTagName("bean");
+                if (beanNodes == null || beanNodes.getLength() == 0) {
+                    return false;
+                }
+                for (int i = 0; i < beanNodes.getLength(); i++) {
+                    Element beanElement = (Element) beanNodes.item(i);
+                    if (beanElement == null) {
+                        continue;
+                    }
+                    String className = beanElement.getAttribute("class");
+                    if (isBlank(className)) {
+                        continue;
+                    }
+                    try {
+                        Class.forName(className.trim(), false, classLoader);
+                    } catch (Throwable missingClassError) {
+                        if (debugRuntime) {
+                            System.out.println("[RUNTIME_DEBUG] SPRING_CTX_XML_SKIP file="
+                                    + xmlFile.toAbsolutePath() + " missingClass=" + className.trim()
+                                    + " error=" + missingClassError.getClass().getName());
+                        }
+                        return false;
+                    }
+                }
+                return true;
+            } catch (Throwable parseError) {
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_XML_IGNORE file="
+                            + xmlFile.toAbsolutePath() + " error="
+                            + parseError.getClass().getName() + ": " + parseError.getMessage());
+                }
+                return false;
+            }
+        }
+
+        @Override
+        public Object getBean(Class<?> type) {
+            if (type == null || context == null) {
+                return null;
+            }
+            try {
+                return context.getBean(type);
+            } catch (NoSuchBeanDefinitionException missing) {
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_GET_MISS type=" + type.getName());
+                }
+                return null;
+            } catch (BeansException error) {
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_GET_FAIL type=" + type.getName()
+                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
+                return null;
+            }
+        }
+
+        public int getBeanDefinitionCount() {
+            if (context == null) {
+                return 0;
+            }
+            return context.getBeanDefinitionCount();
+        }
+
+        public List<String> snapshotBeanDefinitions(int limit) {
+            if (context == null) {
+                return Collections.emptyList();
+            }
+            String[] names = context.getBeanDefinitionNames();
+            List<String> values = new ArrayList<String>();
+            if (names != null) {
+                values.addAll(Arrays.asList(names));
+            }
+            Collections.sort(values);
+            if (limit > 0 && values.size() > limit) {
+                return new ArrayList<String>(values.subList(0, limit));
+            }
+            return values;
+        }
+
+        public void close() {
+            if (context != null) {
+                context.close();
+            }
+        }
+
+        @Override
+        public String providerName() {
+            return "SpringContextRuntime";
+        }
+    }
+
     public static class TraceAdvice {
         @Advice.OnMethodEnter(suppress = Throwable.class)
         public static String onEnter(@Advice.Origin("#t") String typeName,
@@ -987,6 +1260,10 @@ public class RuntimeSandboxSimulator {
         public int discoveredProjectClassCount;
         public List<String> loadedProjectClasses;
         public List<String> skippedProjectClasses;
+        public boolean useSpringContext;
+        public boolean springContextActive;
+        public int springBeanDefinitionCount;
+        public List<String> springBeanDefinitions;
     }
 
     public static class ProjectClassIndex {
@@ -1163,7 +1440,7 @@ public class RuntimeSandboxSimulator {
         }
     }
 
-    public static class SandboxBeanFactory {
+    public static class SandboxBeanFactory implements BeanProvider {
         private final ClassLoader classLoader;
         private final CliOptions options;
         private final List<String> discoveredClassNames;
@@ -1171,6 +1448,7 @@ public class RuntimeSandboxSimulator {
         private final Set<String> failedClassNames = new LinkedHashSet<String>();
         private final Map<Class<?>, Object> singletonByConcreteClass = new LinkedHashMap<Class<?>, Object>();
         private final Set<Class<?>> creating = new LinkedHashSet<Class<?>>();
+        private final Map<Class<?>, String> beanCreateFailures = new LinkedHashMap<Class<?>, String>();
         private final Map<String, List<Class<?>>> beanClassesByName = new LinkedHashMap<String, List<Class<?>>>();
         private final Map<Class<?>, Set<String>> beanNamesByClass = new LinkedHashMap<Class<?>, Set<String>>();
         private final Map<String, Set<String>> beanNameSources = new LinkedHashMap<String, Set<String>>();
@@ -1200,6 +1478,11 @@ public class RuntimeSandboxSimulator {
 
         public int getScannedClassCount() {
             return discoveredClassNames.size();
+        }
+
+        @Override
+        public String providerName() {
+            return "SandboxBeanFactory";
         }
 
         private void debugBean(String pattern, Object... args) {
@@ -1255,37 +1538,37 @@ public class RuntimeSandboxSimulator {
             return new ArrayList<String>(results);
         }
 
+        @Override
         public Object getBean(Class<?> requestedType) {
             debugBean("BEAN_GET requestType=%s", requestedType == null ? "null" : requestedType.getName());
-            Class<?> targetClass = resolveImplementationClass(requestedType, "", "");
-            if (targetClass == null) {
+            if (requestedType == null) {
+                return null;
+            }
+            List<Class<?>> candidates = resolveImplementationCandidates(requestedType, "", "");
+            if (candidates.isEmpty()) {
                 if (requestedType.isInterface()) {
                     debugBean("BEAN_GET_MOCK requestType=%s reason=no-impl", requestedType.getName());
                     return createInterfaceMock(requestedType);
                 }
-                throw new IllegalStateException("No implementation for type: " + requestedType.getName());
+                debugBean("BEAN_GET_FAIL requestType=%s reason=no-candidates", requestedType.getName());
+                return null;
             }
-            Object existing = singletonByConcreteClass.get(targetClass);
-            if (existing != null) {
-                debugBean("BEAN_GET_HIT class=%s", targetClass.getName());
-                return existing;
+
+            for (Class<?> candidate : candidates) {
+                if (candidate == null) {
+                    continue;
+                }
+                Object bean = getOrCreateConcreteBean(candidate, requestedType, "GET");
+                if (bean != null) {
+                    return bean;
+                }
             }
-            if (!creating.add(targetClass)) {
-                debugBean("BEAN_GET_REENTRANT class=%s", targetClass.getName());
-                return singletonByConcreteClass.get(targetClass);
+            if (requestedType.isInterface()) {
+                debugBean("BEAN_GET_MOCK requestType=%s reason=all-candidates-failed", requestedType.getName());
+                return createInterfaceMock(requestedType);
             }
-            try {
-                debugBean("BEAN_CREATE class=%s", targetClass.getName());
-                Object instance = instantiate(targetClass);
-                singletonByConcreteClass.put(targetClass, instance);
-                injectFields(instance, targetClass);
-                debugBean("BEAN_CREATE_DONE class=%s", targetClass.getName());
-                return instance;
-            } catch (Exception e) {
-                throw new RuntimeException("Create bean failed: " + targetClass.getName(), e);
-            } finally {
-                creating.remove(targetClass);
-            }
+            debugBean("BEAN_GET_FAIL requestType=%s reason=all-candidates-failed", requestedType.getName());
+            return null;
         }
 
         private void injectFields(Object instance, Class<?> type) throws Exception {
@@ -1352,7 +1635,7 @@ public class RuntimeSandboxSimulator {
                 if (namedClass != null) {
                     debugBean("BEAN_RESOLVE_HIT strategy=by-resource-name bean=%s type=%s",
                             hint.preferredBeanName, namedClass.getName());
-                    return getBean(namedClass);
+                    return getOrCreateConcreteBean(namedClass, dependencyType, "RESOURCE_NAME");
                 }
             }
             if (hint != null && !isBlank(hint.qualifier)) {
@@ -1360,32 +1643,58 @@ public class RuntimeSandboxSimulator {
                 if (qualifierClass != null) {
                     debugBean("BEAN_RESOLVE_HIT strategy=by-qualifier bean=%s type=%s",
                             hint.qualifier, qualifierClass.getName());
-                    return getBean(qualifierClass);
+                    return getOrCreateConcreteBean(qualifierClass, dependencyType, "QUALIFIER");
                 }
             }
             if (dependencyType.isInterface()) {
-                Class<?> impl = resolveImplementationClass(dependencyType, fieldName, preferredName);
-                if (impl == null) {
+                List<Class<?>> implCandidates = resolveImplementationCandidates(dependencyType, fieldName, preferredName);
+                if (implCandidates.isEmpty()) {
                     debugBean("BEAN_RESOLVE_MOCK type=%s reason=no-impl", dependencyType.getName());
                     return createInterfaceMock(dependencyType);
                 }
-                debugBean("BEAN_RESOLVE_HIT strategy=interface-impl type=%s impl=%s",
-                        dependencyType.getName(), impl.getName());
-                return getBean(impl);
+                for (Class<?> impl : implCandidates) {
+                    if (impl == null) {
+                        continue;
+                    }
+                    debugBean("BEAN_RESOLVE_TRY strategy=interface-impl type=%s impl=%s",
+                            dependencyType.getName(), impl.getName());
+                    Object resolved = getOrCreateConcreteBean(impl, dependencyType, "INTERFACE_IMPL");
+                    if (resolved != null) {
+                        debugBean("BEAN_RESOLVE_HIT strategy=interface-impl type=%s impl=%s",
+                                dependencyType.getName(), impl.getName());
+                        return resolved;
+                    }
+                    debugBean("BEAN_RESOLVE_BRANCH_FAIL strategy=interface-impl type=%s impl=%s", dependencyType.getName(), impl.getName());
+                }
+                debugBean("BEAN_RESOLVE_MOCK type=%s reason=all-candidates-failed", dependencyType.getName());
+                return createInterfaceMock(dependencyType);
             }
 
             if (Modifier.isAbstract(dependencyType.getModifiers())) {
-                Class<?> impl = resolveImplementationClass(dependencyType, fieldName, preferredName);
-                if (impl == null) {
+                List<Class<?>> implCandidates = resolveImplementationCandidates(dependencyType, fieldName, preferredName);
+                if (implCandidates.isEmpty()) {
                     debugBean("BEAN_RESOLVE_SKIP type=%s reason=abstract-no-impl", dependencyType.getName());
                     return null;
                 }
-                debugBean("BEAN_RESOLVE_HIT strategy=abstract-impl type=%s impl=%s",
-                        dependencyType.getName(), impl.getName());
-                return getBean(impl);
+                for (Class<?> impl : implCandidates) {
+                    if (impl == null) {
+                        continue;
+                    }
+                    debugBean("BEAN_RESOLVE_TRY strategy=abstract-impl type=%s impl=%s",
+                            dependencyType.getName(), impl.getName());
+                    Object resolved = getOrCreateConcreteBean(impl, dependencyType, "ABSTRACT_IMPL");
+                    if (resolved != null) {
+                        debugBean("BEAN_RESOLVE_HIT strategy=abstract-impl type=%s impl=%s",
+                                dependencyType.getName(), impl.getName());
+                        return resolved;
+                    }
+                    debugBean("BEAN_RESOLVE_BRANCH_FAIL strategy=abstract-impl type=%s impl=%s", dependencyType.getName(), impl.getName());
+                }
+                debugBean("BEAN_RESOLVE_SKIP type=%s reason=abstract-all-candidates-failed", dependencyType.getName());
+                return null;
             }
             debugBean("BEAN_RESOLVE_HIT strategy=concrete type=%s", dependencyType.getName());
-            return getBean(dependencyType);
+            return getOrCreateConcreteBean(dependencyType, dependencyType, "CONCRETE");
         }
 
         private Object instantiate(Class<?> targetClass) throws Exception {
@@ -1444,11 +1753,14 @@ public class RuntimeSandboxSimulator {
             throw new IllegalStateException("No suitable constructor for " + targetClass.getName());
         }
 
-        private Class<?> resolveImplementationClass(Class<?> requestedType,
-                                                    String fieldName,
-                                                    String preferredBeanName) {
+        private List<Class<?>> resolveImplementationCandidates(Class<?> requestedType,
+                                                               String fieldName,
+                                                               String preferredBeanName) {
+            if (requestedType == null) {
+                return Collections.emptyList();
+            }
             if (!requestedType.isInterface() && !Modifier.isAbstract(requestedType.getModifiers())) {
-                return requestedType;
+                return Collections.singletonList(requestedType);
             }
             if (!isBlank(preferredBeanName)) {
                 Class<?> byName = resolveBeanClassByName(preferredBeanName, requestedType);
@@ -1460,7 +1772,7 @@ public class RuntimeSandboxSimulator {
                             preferredBeanName,
                             byName.getName()
                     );
-                    return byName;
+                    return Collections.singletonList(byName);
                 }
             }
             List<Class<?>> candidates = new ArrayList<Class<?>>();
@@ -1484,7 +1796,7 @@ public class RuntimeSandboxSimulator {
                         fieldName,
                         preferredBeanName
                 );
-                return null;
+                return Collections.emptyList();
             }
             String normalizedFieldName = normalizeBeanName(fieldName);
             String normalizedPreferredName = normalizeBeanName(preferredBeanName);
@@ -1511,13 +1823,65 @@ public class RuntimeSandboxSimulator {
                     candidateWithScores
             );
             debugBean(
-                    "BEAN_IMPL_SELECT strategy=scored requested=%s field=%s preferred=%s selected=%s",
+                    "BEAN_IMPL_SELECT strategy=scored requested=%s field=%s preferred=%s selected=%s fallbackCount=%d",
                     requestedType.getName(),
                     fieldName,
                     preferredBeanName,
-                    candidates.get(0).getName()
+                    candidates.get(0).getName(),
+                    candidates.size() - 1
             );
-            return candidates.get(0);
+            return candidates;
+        }
+
+        private Object getOrCreateConcreteBean(Class<?> targetClass,
+                                               Class<?> requestedType,
+                                               String reason) {
+            if (targetClass == null) {
+                return null;
+            }
+            Object existing = singletonByConcreteClass.get(targetClass);
+            if (existing != null) {
+                debugBean(
+                        "BEAN_GET_HIT class=%s requested=%s reason=%s",
+                        targetClass.getName(),
+                        requestedType == null ? "null" : requestedType.getName(),
+                        reason
+                );
+                return existing;
+            }
+            if (!creating.add(targetClass)) {
+                debugBean("BEAN_GET_REENTRANT class=%s requested=%s reason=%s",
+                        targetClass.getName(),
+                        requestedType == null ? "null" : requestedType.getName(),
+                        reason);
+                return singletonByConcreteClass.get(targetClass);
+            }
+            try {
+                debugBean("BEAN_CREATE class=%s requested=%s reason=%s",
+                        targetClass.getName(),
+                        requestedType == null ? "null" : requestedType.getName(),
+                        reason);
+                Object instance = instantiate(targetClass);
+                singletonByConcreteClass.put(targetClass, instance);
+                injectFields(instance, targetClass);
+                beanCreateFailures.remove(targetClass);
+                debugBean("BEAN_CREATE_DONE class=%s requested=%s reason=%s",
+                        targetClass.getName(),
+                        requestedType == null ? "null" : requestedType.getName(),
+                        reason);
+                return instance;
+            } catch (Throwable error) {
+                String failure = error.getClass().getName() + ": " + error.getMessage();
+                beanCreateFailures.put(targetClass, failure);
+                debugBean("BEAN_CREATE_BRANCH_FAIL class=%s requested=%s reason=%s error=%s",
+                        targetClass.getName(),
+                        requestedType == null ? "null" : requestedType.getName(),
+                        reason,
+                        failure);
+                return null;
+            } finally {
+                creating.remove(targetClass);
+            }
         }
 
         private Object createInterfaceMock(Class<?> iface) {
@@ -1658,6 +2022,9 @@ public class RuntimeSandboxSimulator {
             return normalized.contains("log4j")
                     || normalized.contains("logback")
                     || normalized.endsWith("/pom.xml")
+                    || normalized.contains("/.m2repo/")
+                    || normalized.contains("/.idea/")
+                    || normalized.contains("/build/")
                     || normalized.contains("/target/");
         }
 
@@ -2139,6 +2506,7 @@ public class RuntimeSandboxSimulator {
         public final Path outputDir;
         public final int maxCalls;
         public final boolean debugRuntime;
+        public final boolean useSpringContext;
 
         public CliOptions(Path projectDir,
                           List<Path> classesRoots,
@@ -2149,7 +2517,8 @@ public class RuntimeSandboxSimulator {
                           List<String> tracePrefixes,
                           Path outputDir,
                           int maxCalls,
-                          boolean debugRuntime) {
+                          boolean debugRuntime,
+                          boolean useSpringContext) {
             this.projectDir = projectDir;
             this.classesRoots = classesRoots;
             this.classpathEntries = classpathEntries;
@@ -2160,6 +2529,7 @@ public class RuntimeSandboxSimulator {
             this.outputDir = outputDir;
             this.maxCalls = maxCalls;
             this.debugRuntime = debugRuntime;
+            this.useSpringContext = useSpringContext;
         }
 
         public static CliOptions parse(String[] args) {
@@ -2173,6 +2543,7 @@ public class RuntimeSandboxSimulator {
             Path outputDir = Paths.get(".").toAbsolutePath().normalize().resolve("build/reports/runtime-sandbox");
             int maxCalls = 200000;
             boolean debugRuntime = false;
+            boolean useSpringContext = false;
             boolean outExplicitlySpecified = false;
 
             for (int i = 0; i < args.length; i++) {
@@ -2198,6 +2569,8 @@ public class RuntimeSandboxSimulator {
                     maxCalls = Integer.parseInt(args[++i]);
                 } else if ("--debug-runtime".equals(arg)) {
                     debugRuntime = true;
+                } else if ("--use-spring-context".equals(arg)) {
+                    useSpringContext = true;
                 }
             }
 
@@ -2241,7 +2614,8 @@ public class RuntimeSandboxSimulator {
                     normalizeTokens(tracePrefixes),
                     outputDir,
                     maxCalls,
-                    debugRuntime
+                    debugRuntime,
+                    useSpringContext
             );
         }
 

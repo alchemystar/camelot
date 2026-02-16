@@ -97,7 +97,9 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 
 - 第 1 个参数：目标工程目录（会自动探测 `target/classes` 与常见 jar 依赖）
 - 第 2 个参数：`entry-method`，建议写成 `全限定类名#方法名/参数个数`
-- 其他参数可选追加（例如 `--arg`、`--out`、`--trace-prefix`、`--debug-runtime`）
+- 其他参数可选追加（例如 `--arg`、`--out`、`--trace-prefix`、`--debug-runtime`、`--use-spring-context`）
+- 不传 `--arg` 时会按方法签名自动生成入参；也可对单个参数传 `--arg __auto__` 或 `--arg @auto`
+- `--use-spring-context`：优先使用真实 Spring `ApplicationContext` 装配 Bean（失败自动回退到内置 SandboxBeanFactory）
 - 若目标工程有 `pom.xml`，脚本会自动解析其 runtime 依赖并通过 `--classpath` 传给模拟器
 - 若报 `ClassNotFoundException`，加 `--debug-runtime` 可打印类加载器 URL、扫描类数量、候选类名建议等排查日志
 

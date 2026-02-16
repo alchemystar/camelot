@@ -13,6 +13,7 @@
         <javaparser.version>3.27.1</javaparser.version>
         <jackson.version>2.18.2</jackson.version>
         <bytebuddy.version>1.14.19</bytebuddy.version>
+        <spring.version>5.3.39</spring.version>
     </properties>
 
     <dependencies>
@@ -35,6 +36,11 @@
             <groupId>net.bytebuddy</groupId>
             <artifactId>byte-buddy-agent</artifactId>
             <version>${bytebuddy.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-context</artifactId>
+            <version>${spring.version}</version>
         </dependency>
     </dependencies>
 
