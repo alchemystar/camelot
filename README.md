@@ -78,6 +78,7 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 - 从注入 Bean 参数（如 `validateStage`）推断 stage 实现类，再结合 Pipeline 终止方法内部的 step 调用签名（如 `apply/1`）补边
 - 支持静态下钻：当组装逻辑分散在父类/子类方法中（如 `AbstractPipeline + 子类 override`），会沿调用链递归收集组装参数并合并推断结果
 - 支持 `build()` 返回值追踪：从 `return` 结果反向追踪变量赋值/改写链（含 helper 方法、变量重赋值）以更精确还原组装结果
+- 支持范型返回值下钻：如父类 `build()` 返回类型变量 `P`，子类以 `extends Parent<ConcretePipeline>` 绑定实参时，可继续解析 `build().execute()` 链路
 
 调用链下钻遇到反射/动态代理/SPI/native 等不可静态精确建模场景时，会在图中补充 `STOP::*` 节点并附带 `EVIDENCE` 原因。
 
@@ -113,6 +114,7 @@ mvn -q exec:java -Dexec.args="--project ./examples/demo-spring-app --out ./build
 
 - 注解入口：`/users/{id}`
 - 注解入口：`/pipeline/{id}`
+- 注解入口：`/pipeline/generic/{id}`（父类 `build()` 返回范型变量场景）
 - XML 入口：`/legacy/users/{id}`
 
 ## 已知限制（当前版本）

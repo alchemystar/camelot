@@ -461,6 +461,11 @@ public class SpringCallPathAnalyzer {
                         importContext,
                         declaration.isInterface()
                 );
+                classModel.typeParameters.addAll(
+                        declaration.getTypeParameters().stream()
+                                .map(tp -> tp.getNameAsString())
+                                .collect(Collectors.toList())
+                );
                 classModel.annotations.addAll(annotationNames(declaration));
                 classModel.implementedTypes.addAll(declaration.getImplementedTypes().stream().map(t -> t.asString()).collect(Collectors.toList()));
                 declaration.getExtendedTypes().stream().findFirst().ifPresent(t -> classModel.superType = t.asString());
@@ -1275,7 +1280,18 @@ public class SpringCallPathAnalyzer {
             if (types.isEmpty()) {
                 String parameterType = calleeMethod.visibleVariableTypes.get(parameterName);
                 if (!isBlank(parameterType)) {
-                    types = resolveClassesByTypeWithContext(parameterType, javaModel, javaModel.classesByName.get(calleeMethod.className));
+                    String normalizedParameterType = normalizeTypeName(parameterType);
+                    if (isLikelyTypeVariable(normalizedParameterType)) {
+                        types = resolveGenericTypeVariableToConcreteClasses(
+                                calleeMethod.className,
+                                receiverClassName,
+                                normalizedParameterType,
+                                javaModel
+                        );
+                    }
+                    if (types.isEmpty()) {
+                        types = resolveClassesByTypeWithContext(parameterType, javaModel, javaModel.classesByName.get(calleeMethod.className));
+                    }
                 }
             }
             if (!types.isEmpty()) {
@@ -1310,7 +1326,21 @@ public class SpringCallPathAnalyzer {
             if (isBlank(declaredType)) {
                 continue;
             }
-            Set<String> candidates = resolveClassesByTypeWithContext(declaredType, javaModel, classModel);
+            Set<String> candidates = new LinkedHashSet<String>();
+            String normalizedDeclaredType = normalizeTypeName(declaredType);
+            if (isLikelyTypeVariable(normalizedDeclaredType)) {
+                for (String thisType : context.thisTypeNames) {
+                    candidates.addAll(resolveGenericTypeVariableToConcreteClasses(
+                            classModel.fqcn,
+                            thisType,
+                            normalizedDeclaredType,
+                            javaModel
+                    ));
+                }
+            }
+            if (candidates.isEmpty()) {
+                candidates.addAll(resolveClassesByTypeWithContext(declaredType, javaModel, classModel));
+            }
             if (!candidates.isEmpty()) {
                 context.variableTypes.put(parameterName, candidates);
             }
@@ -1526,9 +1556,18 @@ public class SpringCallPathAnalyzer {
         Set<String> inferred = new LinkedHashSet<String>();
         String returnType = normalizeTypeName(methodModel.returnTypeName);
         if (!isBlank(returnType) && !"void".equals(returnType)) {
-            inferred.addAll(resolveClassesByTypeWithContext(returnType, javaModel, ownerClassModel));
+            if (isLikelyTypeVariable(returnType)) {
+                inferred.addAll(resolveGenericTypeVariableToConcreteClasses(
+                        methodModel.className,
+                        receiverClassName,
+                        returnType,
+                        javaModel
+                ));
+            } else {
+                inferred.addAll(resolveClassesByTypeWithContext(methodModel.returnTypeName, javaModel, ownerClassModel));
+            }
         }
-        if (inferred.isEmpty() || isLikelyTypeVariable(returnType)) {
+        if (inferred.isEmpty()) {
             if (!isBlank(receiverClassName)) {
                 inferred.add(receiverClassName);
             }
@@ -1572,6 +1611,21 @@ public class SpringCallPathAnalyzer {
         }
         String localType = methodModel.visibleVariableTypes.get(token);
         if (!isBlank(localType)) {
+            String normalizedLocalType = normalizeTypeName(localType);
+            if (isLikelyTypeVariable(normalizedLocalType) && context != null && !context.thisTypeNames.isEmpty()) {
+                Set<String> concreteLocalTypes = new LinkedHashSet<String>();
+                for (String thisType : context.thisTypeNames) {
+                    concreteLocalTypes.addAll(resolveGenericTypeVariableToConcreteClasses(
+                            methodModel.className,
+                            thisType,
+                            normalizedLocalType,
+                            javaModel
+                    ));
+                }
+                if (!concreteLocalTypes.isEmpty()) {
+                    return concreteLocalTypes;
+                }
+            }
             return resolveClassesByTypeWithContext(localType, javaModel, classModel);
         }
         FieldModel fieldModel = classModel.fields.get(token);
@@ -1588,6 +1642,21 @@ public class SpringCallPathAnalyzer {
             }
             if (!injectedTargets.isEmpty()) {
                 return injectedTargets;
+            }
+            String normalizedFieldType = normalizeTypeName(fieldModel.typeName);
+            if (isLikelyTypeVariable(normalizedFieldType) && context != null && !context.thisTypeNames.isEmpty()) {
+                Set<String> concreteFieldTypes = new LinkedHashSet<String>();
+                for (String thisType : context.thisTypeNames) {
+                    concreteFieldTypes.addAll(resolveGenericTypeVariableToConcreteClasses(
+                            classModel.fqcn,
+                            thisType,
+                            normalizedFieldType,
+                            javaModel
+                    ));
+                }
+                if (!concreteFieldTypes.isEmpty()) {
+                    return concreteFieldTypes;
+                }
             }
             return resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
         }
@@ -3182,6 +3251,168 @@ public class SpringCallPathAnalyzer {
         return direct;
     }
 
+    private Set<String> resolveGenericTypeVariableToConcreteClasses(String ownerClassName,
+                                                                    String receiverClassName,
+                                                                    String typeVariable,
+                                                                    JavaModel javaModel) {
+        Set<String> resolved = new LinkedHashSet<String>();
+        Set<String> expressions = resolveGenericTypeVariableExpressions(
+                ownerClassName,
+                receiverClassName,
+                typeVariable,
+                javaModel
+        );
+        if (expressions.isEmpty()) {
+            return resolved;
+        }
+        ClassModel ownerClassModel = javaModel.classesByName.get(ownerClassName);
+        for (String expression : expressions) {
+            resolved.addAll(resolveClassesByTypeWithContext(expression, javaModel, ownerClassModel));
+        }
+        return resolved;
+    }
+
+    private Set<String> resolveGenericTypeVariableExpressions(String ownerClassName,
+                                                              String receiverClassName,
+                                                              String typeVariable,
+                                                              JavaModel javaModel) {
+        if (isBlank(ownerClassName) || isBlank(typeVariable)) {
+            return Collections.emptySet();
+        }
+        String startClass = isBlank(receiverClassName) ? ownerClassName : receiverClassName;
+        if (isBlank(startClass)) {
+            return Collections.emptySet();
+        }
+
+        Set<String> resolved = new LinkedHashSet<String>();
+        Deque<TypeBindingFrame> queue = new ArrayDeque<TypeBindingFrame>();
+        Set<String> visiting = new LinkedHashSet<String>();
+        queue.addLast(new TypeBindingFrame(startClass, new LinkedHashMap<String, String>()));
+
+        while (!queue.isEmpty()) {
+            TypeBindingFrame frame = queue.removeFirst();
+            if (!visiting.add(frame.signature())) {
+                continue;
+            }
+
+            if (ownerClassName.equals(frame.className)) {
+                String resolvedExpr = resolveBoundTypeExpression(typeVariable, frame.bindings, 16);
+                if (!isBlank(resolvedExpr)) {
+                    String normalizedExpr = normalizeTypeName(resolvedExpr);
+                    if (!typeVariable.equals(normalizedExpr)) {
+                        resolved.add(resolvedExpr);
+                    }
+                }
+            }
+
+            ClassModel currentModel = javaModel.classesByName.get(frame.className);
+            if (currentModel == null) {
+                continue;
+            }
+
+            List<String> parentTypeReferences = new ArrayList<String>();
+            if (!isBlank(currentModel.superType)) {
+                parentTypeReferences.add(currentModel.superType);
+            }
+            parentTypeReferences.addAll(currentModel.implementedTypes);
+
+            for (String rawParent : parentTypeReferences) {
+                ParsedTypeRef parentTypeRef = ParsedTypeRef.parse(rawParent);
+                if (parentTypeRef == null || isBlank(parentTypeRef.baseType)) {
+                    continue;
+                }
+                Set<String> parentCandidates = resolveDirectTypeNames(parentTypeRef.baseType, javaModel);
+                if (parentCandidates.isEmpty() && parentTypeRef.baseType.contains(".")) {
+                    parentCandidates.add(parentTypeRef.baseType);
+                }
+                for (String parentClassName : parentCandidates) {
+                    Map<String, String> parentBindings = buildParentTypeBindings(
+                            parentClassName,
+                            parentTypeRef.typeArguments,
+                            frame.bindings,
+                            javaModel
+                    );
+                    queue.addLast(new TypeBindingFrame(parentClassName, parentBindings));
+                }
+            }
+        }
+        return resolved;
+    }
+
+    private Map<String, String> buildParentTypeBindings(String parentClassName,
+                                                        List<String> parentTypeArguments,
+                                                        Map<String, String> childBindings,
+                                                        JavaModel javaModel) {
+        ClassModel parentModel = javaModel.classesByName.get(parentClassName);
+        if (parentModel == null || parentModel.typeParameters.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<String, String> bindings = new LinkedHashMap<String, String>();
+        for (int i = 0; i < parentModel.typeParameters.size(); i++) {
+            String parentTypeVariable = parentModel.typeParameters.get(i);
+            String argumentExpression = i < parentTypeArguments.size()
+                    ? parentTypeArguments.get(i)
+                    : parentTypeVariable;
+            String resolvedExpression = resolveBoundTypeExpression(argumentExpression, childBindings, 16);
+            if (isBlank(resolvedExpression)) {
+                resolvedExpression = argumentExpression;
+            }
+            bindings.put(parentTypeVariable, resolvedExpression);
+        }
+        return bindings;
+    }
+
+    private String resolveBoundTypeExpression(String expression,
+                                              Map<String, String> bindings,
+                                              int depthGuard) {
+        if (depthGuard <= 0 || isBlank(expression)) {
+            return "";
+        }
+        String normalizedExpression = normalizeBoundTypeExpression(expression);
+        if (isBlank(normalizedExpression)) {
+            return "";
+        }
+
+        ParsedTypeRef parsed = ParsedTypeRef.parse(normalizedExpression);
+        if (parsed == null) {
+            return normalizedExpression;
+        }
+
+        if (parsed.typeArguments.isEmpty()) {
+            String mapped = bindings.get(parsed.baseType);
+            if (isBlank(mapped) || parsed.baseType.equals(mapped)) {
+                return parsed.baseType;
+            }
+            return resolveBoundTypeExpression(mapped, bindings, depthGuard - 1);
+        }
+
+        List<String> resolvedArguments = new ArrayList<String>();
+        for (String rawArg : parsed.typeArguments) {
+            String resolvedArg = resolveBoundTypeExpression(rawArg, bindings, depthGuard - 1);
+            resolvedArguments.add(isBlank(resolvedArg) ? normalizeBoundTypeExpression(rawArg) : resolvedArg);
+        }
+        return parsed.baseType + "<" + String.join(",", resolvedArguments) + ">";
+    }
+
+    private static String normalizeBoundTypeExpression(String expression) {
+        if (expression == null) {
+            return "";
+        }
+        String normalized = expression.trim();
+        if (normalized.startsWith("? extends ")) {
+            normalized = normalized.substring("? extends ".length()).trim();
+        } else if (normalized.startsWith("? super ")) {
+            normalized = normalized.substring("? super ".length()).trim();
+        } else if ("?".equals(normalized)) {
+            return "java.lang.Object";
+        }
+        int ampersandIndex = normalized.indexOf('&');
+        if (ampersandIndex > 0) {
+            normalized = normalized.substring(0, ampersandIndex).trim();
+        }
+        return normalized.replace("[]", "").trim();
+    }
+
     private static String resolveAlias(String beanId, Map<String, String> aliasToName) {
         String current = beanId;
         Set<String> seen = new HashSet<>();
@@ -4012,6 +4243,7 @@ public class SpringCallPathAnalyzer {
         public final Map<String, FieldModel> fields = new LinkedHashMap<>();
         public final Map<String, MethodModel> methodsById = new LinkedHashMap<>();
         public final Map<String, List<MethodModel>> methodsByName = new LinkedHashMap<>();
+        public final List<String> typeParameters = new ArrayList<String>();
         public final List<String> implementedTypes = new ArrayList<>();
         public final Map<String, String> constructorInjectedFieldTypes = new LinkedHashMap<>();
         public final List<String> classRequestPaths = new ArrayList<>();
@@ -4196,6 +4428,121 @@ public class SpringCallPathAnalyzer {
             this.methodId = methodId;
             this.reason = isBlank(reason) ? "JAVA:unknown" : reason;
             this.receiverClassName = receiverClassName == null ? "" : receiverClassName;
+        }
+    }
+
+    private static class TypeBindingFrame {
+        public final String className;
+        public final Map<String, String> bindings;
+
+        private TypeBindingFrame(String className, Map<String, String> bindings) {
+            this.className = className;
+            this.bindings = bindings == null
+                    ? new LinkedHashMap<String, String>()
+                    : new LinkedHashMap<String, String>(bindings);
+        }
+
+        private String signature() {
+            if (bindings.isEmpty()) {
+                return className + "|";
+            }
+            List<String> parts = new ArrayList<String>();
+            List<String> keys = new ArrayList<String>(bindings.keySet());
+            Collections.sort(keys);
+            for (String key : keys) {
+                parts.add(key + "=" + bindings.get(key));
+            }
+            return className + "|" + String.join(",", parts);
+        }
+    }
+
+    private static class ParsedTypeRef {
+        public final String baseType;
+        public final List<String> typeArguments;
+
+        private ParsedTypeRef(String baseType, List<String> typeArguments) {
+            this.baseType = baseType;
+            this.typeArguments = typeArguments == null
+                    ? new ArrayList<String>()
+                    : new ArrayList<String>(typeArguments);
+        }
+
+        private static ParsedTypeRef parse(String rawTypeExpression) {
+            String normalized = normalizeBoundTypeExpression(rawTypeExpression);
+            if (isBlank(normalized)) {
+                return null;
+            }
+
+            int lt = normalized.indexOf('<');
+            if (lt < 0) {
+                return new ParsedTypeRef(normalized, Collections.<String>emptyList());
+            }
+            int gt = findMatchingRightAngle(normalized, lt);
+            if (gt <= lt) {
+                return new ParsedTypeRef(normalizeTypeName(normalized), Collections.<String>emptyList());
+            }
+
+            String base = normalizeTypeName(normalized.substring(0, lt));
+            String argumentBody = normalized.substring(lt + 1, gt);
+            List<String> arguments = splitTopLevelTypeArguments(argumentBody);
+            return new ParsedTypeRef(base, arguments);
+        }
+
+        private static int findMatchingRightAngle(String source, int leftAngleIndex) {
+            if (source == null || leftAngleIndex < 0 || leftAngleIndex >= source.length()) {
+                return -1;
+            }
+            int depth = 0;
+            for (int i = leftAngleIndex; i < source.length(); i++) {
+                char c = source.charAt(i);
+                if (c == '<') {
+                    depth++;
+                } else if (c == '>') {
+                    depth--;
+                    if (depth == 0) {
+                        return i;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        private static List<String> splitTopLevelTypeArguments(String rawArguments) {
+            if (isBlank(rawArguments)) {
+                return Collections.emptyList();
+            }
+            List<String> parts = new ArrayList<String>();
+            StringBuilder token = new StringBuilder();
+            int depth = 0;
+            for (int i = 0; i < rawArguments.length(); i++) {
+                char c = rawArguments.charAt(i);
+                if (c == '<') {
+                    depth++;
+                    token.append(c);
+                    continue;
+                }
+                if (c == '>') {
+                    if (depth > 0) {
+                        depth--;
+                    }
+                    token.append(c);
+                    continue;
+                }
+                if (c == ',' && depth == 0) {
+                    String value = token.toString().trim();
+                    if (!isBlank(value)) {
+                        parts.add(value);
+                    }
+                    token.setLength(0);
+                    continue;
+                }
+                token.append(c);
+            }
+            String tail = token.toString().trim();
+            if (!isBlank(tail)) {
+                parts.add(tail);
+            }
+            return parts;
         }
     }
 
