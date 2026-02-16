@@ -459,7 +459,8 @@ public class SpringCallPathAnalyzer {
                         simpleName,
                         packageName,
                         importContext,
-                        declaration.isInterface()
+                        declaration.isInterface(),
+                        declaration.isAbstract()
                 );
                 classModel.typeParameters.addAll(
                         declaration.getTypeParameters().stream()
@@ -2185,7 +2186,7 @@ public class SpringCallPathAnalyzer {
             );
         }
 
-        if (assemblyLikeCall) {
+        if (assemblyLikeCall && isStrongPipelineAssemblyMethod(callSite.methodName)) {
             return;
         }
 
@@ -2227,6 +2228,13 @@ public class SpringCallPathAnalyzer {
             unique.put(arg.ownerClassName + "#" + arg.ownerMethodId + "#" + arg.token, arg);
         }
         return new ArrayList<PipelineAssemblyArg>(unique.values());
+    }
+
+    private boolean isStrongPipelineAssemblyMethod(String methodName) {
+        if (isBlank(methodName)) {
+            return false;
+        }
+        return PIPELINE_ASSEMBLY_METHOD_NAMES.contains(methodName.toLowerCase(Locale.ROOT));
     }
 
     private void collectPipelineAssemblyArgsFromVariableState(ClassModel classModel,
@@ -3041,6 +3049,16 @@ public class SpringCallPathAnalyzer {
         if (isBlank(className)) {
             return setOf();
         }
+        ClassModel startModel = javaModel.classesByName.get(className);
+        if (startModel != null && (startModel.isInterface || startModel.isAbstract)) {
+            Set<String> expanded = new LinkedHashSet<String>();
+            expanded.addAll(resolveMethodByName(className, call, javaModel));
+            expanded.addAll(resolveMethodInDescendants(startModel, call, javaModel));
+            if (!expanded.isEmpty()) {
+                return expanded;
+            }
+        }
+
         Set<String> visited = new LinkedHashSet<String>();
         Deque<String> queue = new ArrayDeque<String>();
         queue.add(className);
@@ -4239,6 +4257,7 @@ public class SpringCallPathAnalyzer {
         public final String packageName;
         public final ImportContext importContext;
         public final boolean isInterface;
+        public final boolean isAbstract;
         public final Set<String> annotations = new LinkedHashSet<>();
         public final Map<String, FieldModel> fields = new LinkedHashMap<>();
         public final Map<String, MethodModel> methodsById = new LinkedHashMap<>();
@@ -4255,12 +4274,14 @@ public class SpringCallPathAnalyzer {
                           String simpleName,
                           String packageName,
                           ImportContext importContext,
-                          boolean isInterface) {
+                          boolean isInterface,
+                          boolean isAbstract) {
             this.fqcn = fqcn;
             this.simpleName = simpleName;
             this.packageName = packageName;
             this.importContext = importContext;
             this.isInterface = isInterface;
+            this.isAbstract = isAbstract;
         }
 
         public boolean isComponent() {

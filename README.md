@@ -115,6 +115,7 @@ mvn -q exec:java -Dexec.args="--project ./examples/demo-spring-app --out ./build
 - 注解入口：`/users/{id}`
 - 注解入口：`/pipeline/{id}`
 - 注解入口：`/pipeline/generic/{id}`（父类 `build()` 返回范型变量场景）
+- 注解入口：`/complex/pattern/{id}` 与 `/complex/pattern/chain/{id}`（Template + Pipeline + Observer + Visitor + 泛型跨类组装）
 - XML 入口：`/legacy/users/{id}`
 
 ## 已知限制（当前版本）
