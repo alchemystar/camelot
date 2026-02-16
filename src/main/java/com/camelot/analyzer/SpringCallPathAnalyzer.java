@@ -295,31 +295,21 @@ public class SpringCallPathAnalyzer {
             ));
         }
 
-        Set<String> reachableMethodIds = collectReachableMethodIds(endpointPaths);
-        debugLogger.log("REACHABLE methods=%d endpointPaths=%d", reachableMethodIds.size(), endpointPaths.size());
+        Set<String> pathSampleMethodIds = collectReachableMethodIds(endpointPaths);
+        debugLogger.log("PATH_SAMPLE methods=%d endpointPaths=%d", pathSampleMethodIds.size(), endpointPaths.size());
         List<CallEdge> filteredEdges = edges;
-        Map<String, String> methodDisplay;
-        if (reachableMethodIds.isEmpty() && isBlank(endpointPathFilter) && isBlank(entryMethodFilter)) {
-            methodDisplay = methodsById.values().stream()
-                    .collect(Collectors.toMap(m -> m.id, MethodModel::display, (a, b) -> a, LinkedHashMap::new));
-        } else {
-            filteredEdges = edges.stream()
-                    .filter(e -> reachableMethodIds.contains(e.from) && reachableMethodIds.contains(e.to))
-                    .collect(Collectors.toList());
-            methodDisplay = new LinkedHashMap<String, String>();
-            for (String methodId : reachableMethodIds) {
-                MethodModel methodModel = methodsById.get(methodId);
-                if (methodModel != null) {
-                    methodDisplay.put(methodId, methodModel.display());
-                }
-            }
-        }
+        Map<String, String> methodDisplay = new LinkedHashMap<String, String>();
         for (CallEdge edge : filteredEdges) {
             if (!methodDisplay.containsKey(edge.from)) {
                 methodDisplay.put(edge.from, toMethodDisplay(edge.from, methodsById));
             }
             if (!methodDisplay.containsKey(edge.to)) {
                 methodDisplay.put(edge.to, toMethodDisplay(edge.to, methodsById));
+            }
+        }
+        for (EndpointPaths endpointPath : endpointPaths) {
+            if (!methodDisplay.containsKey(endpointPath.entryMethodId)) {
+                methodDisplay.put(endpointPath.entryMethodId, toMethodDisplay(endpointPath.entryMethodId, methodsById));
             }
         }
 
@@ -1019,11 +1009,18 @@ public class SpringCallPathAnalyzer {
         if (classModel == null) {
             return;
         }
+        debugLogger.log("TRAVERSE_ENTER method=%s depth=%d", methodId, depth);
 
         TypeFlowContext methodContext = initializeMethodContext(classModel, methodModel, incomingContext, javaModel);
         String frameKey = methodId + "@" + methodContext.signature();
         Integer expandedDepth = expandedFrameDepth.get(frameKey);
         if (expandedDepth != null && expandedDepth.intValue() <= depth) {
+            debugLogger.log(
+                    "TRAVERSE_SKIP_ALREADY_EXPANDED method=%s depth=%d previousDepth=%d",
+                    methodId,
+                    depth,
+                    expandedDepth.intValue()
+            );
             return;
         }
         expandedFrameDepth.put(frameKey, Integer.valueOf(depth));
@@ -1045,6 +1042,15 @@ public class SpringCallPathAnalyzer {
             int assignmentIdx = 0;
 
             for (CallSite call : calls) {
+                debugLogger.log(
+                        "TRAVERSE_CALL from=%s line=%d call=%s/%d scope=%s scopeToken=%s",
+                        methodModel.id,
+                        call.line,
+                        call.methodName,
+                        call.argumentCount,
+                        call.scopeType,
+                        call.scopeToken
+                );
                 assignmentIdx = applyAssignmentsBeforeCall(
                         assignments,
                         assignmentIdx,
@@ -1096,6 +1102,16 @@ public class SpringCallPathAnalyzer {
                 candidates = deduplicateResolvedTargets(candidates);
 
                 if (candidates.isEmpty()) {
+                    debugLogger.log(
+                            "TRAVERSE_CALL_UNRESOLVED from=%s line=%d call=%s/%d scope=%s scopeToken=%s contextTypes=%s",
+                            methodModel.id,
+                            call.line,
+                            call.methodName,
+                            call.argumentCount,
+                            call.scopeType,
+                            call.scopeToken,
+                            methodContext.signature()
+                    );
                     String stopReason = detectUnsupportedStopReason(call);
                     if (!isBlank(stopReason)) {
                         String reason = enrichReasonWithEvidence("STOP:" + stopReason, call);
@@ -1143,6 +1159,7 @@ public class SpringCallPathAnalyzer {
                 }
             }
         } finally {
+            debugLogger.log("TRAVERSE_EXIT method=%s depth=%d", methodId, depth);
             visitingMethods.removeLast();
             visitingFrames.remove(frameKey);
         }
@@ -1424,6 +1441,29 @@ public class SpringCallPathAnalyzer {
                             resolveMethodByReceiverDispatch(runtimeType, call, javaModel),
                             "CTX:runtime-var",
                             runtimeType
+                    );
+                }
+                if (!resolved.isEmpty()) {
+                    return deduplicateResolvedTargets(resolved);
+                }
+            }
+
+            Set<String> inferredTokenTypes = inferTokenTypes(
+                    classModel,
+                    methodModel,
+                    call.scopeToken,
+                    context,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry
+            );
+            if (!inferredTokenTypes.isEmpty()) {
+                for (String inferredType : inferredTokenTypes) {
+                    addResolvedTargets(
+                            resolved,
+                            resolveMethodByReceiverDispatch(inferredType, call, javaModel),
+                            "CTX:token-infer",
+                            inferredType
                     );
                 }
                 if (!resolved.isEmpty()) {
