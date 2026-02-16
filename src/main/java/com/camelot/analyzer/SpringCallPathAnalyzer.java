@@ -1046,6 +1046,19 @@ public class SpringCallPathAnalyzer {
             return Collections.emptyMap();
         }
         boolean namedTerminal = isPipelineTerminalCall(call);
+        PipelineStepContext stepContext = collectPipelineStepContext(
+                terminalCandidates.keySet(),
+                methodsById,
+                javaModel
+        );
+        Set<String> expectedStepTypes = stepContext.receiverTypeNames;
+        Set<PipelineStepCallSignature> stepSignatures = stepContext.signatures;
+        if (!namedTerminal && stepSignatures.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        if (stepSignatures.isEmpty()) {
+            return Collections.emptyMap();
+        }
 
         List<PipelineAssemblyArg> assemblyArgs = new ArrayList<PipelineAssemblyArg>();
         assemblyArgs.addAll(collectPipelineAssemblyArgs(
@@ -1054,7 +1067,8 @@ public class SpringCallPathAnalyzer {
                 call.scopeCall,
                 javaModel,
                 methodsById,
-                injectionRegistry
+                injectionRegistry,
+                expectedStepTypes
         ));
         assemblyArgs.addAll(collectPipelineAssemblyArgsFromScopeMethods(
                 classModel,
@@ -1062,7 +1076,8 @@ public class SpringCallPathAnalyzer {
                 call,
                 javaModel,
                 methodsById,
-                injectionRegistry
+                injectionRegistry,
+                expectedStepTypes
         ));
         assemblyArgs = deduplicatePipelineAssemblyArgs(assemblyArgs);
         if (assemblyArgs.isEmpty()) {
@@ -1076,17 +1091,6 @@ public class SpringCallPathAnalyzer {
                 injectionRegistry
         );
         if (assemblyTargets.isEmpty()) {
-            return Collections.emptyMap();
-        }
-
-        Set<PipelineStepCallSignature> stepSignatures = collectPipelineStepCallSignatures(
-                terminalCandidates.keySet(),
-                methodsById
-        );
-        if (!namedTerminal && stepSignatures.isEmpty()) {
-            return Collections.emptyMap();
-        }
-        if (stepSignatures.isEmpty()) {
             return Collections.emptyMap();
         }
 
@@ -1141,7 +1145,8 @@ public class SpringCallPathAnalyzer {
                                                                   CallSite scopeCall,
                                                                   JavaModel javaModel,
                                                                   Map<String, MethodModel> methodsById,
-                                                                  InjectionRegistry injectionRegistry) {
+                                                                  InjectionRegistry injectionRegistry,
+                                                                  Set<String> expectedStepTypes) {
         List<PipelineAssemblyArg> args = new ArrayList<PipelineAssemblyArg>();
         CallSite current = scopeCall;
         while (current != null) {
@@ -1151,7 +1156,8 @@ public class SpringCallPathAnalyzer {
                     current,
                     javaModel,
                     methodsById,
-                    injectionRegistry
+                    injectionRegistry,
+                    expectedStepTypes
             )) {
                 for (String token : current.argumentTokens) {
                     String normalized = normalizePipelineArgToken(token);
@@ -1175,7 +1181,8 @@ public class SpringCallPathAnalyzer {
                                                                                   CallSite call,
                                                                                   JavaModel javaModel,
                                                                                   Map<String, MethodModel> methodsById,
-                                                                                  InjectionRegistry injectionRegistry) {
+                                                                                  InjectionRegistry injectionRegistry,
+                                                                                  Set<String> expectedStepTypes) {
         if (call.scopeCall == null) {
             return Collections.emptyList();
         }
@@ -1200,6 +1207,7 @@ public class SpringCallPathAnalyzer {
                     javaModel,
                     methodsById,
                     injectionRegistry,
+                    expectedStepTypes,
                     0,
                     visitedMethodIds,
                     args
@@ -1212,6 +1220,7 @@ public class SpringCallPathAnalyzer {
                                                              JavaModel javaModel,
                                                              Map<String, MethodModel> methodsById,
                                                              InjectionRegistry injectionRegistry,
+                                                             Set<String> expectedStepTypes,
                                                              int depth,
                                                              Set<String> visiting,
                                                              List<PipelineAssemblyArg> out) {
@@ -1241,6 +1250,7 @@ public class SpringCallPathAnalyzer {
                         javaModel,
                         methodsById,
                         injectionRegistry,
+                        expectedStepTypes,
                         depth,
                         visiting,
                         variableVisit,
@@ -1257,6 +1267,7 @@ public class SpringCallPathAnalyzer {
                         javaModel,
                         methodsById,
                         injectionRegistry,
+                        expectedStepTypes,
                         depth,
                         visiting,
                         variableVisit,
@@ -1274,6 +1285,7 @@ public class SpringCallPathAnalyzer {
                                                           JavaModel javaModel,
                                                           Map<String, MethodModel> methodsById,
                                                           InjectionRegistry injectionRegistry,
+                                                          Set<String> expectedStepTypes,
                                                           int depth,
                                                           Set<String> visitingMethods,
                                                           Set<String> visitingVariables,
@@ -1290,6 +1302,7 @@ public class SpringCallPathAnalyzer {
                     javaModel,
                     methodsById,
                     injectionRegistry,
+                    expectedStepTypes,
                     depth,
                     visitingMethods,
                     visitingVariables,
@@ -1306,6 +1319,7 @@ public class SpringCallPathAnalyzer {
                     javaModel,
                     methodsById,
                     injectionRegistry,
+                    expectedStepTypes,
                     depth,
                     visitingMethods,
                     visitingVariables,
@@ -1321,6 +1335,7 @@ public class SpringCallPathAnalyzer {
                                                          JavaModel javaModel,
                                                          Map<String, MethodModel> methodsById,
                                                          InjectionRegistry injectionRegistry,
+                                                         Set<String> expectedStepTypes,
                                                          int depth,
                                                          Set<String> visitingMethods,
                                                          Set<String> visitingVariables,
@@ -1338,7 +1353,8 @@ public class SpringCallPathAnalyzer {
                     callSite.scopeCall,
                     javaModel,
                     methodsById,
-                    injectionRegistry
+                    injectionRegistry,
+                    expectedStepTypes
             ));
         }
 
@@ -1348,7 +1364,8 @@ public class SpringCallPathAnalyzer {
                 callSite,
                 javaModel,
                 methodsById,
-                injectionRegistry
+                injectionRegistry,
+                expectedStepTypes
         );
         if (assemblyLikeCall) {
             for (String token : callSite.argumentTokens) {
@@ -1374,6 +1391,7 @@ public class SpringCallPathAnalyzer {
                     javaModel,
                     methodsById,
                     injectionRegistry,
+                    expectedStepTypes,
                     depth,
                     visitingMethods,
                     visitingVariables,
@@ -1403,6 +1421,7 @@ public class SpringCallPathAnalyzer {
                     javaModel,
                     methodsById,
                     injectionRegistry,
+                    expectedStepTypes,
                     depth + 1,
                     visitingMethods,
                     out
@@ -1431,6 +1450,7 @@ public class SpringCallPathAnalyzer {
                                                               JavaModel javaModel,
                                                               Map<String, MethodModel> methodsById,
                                                               InjectionRegistry injectionRegistry,
+                                                              Set<String> expectedStepTypes,
                                                               int depth,
                                                               Set<String> visitingMethods,
                                                               Set<String> visitingVariables,
@@ -1459,7 +1479,8 @@ public class SpringCallPathAnalyzer {
                         callSite,
                         javaModel,
                         methodsById,
-                        injectionRegistry
+                        injectionRegistry,
+                        expectedStepTypes
                 );
                 if (assemblyLikeCall) {
                     for (String token : callSite.argumentTokens) {
@@ -1492,6 +1513,7 @@ public class SpringCallPathAnalyzer {
                         javaModel,
                         methodsById,
                         injectionRegistry,
+                        expectedStepTypes,
                         depth,
                         visitingMethods,
                         visitingVariables,
@@ -1542,6 +1564,7 @@ public class SpringCallPathAnalyzer {
                                 javaModel,
                                 methodsById,
                                 injectionRegistry,
+                                expectedStepTypes,
                                 depth + 1,
                                 visitingMethods,
                                 visitingVariables,
@@ -1756,14 +1779,17 @@ public class SpringCallPathAnalyzer {
         return resolved;
     }
 
-    private Set<PipelineStepCallSignature> collectPipelineStepCallSignatures(Set<String> terminalMethodIds,
-                                                                             Map<String, MethodModel> methodsById) {
+    private PipelineStepContext collectPipelineStepContext(Set<String> terminalMethodIds,
+                                                           Map<String, MethodModel> methodsById,
+                                                           JavaModel javaModel) {
         Set<PipelineStepCallSignature> signatures = new LinkedHashSet<PipelineStepCallSignature>();
+        Set<String> receiverTypeNames = new LinkedHashSet<String>();
         for (String terminalMethodId : terminalMethodIds) {
             MethodModel terminalMethod = methodsById.get(terminalMethodId);
             if (terminalMethod == null) {
                 continue;
             }
+            ClassModel terminalClassModel = javaModel.classesByName.get(terminalMethod.className);
             for (CallSite terminalCall : terminalMethod.calls) {
                 if (terminalCall.scopeType != ScopeType.NAME || isBlank(terminalCall.scopeToken)) {
                     continue;
@@ -1783,9 +1809,11 @@ public class SpringCallPathAnalyzer {
                     continue;
                 }
                 signatures.add(new PipelineStepCallSignature(terminalCall.methodName, terminalCall.argumentCount));
+                receiverTypeNames.add(normalizedType);
+                receiverTypeNames.addAll(resolveClassesByTypeWithContext(localType, javaModel, terminalClassModel));
             }
         }
-        return signatures;
+        return new PipelineStepContext(signatures, receiverTypeNames);
     }
 
     private String normalizePipelineArgToken(String raw) {
@@ -1807,7 +1835,8 @@ public class SpringCallPathAnalyzer {
                                                CallSite callSite,
                                                JavaModel javaModel,
                                                Map<String, MethodModel> methodsById,
-                                               InjectionRegistry injectionRegistry) {
+                                               InjectionRegistry injectionRegistry,
+                                               Set<String> expectedStepTypes) {
         if (callSite == null) {
             return false;
         }
@@ -1851,8 +1880,77 @@ public class SpringCallPathAnalyzer {
             if (targetMethod == null) {
                 continue;
             }
+            ClassModel targetClassModel = javaModel.classesByName.get(targetMethod.className);
+            if (hasCompatibleStageParameter(targetMethod, targetClassModel, expectedStepTypes, javaModel)) {
+                return true;
+            }
             if (isLikelyFluentAssemblyTarget(targetMethod, javaModel)) {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasCompatibleStageParameter(MethodModel targetMethod,
+                                                ClassModel targetClassModel,
+                                                Set<String> expectedStepTypes,
+                                                JavaModel javaModel) {
+        if (targetMethod == null || targetMethod.parameterNames.isEmpty() || expectedStepTypes == null || expectedStepTypes.isEmpty()) {
+            return false;
+        }
+        for (String parameterName : targetMethod.parameterNames) {
+            String parameterType = targetMethod.visibleVariableTypes.get(parameterName);
+            if (isBlank(parameterType)) {
+                continue;
+            }
+            if (isTypeCompatibleWithExpectedSteps(parameterType, expectedStepTypes, javaModel, targetClassModel)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isTypeCompatibleWithExpectedSteps(String parameterType,
+                                                      Set<String> expectedStepTypes,
+                                                      JavaModel javaModel,
+                                                      ClassModel contextClass) {
+        String normalizedParamType = normalizeTypeName(parameterType);
+        if (isBlank(normalizedParamType) || expectedStepTypes.isEmpty()) {
+            return false;
+        }
+        Set<String> paramCandidates = new LinkedHashSet<String>(resolveClassesByTypeWithContext(normalizedParamType, javaModel, contextClass));
+        if (paramCandidates.isEmpty()) {
+            paramCandidates.add(normalizedParamType);
+        }
+
+        Set<String> expectedCandidates = new LinkedHashSet<String>();
+        for (String expected : expectedStepTypes) {
+            if (isBlank(expected)) {
+                continue;
+            }
+            String normalizedExpected = normalizeTypeName(expected);
+            if (isBlank(normalizedExpected)) {
+                continue;
+            }
+            expectedCandidates.add(normalizedExpected);
+            expectedCandidates.addAll(resolveClassesByTypeWithContext(normalizedExpected, javaModel, contextClass));
+        }
+
+        for (String paramTypeCandidate : paramCandidates) {
+            if (isBlank(paramTypeCandidate)) {
+                continue;
+            }
+            for (String expectedCandidate : expectedCandidates) {
+                if (isBlank(expectedCandidate)) {
+                    continue;
+                }
+                if (simpleName(paramTypeCandidate).equals(simpleName(expectedCandidate))) {
+                    return true;
+                }
+                if (isAssignableTo(paramTypeCandidate, expectedCandidate, javaModel, new HashSet<String>())
+                        || isAssignableTo(expectedCandidate, paramTypeCandidate, javaModel, new HashSet<String>())) {
+                    return true;
+                }
             }
         }
         return false;
@@ -3369,6 +3467,20 @@ public class SpringCallPathAnalyzer {
         @Override
         public int hashCode() {
             return (methodName == null ? 0 : methodName.hashCode()) * 31 + argumentCount;
+        }
+    }
+
+    private static class PipelineStepContext {
+        public final Set<PipelineStepCallSignature> signatures;
+        public final Set<String> receiverTypeNames;
+
+        private PipelineStepContext(Set<PipelineStepCallSignature> signatures, Set<String> receiverTypeNames) {
+            this.signatures = signatures == null
+                    ? Collections.<PipelineStepCallSignature>emptySet()
+                    : new LinkedHashSet<PipelineStepCallSignature>(signatures);
+            this.receiverTypeNames = receiverTypeNames == null
+                    ? Collections.<String>emptySet()
+                    : new LinkedHashSet<String>(receiverTypeNames);
         }
     }
 
