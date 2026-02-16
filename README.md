@@ -19,9 +19,11 @@
   - `<constructor-arg ref>`（已记录，当前不参与字段名调用匹配）
   - `SimpleUrlHandlerMapping` 的 `urlMap`（`<entry key value-ref>` 和 `<prop key>`）
 - 调用图构建与路径搜索
-  - 方法级调用边
+  - 以入口方法为起点的递归下钻（携带类型上下文）
+  - 方法级调用边（含调用来源证据 `EVIDENCE:*`）
   - Pipeline 组装推断（`builder().add(stageBean)...build().execute(...)`）
-  - 从注解入口和 XML URL 入口做 DFS
+  - 继承/实现链联合分派（按当前接收者类型收敛，多个实现保守分叉）
+  - callee 命中 jar 后停止继续下钻
   - 可配置 `max-depth` / `max-paths`
 - 输出
   - `analysis-report.json`
@@ -34,7 +36,7 @@ JDK 要求：`Java 8+`（当前项目以 `source/target 1.8` 编译）。
 
 ```bash
 mvn -q compile
-mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --max-depth 8 --max-paths 200 --endpoint /users/{id}"
+mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --max-depth 50 --max-paths 200 --endpoint /users/{id}"
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --entry-method com.example.api.UserService#findUser/1"
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --entry-method com.example.api.UserService#findUser/1 --debug"
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-rpc-prefix com.partner.api --non-external-rpc-prefix com.mycorp --non-external-rpc-prefix com.mycorp.shared"
@@ -44,7 +46,7 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 
 - `--project`：被分析工程根目录，默认当前目录
 - `--out`：输出目录，默认 `build/reports/spring-call-path`
-- `--max-depth`：路径最大深度，默认 `8`
+- `--max-depth`：路径最大深度，默认 `50`
 - `--max-paths`：每个入口最多输出路径数，默认 `200`
 - `--endpoint`：仅分析某个接口路径（如 `/users/{id}`），默认分析全部接口
 - `--entry-method`：仅分析某个方法入口（如 `com.foo.UserService#getById/1` 或 `UserService#getById`）
@@ -76,6 +78,8 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 - 从注入 Bean 参数（如 `validateStage`）推断 stage 实现类，再结合 Pipeline 终止方法内部的 step 调用签名（如 `apply/1`）补边
 - 支持静态下钻：当组装逻辑分散在父类/子类方法中（如 `AbstractPipeline + 子类 override`），会沿调用链递归收集组装参数并合并推断结果
 - 支持 `build()` 返回值追踪：从 `return` 结果反向追踪变量赋值/改写链（含 helper 方法、变量重赋值）以更精确还原组装结果
+
+调用链下钻遇到反射/动态代理/SPI/native 等不可静态精确建模场景时，会在图中补充 `STOP::*` 节点并附带 `EVIDENCE` 原因。
 
 示例工程中新增了 `/pipeline/{id}` 入口，可用于验证该能力。
 

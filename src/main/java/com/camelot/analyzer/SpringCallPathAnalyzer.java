@@ -78,6 +78,13 @@ public class SpringCallPathAnalyzer {
     private static final Set<String> PIPELINE_SKIP_STEP_METHOD_NAMES = setOf(
             "iterator", "hasnext", "next", "size", "add", "get", "set"
     );
+    private static final Set<String> JAVA_LANG_COMMON_TYPES = setOf(
+            "Object", "String", "Boolean", "Byte", "Short", "Integer", "Long",
+            "Float", "Double", "Character", "Number", "Void", "Class",
+            "RuntimeException", "Exception", "Throwable", "Enum"
+    );
+    private static final int CALL_RESOLVE_MAX_DEPTH = 16;
+    private static final int FLOW_TRACE_MAX_DEPTH = 50;
 
     public static void main(String[] args) throws Exception {
         CliOptions options = CliOptions.parse(args);
@@ -247,7 +254,6 @@ public class SpringCallPathAnalyzer {
         BeanRegistry beanRegistry = buildBeanRegistry(javaModel, xmlModel);
         InjectionRegistry injectionRegistry = buildInjectionRegistry(javaModel, xmlModel, beanRegistry);
         Map<String, MethodModel> methodsById = collectMethods(javaModel);
-        List<CallEdge> edges = buildCallEdges(javaModel, methodsById, injectionRegistry);
         List<Endpoint> endpoints = buildEndpoints(javaModel, xmlModel, beanRegistry);
         List<Endpoint> selectedEndpoints = new ArrayList<Endpoint>();
         if (!isBlank(endpointPathFilter)) {
@@ -256,6 +262,20 @@ public class SpringCallPathAnalyzer {
             selectedEndpoints.addAll(endpoints);
         }
         debugLogger.log("ENDPOINTS total=%d selected=%d", endpoints.size(), selectedEndpoints.size());
+        Set<String> selectedEntryMethods = selectEntryMethods(entryMethodFilter, methodsById, javaModel);
+        Set<String> traversalEntries = new LinkedHashSet<String>();
+        for (Endpoint endpoint : selectedEndpoints) {
+            traversalEntries.add(endpoint.entryMethodId);
+        }
+        traversalEntries.addAll(selectedEntryMethods);
+
+        List<CallEdge> edges = buildCallEdgesFromEntries(
+                javaModel,
+                methodsById,
+                injectionRegistry,
+                traversalEntries,
+                maxDepth
+        );
         Map<String, List<CallEdge>> edgesFrom = edges.stream()
                 .collect(Collectors.groupingBy(e -> e.from, LinkedHashMap::new, Collectors.toList()));
 
@@ -264,7 +284,7 @@ public class SpringCallPathAnalyzer {
             List<List<String>> paths = enumeratePaths(endpoint.entryMethodId, edgesFrom, maxDepth, maxPathsPerEndpoint);
             endpointPaths.add(new EndpointPaths(endpoint.path, endpoint.httpMethods, endpoint.source, endpoint.entryMethodId, paths));
         }
-        for (String entryMethodId : selectEntryMethods(entryMethodFilter, methodsById, javaModel)) {
+        for (String entryMethodId : selectedEntryMethods) {
             List<List<String>> paths = enumeratePaths(entryMethodId, edgesFrom, maxDepth, maxPathsPerEndpoint);
             endpointPaths.add(new EndpointPaths(
                     "method:" + entryMethodId,
@@ -923,6 +943,703 @@ public class SpringCallPathAnalyzer {
         return methods;
     }
 
+    private List<CallEdge> buildCallEdgesFromEntries(JavaModel javaModel,
+                                                     Map<String, MethodModel> methodsById,
+                                                     InjectionRegistry injectionRegistry,
+                                                     Set<String> entryMethodIds,
+                                                     int maxDepth) {
+        if (entryMethodIds == null || entryMethodIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Map<String, CallEdgeAccumulator> edgeMap = new LinkedHashMap<String, CallEdgeAccumulator>();
+        Map<String, Integer> expandedFrameDepth = new LinkedHashMap<String, Integer>();
+        for (String entryMethodId : entryMethodIds) {
+            MethodModel entryMethod = methodsById.get(entryMethodId);
+            if (entryMethod == null) {
+                continue;
+            }
+            TypeFlowContext rootContext = TypeFlowContext.forRoot(entryMethod.className);
+            Deque<String> visitingMethods = new ArrayDeque<String>();
+            Set<String> visitingFrames = new LinkedHashSet<String>();
+            traverseMethodWithContext(
+                    entryMethodId,
+                    rootContext,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry,
+                    maxDepth,
+                    0,
+                    visitingMethods,
+                    visitingFrames,
+                    expandedFrameDepth,
+                    edgeMap
+            );
+        }
+
+        List<CallEdge> edges = new ArrayList<CallEdge>();
+        for (CallEdgeAccumulator accumulator : edgeMap.values()) {
+            edges.add(new CallEdge(
+                    accumulator.from,
+                    accumulator.to,
+                    String.join("|", accumulator.reasons),
+                    accumulator.line,
+                    listOf()
+            ));
+        }
+        edges.sort(Comparator.comparing((CallEdge e) -> e.from).thenComparing(e -> e.to));
+        debugLogger.log("CALL_GRAPH_ENTRY_SUMMARY entries=%d edges=%d", entryMethodIds.size(), edges.size());
+        return edges;
+    }
+
+    private void traverseMethodWithContext(String methodId,
+                                           TypeFlowContext incomingContext,
+                                           JavaModel javaModel,
+                                           Map<String, MethodModel> methodsById,
+                                           InjectionRegistry injectionRegistry,
+                                           int maxDepth,
+                                           int depth,
+                                           Deque<String> visitingMethods,
+                                           Set<String> visitingFrames,
+                                           Map<String, Integer> expandedFrameDepth,
+                                           Map<String, CallEdgeAccumulator> edgeMap) {
+        if (depth > Math.max(maxDepth, 0)) {
+            return;
+        }
+        MethodModel methodModel = methodsById.get(methodId);
+        if (methodModel == null) {
+            return;
+        }
+        ClassModel classModel = javaModel.classesByName.get(methodModel.className);
+        if (classModel == null) {
+            return;
+        }
+
+        TypeFlowContext methodContext = initializeMethodContext(classModel, methodModel, incomingContext, javaModel);
+        String frameKey = methodId + "@" + methodContext.signature();
+        Integer expandedDepth = expandedFrameDepth.get(frameKey);
+        if (expandedDepth != null && expandedDepth.intValue() <= depth) {
+            return;
+        }
+        expandedFrameDepth.put(frameKey, Integer.valueOf(depth));
+
+        if (visitingMethods.contains(methodId)) {
+            debugLogger.log("TRAVERSE_STOP_CYCLE method=%s depth=%d", methodId, depth);
+            return;
+        }
+        if (!visitingFrames.add(frameKey)) {
+            debugLogger.log("TRAVERSE_STOP_FRAME_CYCLE method=%s depth=%d frame=%s", methodId, depth, frameKey);
+            return;
+        }
+        visitingMethods.addLast(methodId);
+        try {
+            List<CallSite> calls = new ArrayList<CallSite>(methodModel.calls);
+            calls.sort(Comparator.comparingInt(c -> c.line <= 0 ? Integer.MAX_VALUE : c.line));
+            List<AssignmentFlow> assignments = new ArrayList<AssignmentFlow>(methodModel.assignments);
+            assignments.sort(Comparator.comparingInt(a -> a.line <= 0 ? Integer.MAX_VALUE : a.line));
+            int assignmentIdx = 0;
+
+            for (CallSite call : calls) {
+                assignmentIdx = applyAssignmentsBeforeCall(
+                        assignments,
+                        assignmentIdx,
+                        call.line,
+                        classModel,
+                        methodModel,
+                        methodContext,
+                        javaModel,
+                        methodsById,
+                        injectionRegistry
+                );
+                List<ResolvedCallTarget> candidates = resolveCallTargetsWithContext(
+                        classModel,
+                        methodModel,
+                        call,
+                        methodContext,
+                        javaModel,
+                        methodsById,
+                        injectionRegistry,
+                        0
+                );
+
+                Map<String, String> terminalCandidateMap = new LinkedHashMap<String, String>();
+                for (ResolvedCallTarget candidate : candidates) {
+                    terminalCandidateMap.merge(
+                            candidate.methodId,
+                            candidate.reason,
+                            (a, b) -> a.equals(b) ? a : a + "|" + b
+                    );
+                }
+                Map<String, String> pipelineCandidates = resolvePipelineAssemblyCandidates(
+                        classModel,
+                        methodModel,
+                        call,
+                        javaModel,
+                        methodsById,
+                        injectionRegistry,
+                        terminalCandidateMap
+                );
+                for (Map.Entry<String, String> pipelineCandidate : pipelineCandidates.entrySet()) {
+                    MethodIdInfo targetInfo = MethodIdInfo.parse(pipelineCandidate.getKey());
+                    String receiverClass = targetInfo == null ? "" : targetInfo.className;
+                    candidates.add(new ResolvedCallTarget(
+                            pipelineCandidate.getKey(),
+                            pipelineCandidate.getValue(),
+                            receiverClass
+                    ));
+                }
+                candidates = deduplicateResolvedTargets(candidates);
+
+                if (candidates.isEmpty()) {
+                    String stopReason = detectUnsupportedStopReason(call);
+                    if (!isBlank(stopReason)) {
+                        String reason = enrichReasonWithEvidence("STOP:" + stopReason, call);
+                        addEdge(edgeMap, methodModel.id, toStopNodeId(stopReason), reason, call.line);
+                    }
+                    continue;
+                }
+
+                for (ResolvedCallTarget candidate : candidates) {
+                    String reason = enrichReasonWithEvidence(candidate.reason, call);
+                    addEdge(edgeMap, methodModel.id, candidate.methodId, reason, call.line);
+
+                    MethodModel calleeMethod = methodsById.get(candidate.methodId);
+                    if (calleeMethod == null) {
+                        debugLogger.log("TRAVERSE_STOP_JAR from=%s to=%s reason=%s", methodModel.id, candidate.methodId, reason);
+                        continue;
+                    }
+                    if (depth >= Math.max(maxDepth, 0)) {
+                        continue;
+                    }
+                    TypeFlowContext calleeContext = buildCalleeContext(
+                            classModel,
+                            methodModel,
+                            call,
+                            calleeMethod,
+                            candidate.receiverClassName,
+                            methodContext,
+                            javaModel,
+                            methodsById,
+                            injectionRegistry
+                    );
+                    traverseMethodWithContext(
+                            calleeMethod.id,
+                            calleeContext,
+                            javaModel,
+                            methodsById,
+                            injectionRegistry,
+                            maxDepth,
+                            depth + 1,
+                            visitingMethods,
+                            visitingFrames,
+                            expandedFrameDepth,
+                            edgeMap
+                    );
+                }
+            }
+        } finally {
+            visitingMethods.removeLast();
+            visitingFrames.remove(frameKey);
+        }
+    }
+
+    private int applyAssignmentsBeforeCall(List<AssignmentFlow> assignments,
+                                           int assignmentIdx,
+                                           int callLine,
+                                           ClassModel classModel,
+                                           MethodModel methodModel,
+                                           TypeFlowContext methodContext,
+                                           JavaModel javaModel,
+                                           Map<String, MethodModel> methodsById,
+                                           InjectionRegistry injectionRegistry) {
+        if (assignments == null || assignments.isEmpty()) {
+            return assignmentIdx;
+        }
+        int nextIdx = assignmentIdx;
+        while (nextIdx < assignments.size()) {
+            AssignmentFlow assignment = assignments.get(nextIdx);
+            if (assignment == null) {
+                nextIdx++;
+                continue;
+            }
+            if (callLine > 0 && assignment.line > 0 && assignment.line > callLine) {
+                break;
+            }
+            Set<String> inferredTypes = inferValueExprTypes(
+                    classModel,
+                    methodModel,
+                    assignment.value,
+                    methodContext,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry
+            );
+            if (!inferredTypes.isEmpty()) {
+                methodContext.variableTypes.put(assignment.targetVar, inferredTypes);
+                debugLogger.log(
+                        "TYPE_FLOW_ASSIGN method=%s var=%s line=%d types=%s",
+                        methodModel.id,
+                        assignment.targetVar,
+                        assignment.line,
+                        inferredTypes
+                );
+            }
+            nextIdx++;
+        }
+        return nextIdx;
+    }
+
+    private Set<String> inferValueExprTypes(ClassModel classModel,
+                                            MethodModel methodModel,
+                                            ValueExpr valueExpr,
+                                            TypeFlowContext methodContext,
+                                            JavaModel javaModel,
+                                            Map<String, MethodModel> methodsById,
+                                            InjectionRegistry injectionRegistry) {
+        if (valueExpr == null) {
+            return Collections.emptySet();
+        }
+        if (valueExpr.isVariable()) {
+            Set<String> fromContext = methodContext.variableTypes.get(valueExpr.variableName);
+            if (fromContext != null && !fromContext.isEmpty()) {
+                return new LinkedHashSet<String>(fromContext);
+            }
+            String localType = methodModel.visibleVariableTypes.get(valueExpr.variableName);
+            if (!isBlank(localType)) {
+                return resolveClassesByTypeWithContext(localType, javaModel, classModel);
+            }
+            FieldModel fieldModel = classModel.fields.get(valueExpr.variableName);
+            if (fieldModel != null && !isBlank(fieldModel.typeName)) {
+                return resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
+            }
+            return Collections.emptySet();
+        }
+        if (!valueExpr.isCall()) {
+            return Collections.emptySet();
+        }
+        List<ResolvedCallTarget> targets = resolveCallTargetsWithContext(
+                classModel,
+                methodModel,
+                valueExpr.callSite,
+                methodContext,
+                javaModel,
+                methodsById,
+                injectionRegistry,
+                0
+        );
+        Set<String> returnTypes = new LinkedHashSet<String>();
+        for (ResolvedCallTarget target : targets) {
+            returnTypes.addAll(inferMethodReturnTypes(
+                    target.methodId,
+                    target.receiverClassName,
+                    methodContext,
+                    javaModel,
+                    methodsById
+            ));
+        }
+        return returnTypes;
+    }
+
+    private TypeFlowContext buildCalleeContext(ClassModel callerClass,
+                                               MethodModel callerMethod,
+                                               CallSite call,
+                                               MethodModel calleeMethod,
+                                               String receiverClassName,
+                                               TypeFlowContext callerContext,
+                                               JavaModel javaModel,
+                                               Map<String, MethodModel> methodsById,
+                                               InjectionRegistry injectionRegistry) {
+        TypeFlowContext calleeContext = new TypeFlowContext();
+        if (!isBlank(receiverClassName)) {
+            calleeContext.thisTypeNames.add(receiverClassName);
+        } else {
+            calleeContext.thisTypeNames.add(calleeMethod.className);
+        }
+        for (int i = 0; i < calleeMethod.parameterNames.size(); i++) {
+            String parameterName = calleeMethod.parameterNames.get(i);
+            if (isBlank(parameterName)) {
+                continue;
+            }
+            Set<String> types = Collections.emptySet();
+            if (i < call.argumentTokens.size()) {
+                String token = normalizePipelineArgToken(call.argumentTokens.get(i));
+                types = inferTokenTypes(
+                        callerClass,
+                        callerMethod,
+                        token,
+                        callerContext,
+                        javaModel,
+                        methodsById,
+                        injectionRegistry
+                );
+            }
+            if (types.isEmpty()) {
+                String parameterType = calleeMethod.visibleVariableTypes.get(parameterName);
+                if (!isBlank(parameterType)) {
+                    types = resolveClassesByTypeWithContext(parameterType, javaModel, javaModel.classesByName.get(calleeMethod.className));
+                }
+            }
+            if (!types.isEmpty()) {
+                calleeContext.variableTypes.put(parameterName, new LinkedHashSet<String>(types));
+            }
+        }
+        return calleeContext;
+    }
+
+    private TypeFlowContext initializeMethodContext(ClassModel classModel,
+                                                    MethodModel methodModel,
+                                                    TypeFlowContext incomingContext,
+                                                    JavaModel javaModel) {
+        TypeFlowContext context = new TypeFlowContext();
+        if (incomingContext != null) {
+            for (Map.Entry<String, Set<String>> entry : incomingContext.variableTypes.entrySet()) {
+                context.variableTypes.put(entry.getKey(), new LinkedHashSet<String>(entry.getValue()));
+            }
+            context.thisTypeNames.addAll(incomingContext.thisTypeNames);
+        }
+        if (context.thisTypeNames.isEmpty()) {
+            context.thisTypeNames.add(classModel.fqcn);
+        }
+        for (String parameterName : methodModel.parameterNames) {
+            if (isBlank(parameterName)) {
+                continue;
+            }
+            if (context.variableTypes.containsKey(parameterName)) {
+                continue;
+            }
+            String declaredType = methodModel.visibleVariableTypes.get(parameterName);
+            if (isBlank(declaredType)) {
+                continue;
+            }
+            Set<String> candidates = resolveClassesByTypeWithContext(declaredType, javaModel, classModel);
+            if (!candidates.isEmpty()) {
+                context.variableTypes.put(parameterName, candidates);
+            }
+        }
+        return context;
+    }
+
+    private List<ResolvedCallTarget> resolveCallTargetsWithContext(ClassModel classModel,
+                                                                   MethodModel methodModel,
+                                                                   CallSite call,
+                                                                   TypeFlowContext context,
+                                                                   JavaModel javaModel,
+                                                                   Map<String, MethodModel> methodsById,
+                                                                   InjectionRegistry injectionRegistry,
+                                                                   int depth) {
+        if (depth > CALL_RESOLVE_MAX_DEPTH) {
+            debugLogger.log("RESOLVE_DEPTH_GUARD from=%s call=%s/%d", methodModel.id, call.methodName, call.argumentCount);
+            return Collections.emptyList();
+        }
+        List<ResolvedCallTarget> resolved = new ArrayList<ResolvedCallTarget>();
+
+        if (call.scopeType == ScopeType.UNSCOPED || call.scopeType == ScopeType.THIS) {
+            Set<String> thisTypes = context == null || context.thisTypeNames.isEmpty()
+                    ? Collections.<String>singleton(classModel.fqcn)
+                    : context.thisTypeNames;
+            for (String thisType : thisTypes) {
+                addResolvedTargets(
+                        resolved,
+                        resolveMethodByReceiverDispatch(thisType, call, javaModel),
+                        "JAVA:this",
+                        thisType
+                );
+            }
+            if (context == null || context.thisTypeNames.isEmpty()) {
+                addResolvedTargets(
+                        resolved,
+                        resolveMethodInDescendants(classModel, call, javaModel),
+                        "JAVA:this-override",
+                        classModel.fqcn
+                );
+            }
+            return deduplicateResolvedTargets(resolved);
+        }
+
+        if (call.scopeType == ScopeType.NAME && call.scopeToken != null) {
+            Set<String> ownerTypes = context == null || context.thisTypeNames.isEmpty()
+                    ? Collections.<String>singleton(classModel.fqcn)
+                    : context.thisTypeNames;
+            boolean resolvedByInjection = false;
+            for (String ownerType : ownerTypes) {
+                Map<String, String> injectedTargets = resolveInjectionTargetsByClassHierarchy(
+                        ownerType,
+                        call.scopeToken,
+                        javaModel,
+                        injectionRegistry
+                );
+                if (injectedTargets.isEmpty()) {
+                    continue;
+                }
+                resolvedByInjection = true;
+                for (Map.Entry<String, String> target : injectedTargets.entrySet()) {
+                    addResolvedTargets(
+                            resolved,
+                            resolveMethodByReceiverDispatch(target.getKey(), call, javaModel),
+                            target.getValue(),
+                            target.getKey()
+                    );
+                }
+            }
+            if (resolvedByInjection) {
+                return deduplicateResolvedTargets(resolved);
+            }
+
+            Set<String> runtimeTypes = context == null ? Collections.<String>emptySet()
+                    : context.variableTypes.getOrDefault(call.scopeToken, Collections.<String>emptySet());
+            if (runtimeTypes != null && !runtimeTypes.isEmpty()) {
+                for (String runtimeType : runtimeTypes) {
+                    addResolvedTargets(
+                            resolved,
+                            resolveMethodByReceiverDispatch(runtimeType, call, javaModel),
+                            "CTX:runtime-var",
+                            runtimeType
+                    );
+                }
+                if (!resolved.isEmpty()) {
+                    return deduplicateResolvedTargets(resolved);
+                }
+            }
+
+            String localType = methodModel.visibleVariableTypes.get(call.scopeToken);
+            if (!isBlank(localType)) {
+                Set<String> localCandidates = resolveClassesByTypeWithContext(localType, javaModel, classModel);
+                for (String localCandidate : localCandidates) {
+                    addResolvedTargets(resolved, resolveMethodByReceiverDispatch(localCandidate, call, javaModel), "JAVA:local-var", localCandidate);
+                }
+                if (!resolved.isEmpty()) {
+                    return deduplicateResolvedTargets(resolved);
+                }
+            }
+
+            FieldModel fieldModel = classModel.fields.get(call.scopeToken);
+            if (fieldModel != null && !isBlank(fieldModel.typeName)) {
+                Set<String> typeCandidates = resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
+                for (String typeCandidate : typeCandidates) {
+                    addResolvedTargets(resolved, resolveMethodByReceiverDispatch(typeCandidate, call, javaModel), "JAVA:field-type", typeCandidate);
+                }
+                if (!resolved.isEmpty()) {
+                    return deduplicateResolvedTargets(resolved);
+                }
+            }
+
+            if (isLikelyTypeReferenceToken(call.scopeToken)) {
+                Set<String> staticTypeCandidates = resolveClassesByTypeWithContext(call.scopeToken, javaModel, classModel);
+                for (String staticTypeCandidate : staticTypeCandidates) {
+                    addResolvedTargets(
+                            resolved,
+                            resolveMethodInClassHierarchy(staticTypeCandidate, call, javaModel),
+                            "JAVA:static-type",
+                            staticTypeCandidate
+                    );
+                }
+            }
+            return deduplicateResolvedTargets(resolved);
+        }
+
+        if (call.scopeType == ScopeType.METHOD_CALL && call.scopeCall != null) {
+            List<ResolvedCallTarget> scopeCalls = resolveCallTargetsWithContext(
+                    classModel,
+                    methodModel,
+                    call.scopeCall,
+                    context,
+                    javaModel,
+                    methodsById,
+                    injectionRegistry,
+                    depth + 1
+            );
+            for (ResolvedCallTarget scopeCall : scopeCalls) {
+                Set<String> receiverTypes = inferMethodReturnTypes(
+                        scopeCall.methodId,
+                        scopeCall.receiverClassName,
+                        context,
+                        javaModel,
+                        methodsById
+                );
+                if (receiverTypes.isEmpty() && !isBlank(scopeCall.receiverClassName)) {
+                    receiverTypes.add(scopeCall.receiverClassName);
+                }
+                if (receiverTypes.isEmpty()) {
+                    continue;
+                }
+                for (String receiverType : receiverTypes) {
+                    addResolvedTargets(
+                            resolved,
+                            resolveMethodByReceiverDispatch(receiverType, call, javaModel),
+                            "CHAIN:" + scopeCall.reason,
+                            receiverType
+                    );
+                }
+            }
+            return deduplicateResolvedTargets(resolved);
+        }
+        return Collections.emptyList();
+    }
+
+    private void addResolvedTargets(List<ResolvedCallTarget> resolved,
+                                    Set<String> targets,
+                                    String reason,
+                                    String receiverClassName) {
+        for (String target : targets) {
+            resolved.add(new ResolvedCallTarget(target, reason, receiverClassName));
+        }
+    }
+
+    private List<ResolvedCallTarget> deduplicateResolvedTargets(List<ResolvedCallTarget> raw) {
+        if (raw == null || raw.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Map<String, ResolvedCallTarget> unique = new LinkedHashMap<String, ResolvedCallTarget>();
+        for (ResolvedCallTarget target : raw) {
+            if (target == null || isBlank(target.methodId)) {
+                continue;
+            }
+            String key = target.methodId + "#" + target.receiverClassName;
+            ResolvedCallTarget existing = unique.get(key);
+            if (existing == null) {
+                unique.put(key, target);
+                continue;
+            }
+            String mergedReason = existing.reason.equals(target.reason)
+                    ? existing.reason
+                    : existing.reason + "|" + target.reason;
+            unique.put(key, new ResolvedCallTarget(existing.methodId, mergedReason, existing.receiverClassName));
+        }
+        return new ArrayList<ResolvedCallTarget>(unique.values());
+    }
+
+    private Set<String> inferMethodReturnTypes(String methodId,
+                                               String receiverClassName,
+                                               TypeFlowContext callContext,
+                                               JavaModel javaModel,
+                                               Map<String, MethodModel> methodsById) {
+        MethodModel methodModel = methodsById.get(methodId);
+        MethodIdInfo idInfo = MethodIdInfo.parse(methodId);
+        String ownerClass = methodModel != null ? methodModel.className : (idInfo == null ? "" : idInfo.className);
+        if (methodModel == null && !isBlank(ownerClass)) {
+            return setOf(ownerClass);
+        }
+        if (methodModel == null) {
+            return Collections.emptySet();
+        }
+
+        ClassModel ownerClassModel = javaModel.classesByName.get(methodModel.className);
+        Set<String> inferred = new LinkedHashSet<String>();
+        String returnType = normalizeTypeName(methodModel.returnTypeName);
+        if (!isBlank(returnType) && !"void".equals(returnType)) {
+            inferred.addAll(resolveClassesByTypeWithContext(returnType, javaModel, ownerClassModel));
+        }
+        if (inferred.isEmpty() || isLikelyTypeVariable(returnType)) {
+            if (!isBlank(receiverClassName)) {
+                inferred.add(receiverClassName);
+            }
+            inferred.add(methodModel.className);
+        }
+        if (!methodModel.returns.isEmpty() && callContext != null) {
+            for (ReturnFlow returnFlow : methodModel.returns) {
+                if (returnFlow == null || returnFlow.value == null) {
+                    continue;
+                }
+                if (returnFlow.value.isVariable()) {
+                    Set<String> types = callContext.variableTypes.get(returnFlow.value.variableName);
+                    if (types != null && !types.isEmpty()) {
+                        inferred.addAll(types);
+                    }
+                }
+            }
+        }
+        return inferred;
+    }
+
+    private Set<String> inferTokenTypes(ClassModel classModel,
+                                        MethodModel methodModel,
+                                        String token,
+                                        TypeFlowContext context,
+                                        JavaModel javaModel,
+                                        Map<String, MethodModel> methodsById,
+                                        InjectionRegistry injectionRegistry) {
+        if (isBlank(token)) {
+            return Collections.emptySet();
+        }
+        if (token.startsWith("new ")) {
+            String createdType = normalizeTypeName(token.substring("new ".length()).trim());
+            return resolveClassesByTypeWithContext(createdType, javaModel, classModel);
+        }
+        Set<String> runtimeTypes = context == null
+                ? Collections.<String>emptySet()
+                : context.variableTypes.getOrDefault(token, Collections.<String>emptySet());
+        if (!runtimeTypes.isEmpty()) {
+            return new LinkedHashSet<String>(runtimeTypes);
+        }
+        String localType = methodModel.visibleVariableTypes.get(token);
+        if (!isBlank(localType)) {
+            return resolveClassesByTypeWithContext(localType, javaModel, classModel);
+        }
+        FieldModel fieldModel = classModel.fields.get(token);
+        if (fieldModel != null && !isBlank(fieldModel.typeName)) {
+            Set<String> injectedTargets = new LinkedHashSet<String>();
+            Map<String, String> byInjection = resolveInjectionTargetsByClassHierarchy(
+                    classModel.fqcn,
+                    token,
+                    javaModel,
+                    injectionRegistry
+            );
+            if (!byInjection.isEmpty()) {
+                injectedTargets.addAll(byInjection.keySet());
+            }
+            if (!injectedTargets.isEmpty()) {
+                return injectedTargets;
+            }
+            return resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
+        }
+        if (isLikelyTypeReferenceToken(token)) {
+            return resolveClassesByTypeWithContext(token, javaModel, classModel);
+        }
+        return Collections.emptySet();
+    }
+
+    private String enrichReasonWithEvidence(String reason, CallSite call) {
+        String mergedReason = isBlank(reason) ? "JAVA:unknown" : reason;
+        StringBuilder evidence = new StringBuilder();
+        evidence.append("EVIDENCE:call=").append(call.methodName).append("/").append(call.argumentCount);
+        evidence.append(",scope=").append(call.scopeType);
+        if (!isBlank(call.scopeToken)) {
+            evidence.append(",token=").append(call.scopeToken);
+        }
+        if (call.line > 0) {
+            evidence.append(",line=").append(call.line);
+        }
+        if (mergedReason.contains(evidence.toString())) {
+            return mergedReason;
+        }
+        return mergedReason + "|" + evidence.toString();
+    }
+
+    private String detectUnsupportedStopReason(CallSite call) {
+        if (call == null || isBlank(call.methodName)) {
+            return "";
+        }
+        String methodName = call.methodName.toLowerCase(Locale.ROOT);
+        if ("forname".equals(methodName)
+                || "loadclass".equals(methodName)
+                || "getmethod".equals(methodName)
+                || "getdeclaredmethod".equals(methodName)
+                || "invoke".equals(methodName)
+                || "newproxyinstance".equals(methodName)) {
+            return "REFLECTION_OR_PROXY";
+        }
+        if ("load".equals(methodName) && "ServiceLoader".equals(call.scopeToken)) {
+            return "SPI";
+        }
+        if ("loadlibrary".equals(methodName) || "load".equals(methodName) && "System".equals(call.scopeToken)) {
+            return "NATIVE";
+        }
+        return "";
+    }
+
+    private String toStopNodeId(String stopReason) {
+        return "STOP::" + (isBlank(stopReason) ? "UNKNOWN" : stopReason);
+    }
+
     private List<CallEdge> buildCallEdges(JavaModel javaModel, Map<String, MethodModel> methodsById, InjectionRegistry injectionRegistry) {
         Map<String, CallEdgeAccumulator> edgeMap = new LinkedHashMap<>();
         int totalCallSites = 0;
@@ -1224,7 +1941,7 @@ public class SpringCallPathAnalyzer {
                                                              int depth,
                                                              Set<String> visiting,
                                                              List<PipelineAssemblyArg> out) {
-        if (depth > 8 || !visiting.add(methodId)) {
+        if (depth > FLOW_TRACE_MAX_DEPTH || !visiting.add(methodId)) {
             return;
         }
         MethodModel methodModel = methodsById.get(methodId);
@@ -1455,7 +2172,7 @@ public class SpringCallPathAnalyzer {
                                                               Set<String> visitingMethods,
                                                               Set<String> visitingVariables,
                                                               List<PipelineAssemblyArg> out) {
-        if (depth > 8) {
+        if (depth > FLOW_TRACE_MAX_DEPTH) {
             return;
         }
         if (isBlank(variableName)) {
@@ -1629,7 +2346,7 @@ public class SpringCallPathAnalyzer {
                                                                       Map<String, List<CallerBinding>> callerBindingsCache,
                                                                       Set<String> visitingArgs,
                                                                       int depth) {
-        if (arg == null || isBlank(arg.token) || isBlank(arg.ownerClassName) || depth > 8) {
+        if (arg == null || isBlank(arg.token) || isBlank(arg.ownerClassName) || depth > FLOW_TRACE_MAX_DEPTH) {
             return Collections.emptyMap();
         }
         String visitKey = arg.ownerClassName + "#" + arg.ownerMethodId + "#" + arg.token + "#" + arg.line;
@@ -2016,7 +2733,7 @@ public class SpringCallPathAnalyzer {
                                                       Map<String, MethodModel> methodsById,
                                                       InjectionRegistry injectionRegistry,
                                                       int depth) {
-        if (depth > 6) {
+        if (depth > CALL_RESOLVE_MAX_DEPTH) {
             debugLogger.log("RESOLVE_DEPTH_GUARD from=%s call=%s/%d", methodModel.id, call.methodName, call.argumentCount);
             return Collections.emptyMap();
         }
@@ -2251,6 +2968,36 @@ public class SpringCallPathAnalyzer {
         return resolved;
     }
 
+    private Set<String> resolveMethodByReceiverDispatch(String className, CallSite call, JavaModel javaModel) {
+        if (isBlank(className)) {
+            return setOf();
+        }
+        Set<String> visited = new LinkedHashSet<String>();
+        Deque<String> queue = new ArrayDeque<String>();
+        queue.add(className);
+        while (!queue.isEmpty()) {
+            String currentClass = queue.removeFirst();
+            if (!visited.add(currentClass)) {
+                continue;
+            }
+            Set<String> methods = resolveMethodByName(currentClass, call, javaModel);
+            if (!methods.isEmpty()) {
+                return methods;
+            }
+            ClassModel currentModel = javaModel.classesByName.get(currentClass);
+            if (currentModel == null) {
+                continue;
+            }
+            if (!isBlank(currentModel.superType)) {
+                queue.addAll(resolveDirectTypeNames(currentModel.superType, javaModel));
+            }
+            for (String iface : currentModel.implementedTypes) {
+                queue.addAll(resolveDirectTypeNames(iface, javaModel));
+            }
+        }
+        return setOf();
+    }
+
     private Set<String> resolveMethodInClassHierarchy(String className, CallSite call, JavaModel javaModel) {
         Set<String> resolved = new LinkedHashSet<String>();
         Deque<String> stack = new ArrayDeque<String>();
@@ -2376,7 +3123,9 @@ public class SpringCallPathAnalyzer {
             }
         }
 
-        candidates.add("java.lang." + normalized);
+        if (JAVA_LANG_COMMON_TYPES.contains(normalized)) {
+            candidates.add("java.lang." + normalized);
+        }
         return candidates;
     }
 
@@ -2844,7 +3593,7 @@ public class SpringCallPathAnalyzer {
         public static CliOptions parse(String[] args) {
             Path projectRoot = Paths.get(".").toAbsolutePath().normalize();
             Path outputDir = projectRoot.resolve("build/reports/spring-call-path");
-            int maxDepth = 8;
+            int maxDepth = 50;
             int maxPaths = 200;
             String endpointPath = null;
             String entryMethod = null;
@@ -3406,6 +4155,47 @@ public class SpringCallPathAnalyzer {
             this.argumentCount = argumentCount;
             this.line = line;
             this.argumentTokens = argumentTokens == null ? new ArrayList<String>() : argumentTokens;
+        }
+    }
+
+    private static class TypeFlowContext {
+        public final Set<String> thisTypeNames = new LinkedHashSet<String>();
+        public final Map<String, Set<String>> variableTypes = new LinkedHashMap<String, Set<String>>();
+
+        private static TypeFlowContext forRoot(String thisClassName) {
+            TypeFlowContext context = new TypeFlowContext();
+            if (!isBlank(thisClassName)) {
+                context.thisTypeNames.add(thisClassName);
+            }
+            return context;
+        }
+
+        private String signature() {
+            List<String> parts = new ArrayList<String>();
+            List<String> thisParts = new ArrayList<String>(thisTypeNames);
+            Collections.sort(thisParts);
+            parts.add("this=" + String.join(",", thisParts));
+            List<String> varKeys = new ArrayList<String>(variableTypes.keySet());
+            Collections.sort(varKeys);
+            for (String key : varKeys) {
+                Set<String> value = variableTypes.get(key);
+                List<String> sortedTypes = value == null ? new ArrayList<String>() : new ArrayList<String>(value);
+                Collections.sort(sortedTypes);
+                parts.add(key + "=" + String.join(",", sortedTypes));
+            }
+            return String.join(";", parts);
+        }
+    }
+
+    private static class ResolvedCallTarget {
+        public final String methodId;
+        public final String reason;
+        public final String receiverClassName;
+
+        private ResolvedCallTarget(String methodId, String reason, String receiverClassName) {
+            this.methodId = methodId;
+            this.reason = isBlank(reason) ? "JAVA:unknown" : reason;
+            this.receiverClassName = receiverClassName == null ? "" : receiverClassName;
         }
     }
 
