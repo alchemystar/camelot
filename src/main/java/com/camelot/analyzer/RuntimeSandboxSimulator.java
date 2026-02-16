@@ -15,6 +15,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
@@ -41,6 +42,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -93,7 +95,7 @@ public class RuntimeSandboxSimulator {
             Class<?> entryClass = Class.forName(options.entryClass, true, classLoader);
             Method entryMethod = resolveEntryMethod(entryClass, options.entryMethod, options.arguments.size());
             Object entryBean = beanFactory.getBean(entryClass);
-            Object[] invokeArgs = buildInvokeArgs(entryMethod, options.arguments);
+            Object[] invokeArgs = buildInvokeArgs(entryMethod, options.arguments, beanFactory, options.debugRuntime);
             if (options.debugRuntime) {
                 System.out.println("[RUNTIME_DEBUG] MainClassLoader=" + RuntimeSandboxSimulator.class.getClassLoader());
                 System.out.println("[RUNTIME_DEBUG] EntryClassLoader=" + entryClass.getClassLoader());
@@ -420,20 +422,44 @@ public class RuntimeSandboxSimulator {
         throw new IllegalArgumentException("Entry method not found: " + methodRaw + " in class " + entryClass.getName());
     }
 
-    private static Object[] buildInvokeArgs(Method method, List<String> rawArgs) {
+    private static Object[] buildInvokeArgs(Method method,
+                                            List<String> rawArgs,
+                                            SandboxBeanFactory beanFactory,
+                                            boolean debugRuntime) {
         Class<?>[] types = method.getParameterTypes();
         if (rawArgs.size() > types.length) {
             throw new IllegalArgumentException("Argument count mismatch. required<=" + types.length + " provided=" + rawArgs.size());
         }
         Object[] values = new Object[types.length];
+        AutoArgumentGenerator generator = new AutoArgumentGenerator(beanFactory, debugRuntime);
         for (int i = 0; i < types.length; i++) {
             if (i < rawArgs.size()) {
-                values[i] = convertArg(types[i], rawArgs.get(i));
+                String raw = rawArgs.get(i);
+                if (isAutoArgToken(raw)) {
+                    values[i] = generator.generate(types[i]);
+                } else {
+                    values[i] = convertArg(types[i], rawArgs.get(i));
+                }
             } else {
-                values[i] = defaultArgumentValue(types[i]);
+                values[i] = generator.generate(types[i]);
+            }
+            if (debugRuntime) {
+                Object value = values[i];
+                System.out.println("[RUNTIME_DEBUG] AUTO_ARG index="
+                        + i + " type=" + types[i].getName()
+                        + " valueType=" + (value == null ? "null" : value.getClass().getName())
+                        + " value=" + stringify(value));
             }
         }
         return values;
+    }
+
+    private static boolean isAutoArgToken(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String normalized = raw.trim().toLowerCase(Locale.ROOT);
+        return "__auto__".equals(normalized) || "@auto".equals(normalized);
     }
 
     private static Object defaultArgumentValue(Class<?> targetType) {
@@ -496,6 +522,254 @@ public class RuntimeSandboxSimulator {
             return raw == null || raw.isEmpty() ? '\0' : raw.charAt(0);
         }
         throw new IllegalArgumentException("Unsupported arg type: " + targetType.getName());
+    }
+
+    private static class AutoArgumentGenerator {
+        private static final int MAX_DEPTH = 6;
+        private final SandboxBeanFactory beanFactory;
+        private final boolean debugRuntime;
+        private final Map<Class<?>, Object> cache = new LinkedHashMap<Class<?>, Object>();
+
+        private AutoArgumentGenerator(SandboxBeanFactory beanFactory, boolean debugRuntime) {
+            this.beanFactory = beanFactory;
+            this.debugRuntime = debugRuntime;
+        }
+
+        private Object generate(Class<?> targetType) {
+            return generate(targetType, 0, new LinkedHashSet<Class<?>>());
+        }
+
+        private Object generate(Class<?> targetType, int depth, Set<Class<?>> visiting) {
+            if (targetType == null) {
+                return null;
+            }
+            if (depth > MAX_DEPTH) {
+                return defaultArgumentValue(targetType);
+            }
+            if (targetType.isPrimitive()) {
+                return defaultArgumentValue(targetType);
+            }
+            if (targetType == String.class) {
+                return "auto";
+            }
+            if (targetType == Integer.class) {
+                return Integer.valueOf(0);
+            }
+            if (targetType == Long.class) {
+                return Long.valueOf(0L);
+            }
+            if (targetType == Boolean.class) {
+                return Boolean.FALSE;
+            }
+            if (targetType == Double.class) {
+                return Double.valueOf(0.0d);
+            }
+            if (targetType == Float.class) {
+                return Float.valueOf(0.0f);
+            }
+            if (targetType == Short.class) {
+                return Short.valueOf((short) 0);
+            }
+            if (targetType == Byte.class) {
+                return Byte.valueOf((byte) 0);
+            }
+            if (targetType == Character.class) {
+                return Character.valueOf('\0');
+            }
+            if (targetType == Class.class) {
+                return Object.class;
+            }
+            if (targetType == Optional.class) {
+                return Optional.empty();
+            }
+            if (targetType.isEnum()) {
+                Object[] constants = targetType.getEnumConstants();
+                return constants == null || constants.length == 0 ? null : constants[0];
+            }
+            if (targetType.isArray()) {
+                Class<?> componentType = targetType.getComponentType();
+                Object array = Array.newInstance(componentType, 1);
+                Object element = generate(componentType, depth + 1, visiting);
+                if (element != null || !componentType.isPrimitive()) {
+                    Array.set(array, 0, element);
+                }
+                return array;
+            }
+            if (Collection.class.isAssignableFrom(targetType)) {
+                return instantiateCollection(targetType);
+            }
+            if (Map.class.isAssignableFrom(targetType)) {
+                return instantiateMap(targetType);
+            }
+            if (targetType.isInterface() || Modifier.isAbstract(targetType.getModifiers())) {
+                Object polymorphic = buildPolymorphicValue(targetType);
+                if (polymorphic != null) {
+                    return polymorphic;
+                }
+                return null;
+            }
+
+            Object cached = cache.get(targetType);
+            if (cached != null) {
+                return cached;
+            }
+            if (!visiting.add(targetType)) {
+                return null;
+            }
+            try {
+                Object instance = instantiateConcreteType(targetType, depth, visiting);
+                if (instance != null) {
+                    cache.put(targetType, instance);
+                    populateFields(instance, targetType, depth, visiting);
+                }
+                return instance;
+            } finally {
+                visiting.remove(targetType);
+            }
+        }
+
+        private Object instantiateConcreteType(Class<?> targetType, int depth, Set<Class<?>> visiting) {
+            Constructor<?> noArg = null;
+            for (Constructor<?> constructor : targetType.getDeclaredConstructors()) {
+                if (constructor.getParameterCount() == 0) {
+                    noArg = constructor;
+                    break;
+                }
+            }
+            if (noArg != null) {
+                try {
+                    noArg.setAccessible(true);
+                    return noArg.newInstance();
+                } catch (Throwable ignored) {
+                    // fallback to other constructors
+                }
+            }
+
+            List<Constructor<?>> constructors = Arrays.asList(targetType.getDeclaredConstructors());
+            constructors = constructors.stream()
+                    .sorted(Comparator.comparingInt(Constructor::getParameterCount))
+                    .collect(Collectors.toList());
+            for (Constructor<?> constructor : constructors) {
+                try {
+                    Object[] args = new Object[constructor.getParameterCount()];
+                    Class<?>[] parameterTypes = constructor.getParameterTypes();
+                    for (int i = 0; i < parameterTypes.length; i++) {
+                        args[i] = generate(parameterTypes[i], depth + 1, visiting);
+                        if (args[i] == null && parameterTypes[i].isPrimitive()) {
+                            args[i] = defaultArgumentValue(parameterTypes[i]);
+                        }
+                    }
+                    constructor.setAccessible(true);
+                    return constructor.newInstance(args);
+                } catch (Throwable ignored) {
+                    // try next constructor
+                }
+            }
+            if (beanFactory != null) {
+                try {
+                    return beanFactory.getBean(targetType);
+                } catch (Throwable ignored) {
+                    // give up
+                }
+            }
+            return null;
+        }
+
+        private void populateFields(Object instance, Class<?> targetType, int depth, Set<Class<?>> visiting) {
+            Class<?> current = targetType;
+            while (current != null && current != Object.class) {
+                Field[] fields = current.getDeclaredFields();
+                for (Field field : fields) {
+                    if (Modifier.isStatic(field.getModifiers()) || Modifier.isFinal(field.getModifiers())) {
+                        continue;
+                    }
+                    try {
+                        field.setAccessible(true);
+                        Object currentValue = field.get(instance);
+                        if (currentValue != null) {
+                            continue;
+                        }
+                        Object value = generate(field.getType(), depth + 1, visiting);
+                        if (value == null && field.getType().isPrimitive()) {
+                            value = defaultArgumentValue(field.getType());
+                        }
+                        if (value != null || field.getType().isPrimitive()) {
+                            field.set(instance, value);
+                        }
+                    } catch (Throwable ignored) {
+                        if (debugRuntime) {
+                            System.out.println("[RUNTIME_DEBUG] AUTO_ARG_FIELD_SKIP field="
+                                    + field.getDeclaringClass().getName() + "." + field.getName());
+                        }
+                    }
+                }
+                current = current.getSuperclass();
+            }
+        }
+
+        private Object buildPolymorphicValue(Class<?> targetType) {
+            if (beanFactory != null) {
+                try {
+                    return beanFactory.getBean(targetType);
+                } catch (Throwable ignored) {
+                    // continue
+                }
+            }
+            if (!targetType.isInterface()) {
+                return null;
+            }
+            InvocationHandler handler = new InvocationHandler() {
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) {
+                    return defaultValue(method.getReturnType());
+                }
+            };
+            try {
+                ClassLoader proxyClassLoader = targetType.getClassLoader();
+                if (proxyClassLoader == null) {
+                    proxyClassLoader = RuntimeSandboxSimulator.class.getClassLoader();
+                }
+                return Proxy.newProxyInstance(proxyClassLoader, new Class[]{targetType}, handler);
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        private Object instantiateCollection(Class<?> collectionType) {
+            if (!collectionType.isInterface() && !Modifier.isAbstract(collectionType.getModifiers())) {
+                try {
+                    Constructor<?> constructor = collectionType.getDeclaredConstructor();
+                    constructor.setAccessible(true);
+                    return constructor.newInstance();
+                } catch (Throwable ignored) {
+                    // fallback
+                }
+            }
+            if (List.class.isAssignableFrom(collectionType)) {
+                return new ArrayList<Object>();
+            }
+            if (Set.class.isAssignableFrom(collectionType)) {
+                return new LinkedHashSet<Object>();
+            }
+            if (Collection.class.isAssignableFrom(collectionType)) {
+                return new ArrayList<Object>();
+            }
+            return null;
+        }
+
+        private Object instantiateMap(Class<?> mapType) {
+            if (!mapType.isInterface() && !Modifier.isAbstract(mapType.getModifiers())) {
+                try {
+                    Constructor<?> constructor = mapType.getDeclaredConstructor();
+                    constructor.setAccessible(true);
+                    return constructor.newInstance();
+                } catch (Throwable ignored) {
+                    // fallback
+                }
+            }
+            return new LinkedHashMap<Object, Object>();
+        }
     }
 
     private static String stringify(Object value) {
