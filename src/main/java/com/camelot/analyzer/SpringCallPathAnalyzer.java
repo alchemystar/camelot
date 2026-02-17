@@ -979,14 +979,14 @@ public class SpringCallPathAnalyzer {
         if (typeCandidates == null || typeCandidates.isEmpty()) {
             return new NarrowedInjectionTargets(Collections.<String>emptySet(), "ANNOTATION:type");
         }
-        if (typeCandidates.size() == 1) {
-            return new NarrowedInjectionTargets(typeCandidates, "ANNOTATION:type");
-        }
-
-        Set<String> byName = resolveClassesByBeanId(fieldName, beanRegistry, javaModel);
+        Set<String> byName = resolveClassesByBeanNameStrict(fieldName, beanRegistry);
         Set<String> nameMatched = intersect(typeCandidates, byName);
         if (!nameMatched.isEmpty()) {
-            return new NarrowedInjectionTargets(nameMatched, "ANNOTATION:name");
+            return new NarrowedInjectionTargets(nameMatched, "ANNOTATION:bean-name");
+        }
+
+        if (typeCandidates.size() == 1) {
+            return new NarrowedInjectionTargets(typeCandidates, "ANNOTATION:type");
         }
 
         Set<String> primaryMatched = new LinkedHashSet<String>();
@@ -1035,6 +1035,33 @@ public class SpringCallPathAnalyzer {
             }
         }
         return intersection;
+    }
+
+    private FieldModel findFieldModelInHierarchy(String ownerClassName, String fieldName, JavaModel javaModel) {
+        if (javaModel == null || isBlank(ownerClassName) || isBlank(fieldName)) {
+            return null;
+        }
+        Deque<String> stack = new ArrayDeque<String>();
+        Set<String> visited = new LinkedHashSet<String>();
+        stack.add(ownerClassName);
+        while (!stack.isEmpty()) {
+            String currentClass = stack.removeFirst();
+            if (!visited.add(currentClass)) {
+                continue;
+            }
+            ClassModel classModel = javaModel.classesByName.get(currentClass);
+            if (classModel == null) {
+                continue;
+            }
+            FieldModel field = classModel.fields.get(fieldName);
+            if (field != null) {
+                return field;
+            }
+            if (!isBlank(classModel.superType)) {
+                stack.addAll(resolveDirectTypeNames(classModel.superType, javaModel));
+            }
+        }
+        return null;
     }
 
     private Map<String, MethodModel> collectMethods(JavaModel javaModel) {
@@ -1366,7 +1393,7 @@ public class SpringCallPathAnalyzer {
             if (!isBlank(localType)) {
                 return resolveClassesByTypeWithContext(localType, javaModel, classModel);
             }
-            FieldModel fieldModel = classModel.fields.get(valueExpr.variableName);
+            FieldModel fieldModel = findFieldModelInHierarchy(classModel.fqcn, valueExpr.variableName, javaModel);
             if (fieldModel != null && !isBlank(fieldModel.typeName)) {
                 return resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
             }
@@ -1553,18 +1580,14 @@ public class SpringCallPathAnalyzer {
             Set<String> ownerTypes = context == null || context.thisTypeNames.isEmpty()
                     ? Collections.<String>singleton(classModel.fqcn)
                     : context.thisTypeNames;
-            boolean resolvedByInjection = false;
-            for (String ownerType : ownerTypes) {
-                Map<String, String> injectedTargets = resolveInjectionTargetsByClassHierarchy(
-                        ownerType,
-                        call.scopeToken,
-                        javaModel,
-                        injectionRegistry
-                );
-                if (injectedTargets.isEmpty()) {
-                    continue;
-                }
-                resolvedByInjection = true;
+            Map<String, String> injectedTargets = resolveInjectionTargetsByClassHierarchy(
+                    classModel.fqcn,
+                    call.scopeToken,
+                    ownerTypes,
+                    javaModel,
+                    injectionRegistry
+            );
+            if (!injectedTargets.isEmpty()) {
                 for (Map.Entry<String, String> target : injectedTargets.entrySet()) {
                     addResolvedTargets(
                             resolved,
@@ -1573,8 +1596,6 @@ public class SpringCallPathAnalyzer {
                             target.getKey()
                     );
                 }
-            }
-            if (resolvedByInjection) {
                 return narrowAmbiguousTargets(
                         deduplicateResolvedTargets(resolved),
                         classModel,
@@ -1660,7 +1681,7 @@ public class SpringCallPathAnalyzer {
                 }
             }
 
-            FieldModel fieldModel = classModel.fields.get(call.scopeToken);
+            FieldModel fieldModel = findFieldModelInHierarchy(classModel.fqcn, call.scopeToken, javaModel);
             if (fieldModel != null && !isBlank(fieldModel.typeName)) {
                 Set<String> typeCandidates = resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
                 for (String typeCandidate : typeCandidates) {
@@ -2267,12 +2288,13 @@ public class SpringCallPathAnalyzer {
             }
             return resolveClassesByTypeWithContext(localType, javaModel, classModel);
         }
-        FieldModel fieldModel = classModel.fields.get(token);
+        FieldModel fieldModel = findFieldModelInHierarchy(classModel.fqcn, token, javaModel);
         if (fieldModel != null && !isBlank(fieldModel.typeName)) {
             Set<String> injectedTargets = new LinkedHashSet<String>();
             Map<String, String> byInjection = resolveInjectionTargetsByClassHierarchy(
                     classModel.fqcn,
                     token,
+                    context == null ? Collections.<String>emptySet() : context.thisTypeNames,
                     javaModel,
                     injectionRegistry
             );
@@ -3140,6 +3162,91 @@ public class SpringCallPathAnalyzer {
                                                                         String token,
                                                                         JavaModel javaModel,
                                                                         InjectionRegistry injectionRegistry) {
+        return resolveInjectionTargetsByClassHierarchy(
+                ownerClassName,
+                token,
+                ownerClassName == null
+                        ? Collections.<String>emptySet()
+                        : Collections.singleton(ownerClassName),
+                javaModel,
+                injectionRegistry
+        );
+    }
+
+    private Map<String, String> resolveInjectionTargetsByClassHierarchy(String ownerClassName,
+                                                                        String token,
+                                                                        Set<String> runtimeOwnerTypes,
+                                                                        JavaModel javaModel,
+                                                                        InjectionRegistry injectionRegistry) {
+        if (isBlank(token)) {
+            return Collections.emptyMap();
+        }
+        LinkedHashSet<String> ownerCandidates = new LinkedHashSet<String>();
+        if (runtimeOwnerTypes != null) {
+            for (String runtimeOwnerType : runtimeOwnerTypes) {
+                if (!isBlank(runtimeOwnerType)) {
+                    ownerCandidates.add(runtimeOwnerType);
+                }
+            }
+        }
+        if (!isBlank(ownerClassName)) {
+            ownerCandidates.add(ownerClassName);
+        }
+        if (ownerCandidates.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, String> resolved = new LinkedHashMap<String, String>();
+        for (String ownerCandidate : ownerCandidates) {
+            mergeInjectionTargets(
+                    resolved,
+                    collectInjectionTargetsFromOwnerHierarchy(ownerCandidate, token, javaModel, injectionRegistry),
+                    null
+            );
+        }
+        if (!resolved.isEmpty()) {
+            return resolved;
+        }
+
+        boolean shouldFallbackToDescendants = false;
+        for (String ownerCandidate : ownerCandidates) {
+            ClassModel model = javaModel.classesByName.get(ownerCandidate);
+            if (model == null || model.isAbstract || model.isInterface) {
+                shouldFallbackToDescendants = true;
+                break;
+            }
+        }
+        if (!shouldFallbackToDescendants) {
+            return resolved;
+        }
+
+        List<String> descendants = new ArrayList<String>();
+        for (ClassModel candidate : javaModel.classesByName.values()) {
+            if (candidate == null || candidate.isAbstract || candidate.isInterface) {
+                continue;
+            }
+            for (String ownerCandidate : ownerCandidates) {
+                if (isAssignableTo(candidate.fqcn, ownerCandidate, javaModel, new HashSet<String>())) {
+                    descendants.add(candidate.fqcn);
+                    break;
+                }
+            }
+        }
+        Collections.sort(descendants);
+        for (String descendant : descendants) {
+            mergeInjectionTargets(
+                    resolved,
+                    collectInjectionTargetsFromOwnerHierarchy(descendant, token, javaModel, injectionRegistry),
+                    "CTX:descendant-owner=" + descendant
+            );
+        }
+        return resolved;
+    }
+
+    private Map<String, String> collectInjectionTargetsFromOwnerHierarchy(String ownerClassName,
+                                                                           String token,
+                                                                           JavaModel javaModel,
+                                                                           InjectionRegistry injectionRegistry) {
         if (isBlank(ownerClassName) || isBlank(token)) {
             return Collections.emptyMap();
         }
@@ -3171,6 +3278,21 @@ public class SpringCallPathAnalyzer {
             }
         }
         return resolved;
+    }
+
+    private void mergeInjectionTargets(Map<String, String> into,
+                                       Map<String, String> from,
+                                       String reasonSuffix) {
+        if (into == null || from == null || from.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : from.entrySet()) {
+            String reason = entry.getValue();
+            if (!isBlank(reasonSuffix)) {
+                reason = isBlank(reason) ? reasonSuffix : reason + "|" + reasonSuffix;
+            }
+            into.merge(entry.getKey(), reason, (a, b) -> a.equals(b) ? a : a + "|" + b);
+        }
     }
 
     private List<CallerBinding> findCallerBindingsForMethod(String targetMethodId,
@@ -3461,14 +3583,18 @@ public class SpringCallPathAnalyzer {
         }
 
         if (call.scopeType == ScopeType.NAME && call.scopeToken != null) {
-            Map<String, TargetSet> classTargets = injectionRegistry.targetsByClass.getOrDefault(classModel.fqcn, Collections.emptyMap());
-            TargetSet targetSet = classTargets.get(call.scopeToken);
-            if (targetSet != null && !targetSet.targets.isEmpty()) {
-                for (String targetClass : targetSet.targets) {
+            Map<String, String> injectedTargets = resolveInjectionTargetsByClassHierarchy(
+                    classModel.fqcn,
+                    call.scopeToken,
+                    javaModel,
+                    injectionRegistry
+            );
+            if (!injectedTargets.isEmpty()) {
+                for (Map.Entry<String, String> targetEntry : injectedTargets.entrySet()) {
                     addResolvedTargets(
                             resolved,
-                            resolveMethodInClassHierarchy(targetClass, call, javaModel),
-                            targetSet.reasonSummary()
+                            resolveMethodInClassHierarchy(targetEntry.getKey(), call, javaModel),
+                            targetEntry.getValue()
                     );
                 }
             } else {
@@ -3479,7 +3605,7 @@ public class SpringCallPathAnalyzer {
                         addResolvedTargets(resolved, resolveMethodInClassHierarchy(localCandidate, call, javaModel), "JAVA:local-var");
                     }
                 } else {
-                    FieldModel fieldModel = classModel.fields.get(call.scopeToken);
+                    FieldModel fieldModel = findFieldModelInHierarchy(classModel.fqcn, call.scopeToken, javaModel);
                     if (fieldModel != null) {
                         Set<String> typeCandidates = resolveClassesByTypeWithContext(fieldModel.typeName, javaModel, classModel);
                         for (String typeCandidate : typeCandidates) {
@@ -3792,6 +3918,25 @@ public class SpringCallPathAnalyzer {
 
         String decapitalized = decapitalize(beanId);
         return beanRegistry.beanIdToClasses.getOrDefault(decapitalized, setOf());
+    }
+
+    private Set<String> resolveClassesByBeanNameStrict(String beanName, BeanRegistry beanRegistry) {
+        if (beanRegistry == null || isBlank(beanName)) {
+            return Collections.emptySet();
+        }
+        String resolved = resolveAlias(beanName, beanRegistry.aliasToName);
+        Set<String> classes = beanRegistry.beanIdToClasses.getOrDefault(resolved, Collections.<String>emptySet());
+        if (!classes.isEmpty()) {
+            return classes;
+        }
+        String decapitalized = decapitalize(beanName);
+        if (!decapitalized.equals(beanName)) {
+            classes = beanRegistry.beanIdToClasses.getOrDefault(decapitalized, Collections.<String>emptySet());
+            if (!classes.isEmpty()) {
+                return classes;
+            }
+        }
+        return Collections.emptySet();
     }
 
     private Set<String> resolveClassesByType(String typeName, JavaModel javaModel) {
