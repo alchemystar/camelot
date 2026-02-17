@@ -221,12 +221,14 @@ public class RuntimeSandboxSimulator {
 
         Path jsonPath = options.outputDir.resolve("runtime-trace.json");
         Path treePath = options.outputDir.resolve("runtime-trace-tree.txt");
+        Path dotPath = options.outputDir.resolve("call-graph.dot");
         Path typesPath = options.outputDir.resolve("runtime-types.txt");
         Path executionPath = options.outputDir.resolve("runtime-execution.txt");
         Path callStackPath = options.outputDir.resolve("runtime-call-stack.txt");
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         mapper.writeValue(jsonPath.toFile(), report);
         Files.write(treePath, buildTraceTree(report).getBytes(StandardCharsets.UTF_8));
+        Files.write(dotPath, buildRuntimeCallGraphDot(report).getBytes(StandardCharsets.UTF_8));
         Files.write(typesPath, buildRuntimeTypeSummary(report).getBytes(StandardCharsets.UTF_8));
         Files.write(executionPath, buildRuntimeExecutionSummary(report).getBytes(StandardCharsets.UTF_8));
         Files.write(callStackPath, buildRuntimeCallStackSummary(report).getBytes(StandardCharsets.UTF_8));
@@ -234,6 +236,7 @@ public class RuntimeSandboxSimulator {
         System.out.println("Runtime sandbox finished.");
         System.out.println("Trace JSON: " + jsonPath.toAbsolutePath());
         System.out.println("Trace tree: " + treePath.toAbsolutePath());
+        System.out.println("DOT graph:  " + dotPath.toAbsolutePath());
         System.out.println("Type info:  " + typesPath.toAbsolutePath());
         System.out.println("Exec info:  " + executionPath.toAbsolutePath());
         System.out.println("Stack info: " + callStackPath.toAbsolutePath());
@@ -1051,6 +1054,46 @@ public class RuntimeSandboxSimulator {
         Set<String> visiting = new LinkedHashSet<String>();
         appendTree(sb, root, outgoing, visiting, "  ", 0);
         return sb.toString();
+    }
+
+    private static String buildRuntimeCallGraphDot(RuntimeTraceReport report) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("digraph \"runtime_call_graph\" {\n");
+        sb.append("  rankdir=LR;\n");
+        sb.append("  node [shape=box, style=\"rounded\"];\n");
+
+        List<RuntimeEdge> edges = report == null || report.edges == null
+                ? Collections.<RuntimeEdge>emptyList()
+                : new ArrayList<RuntimeEdge>(report.edges);
+        edges.sort(Comparator.comparing((RuntimeEdge e) -> e.from).thenComparing((RuntimeEdge e) -> e.to));
+
+        if (edges.isEmpty()) {
+            String root = report == null || isBlank(report.rootMethodId) ? "NO_RUNTIME_EDGES" : report.rootMethodId;
+            sb.append("  \"").append(escapeDotLabel(root)).append("\";\n");
+            sb.append("}\n");
+            return sb.toString();
+        }
+
+        for (RuntimeEdge edge : edges) {
+            String from = edge == null ? "" : edge.from;
+            String to = edge == null ? "" : edge.to;
+            int count = edge == null ? 0 : edge.count;
+            if (isBlank(from) || isBlank(to)) {
+                continue;
+            }
+            sb.append("  \"").append(escapeDotLabel(from)).append("\" -> \"")
+                    .append(escapeDotLabel(to)).append("\" [label=\"")
+                    .append(count).append("\"];\n");
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    private static String escapeDotLabel(String input) {
+        if (input == null) {
+            return "";
+        }
+        return input.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     private static String buildRuntimeTypeSummary(RuntimeTraceReport report) {
