@@ -82,7 +82,7 @@ public class RuntimeSandboxSimulator {
 
         ProjectClassIndex projectClassIndex = buildProjectClassIndex(options.classesRoots, options.debugRuntime);
         ProjectAwareClassLoader classLoader = buildClassLoader(options, projectClassIndex);
-        installTracingAgent(options);
+        installTracingAgent(options, projectClassIndex);
 
         RuntimeTraceCollector collector = new RuntimeTraceCollector(options.maxCalls);
         ACTIVE_COLLECTOR = collector;
@@ -333,22 +333,30 @@ public class RuntimeSandboxSimulator {
         return raw.replace('/', '.');
     }
 
-    private static synchronized void installTracingAgent(CliOptions options) {
+    private static synchronized void installTracingAgent(CliOptions options,
+                                                         ProjectClassIndex projectClassIndex) {
         if (AGENT_INSTALLED) {
             return;
         }
         ByteBuddyAgent.install();
         final InstrumentationStats stats = new InstrumentationStats();
-
-        ElementMatcher.Junction<TypeDescription> typeMatcher = ElementMatchers.none();
-        for (String prefix : options.tracePrefixes) {
-            typeMatcher = typeMatcher.or(nameStartsWith(prefix));
-        }
+        final Set<String> projectClassNames = projectClassIndex == null
+                ? Collections.<String>emptySet()
+                : new LinkedHashSet<String>(projectClassIndex.classNames);
+        ElementMatcher.Junction<TypeDescription> typeMatcher = new ElementMatcher.Junction.AbstractBase<TypeDescription>() {
+            @Override
+            public boolean matches(TypeDescription target) {
+                if (target == null) {
+                    return false;
+                }
+                return shouldTraceType(target.getName(), options.tracePrefixes, projectClassNames);
+            }
+        };
 
         AgentBuilder.Listener listener = new AgentBuilder.Listener() {
             @Override
             public void onDiscovery(String typeName, ClassLoader classLoader, JavaModule module, boolean loaded) {
-                if (matchesAnyPrefix(typeName, options.tracePrefixes)) {
+                if (shouldTraceType(typeName, options.tracePrefixes, projectClassNames)) {
                     stats.discovered.incrementAndGet();
                     if (options.debugRuntime) {
                         System.out.println("[RUNTIME_DEBUG] DISCOVER " + typeName + " loaded=" + loaded + " cl=" + classLoader);
@@ -363,7 +371,7 @@ public class RuntimeSandboxSimulator {
                                          boolean loaded,
                                          DynamicType dynamicType) {
                 String typeName = typeDescription == null ? "" : typeDescription.getName();
-                if (matchesAnyPrefix(typeName, options.tracePrefixes)) {
+                if (shouldTraceType(typeName, options.tracePrefixes, projectClassNames)) {
                     stats.transformed.incrementAndGet();
                     if (options.debugRuntime) {
                         System.out.println("[RUNTIME_DEBUG] TRANSFORM " + typeName + " loaded=" + loaded + " cl=" + classLoader);
@@ -377,7 +385,7 @@ public class RuntimeSandboxSimulator {
                                   JavaModule module,
                                   boolean loaded) {
                 String typeName = typeDescription == null ? "" : typeDescription.getName();
-                if (matchesAnyPrefix(typeName, options.tracePrefixes)) {
+                if (shouldTraceType(typeName, options.tracePrefixes, projectClassNames)) {
                     stats.ignored.incrementAndGet();
                     if (options.debugRuntime) {
                         System.out.println("[RUNTIME_DEBUG] IGNORED " + typeName + " loaded=" + loaded + " cl=" + classLoader);
@@ -387,7 +395,7 @@ public class RuntimeSandboxSimulator {
 
             @Override
             public void onError(String typeName, ClassLoader classLoader, JavaModule module, boolean loaded, Throwable throwable) {
-                if (matchesAnyPrefix(typeName, options.tracePrefixes)) {
+                if (shouldTraceType(typeName, options.tracePrefixes, projectClassNames)) {
                     stats.errors.incrementAndGet();
                     if (options.debugRuntime) {
                         System.out.println("[RUNTIME_DEBUG] ERROR " + typeName + " loaded=" + loaded + " cl=" + classLoader + " error=" + throwable);
@@ -440,6 +448,18 @@ public class RuntimeSandboxSimulator {
             }
         }
         return false;
+    }
+
+    private static boolean shouldTraceType(String typeName,
+                                           List<String> tracePrefixes,
+                                           Set<String> projectClassNames) {
+        if (typeName == null || typeName.isEmpty()) {
+            return false;
+        }
+        if (projectClassNames != null && projectClassNames.contains(typeName)) {
+            return true;
+        }
+        return matchesAnyPrefix(typeName, tracePrefixes);
     }
 
     private static Method resolveEntryMethod(Class<?> entryClass, String methodRaw, int argCount) {
@@ -890,6 +910,10 @@ public class RuntimeSandboxSimulator {
 
     private static String buildTraceTree(RuntimeTraceReport report) {
         if (report.edges == null || report.edges.isEmpty()) {
+            if (report.rootMethodId != null && !report.rootMethodId.isEmpty() && report.callCount > 0) {
+                return "Root: " + report.rootMethodId + "\n"
+                        + "  (no nested traced edges captured; calls=" + report.callCount + ")\n";
+            }
             return "No runtime edges captured.\n";
         }
         Map<String, List<RuntimeEdge>> outgoing = new LinkedHashMap<String, List<RuntimeEdge>>();
@@ -2613,7 +2637,11 @@ public class RuntimeSandboxSimulator {
                 }
             }
             if (classesRoots.isEmpty()) {
-                classesRoots.add(Paths.get("target/classes").toAbsolutePath().normalize());
+                if (projectDir != null) {
+                    classesRoots.add(projectDir.resolve("target/classes").toAbsolutePath().normalize());
+                } else {
+                    classesRoots.add(Paths.get("target/classes").toAbsolutePath().normalize());
+                }
             }
             if (entryClass == null || entryClass.trim().isEmpty()) {
                 throw new IllegalArgumentException("Missing entry class. Use --entry-class, or pass --entry-method as Class#method[/arity].");

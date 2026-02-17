@@ -34,6 +34,12 @@ cd "$REPO_DIR"
 
 mvn -q -Dmaven.repo.local="$REPO_DIR/.m2repo" -DskipTests compile
 
+if [ -f "$PROJECT_DIR/pom.xml" ]; then
+  if ! mvn -q -f "$PROJECT_DIR/pom.xml" -Dmaven.repo.local="$REPO_DIR/.m2repo" -DskipTests compile >/dev/null 2>&1; then
+    echo "[runtime-sandbox] warn: cannot compile target project, continue with existing classes output if present." >&2
+  fi
+fi
+
 find "$REPO_DIR/.m2repo" -name "*.jar" -print | sort > "$JAR_LIST_FILE"
 if [ ! -s "$JAR_LIST_FILE" ]; then
   echo "Cannot build classpath: no jars found under $REPO_DIR/.m2repo"
@@ -65,6 +71,14 @@ SIM_ARGS=(
   --project "$PROJECT_DIR"
   --entry-method "$ENTRY_METHOD"
 )
+
+if [ -d "$PROJECT_DIR/target/classes" ]; then
+  SIM_ARGS+=(--classes "$PROJECT_DIR/target/classes")
+elif [ -d "$PROJECT_DIR/build/classes/java/main" ]; then
+  SIM_ARGS+=(--classes "$PROJECT_DIR/build/classes/java/main")
+else
+  echo "[runtime-sandbox] warn: project classes directory not found. expected $PROJECT_DIR/target/classes or $PROJECT_DIR/build/classes/java/main" >&2
+fi
 
 if [ -n "$PROJECT_EXTRA_CP" ]; then
   SIM_ARGS+=(--classpath "$PROJECT_EXTRA_CP")
