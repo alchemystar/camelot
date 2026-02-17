@@ -77,10 +77,14 @@ public class RuntimeSandboxSimulator {
     public static volatile RuntimeTypeSnapshotCollector ACTIVE_TYPE_COLLECTOR;
     public static volatile RuntimeExecutionSnapshotCollector ACTIVE_EXECUTION_COLLECTOR;
     public static volatile SoftFailController ACTIVE_SOFT_FAIL_CONTROLLER;
+    public static volatile boolean ADVICE_DIAG_ENABLED = false;
     private static volatile boolean AGENT_INSTALLED = false;
     private static volatile InstrumentationStats LAST_INSTRUMENTATION_STATS;
     public static final AtomicInteger ADVICE_HITS = new AtomicInteger(0);
     public static final AtomicInteger NULL_COLLECTOR_HITS = new AtomicInteger(0);
+    public static final AtomicInteger ADVICE_DIAG_LINES = new AtomicInteger(0);
+    public static final AtomicInteger ADVICE_ENTER_GUARDED = new AtomicInteger(0);
+    public static final AtomicInteger ADVICE_ENTER_ACCEPTED = new AtomicInteger(0);
     private static final ThreadLocal<Integer> ADVICE_REENTRY_DEPTH =
             new ThreadLocal<Integer>() {
                 @Override
@@ -109,6 +113,16 @@ public class RuntimeSandboxSimulator {
         ACTIVE_TYPE_COLLECTOR = typeCollector;
         ACTIVE_EXECUTION_COLLECTOR = executionCollector;
         ACTIVE_SOFT_FAIL_CONTROLLER = softFailController;
+        ADVICE_DIAG_ENABLED = options.debugRuntime;
+        ADVICE_DIAG_LINES.set(0);
+        ADVICE_ENTER_GUARDED.set(0);
+        ADVICE_ENTER_ACCEPTED.set(0);
+        if (options.debugRuntime) {
+            System.out.println("[RUNTIME_DEBUG] COLLECTOR_INIT collector=" + System.identityHashCode(collector)
+                    + " typeCollector=" + System.identityHashCode(typeCollector)
+                    + " executionCollector=" + System.identityHashCode(executionCollector)
+                    + " runtimeClassLoader=" + RuntimeSandboxSimulator.class.getClassLoader());
+        }
 
         RuntimeTraceReport report = new RuntimeTraceReport();
         report.generatedAt = Instant.now().toString();
@@ -235,6 +249,8 @@ public class RuntimeSandboxSimulator {
                 + " enabled=" + report.softFailEnabled);
         System.out.println("AdviceHits: " + ADVICE_HITS.get());
         System.out.println("NullCollect:" + NULL_COLLECTOR_HITS.get());
+        System.out.println("GuardSkip:  " + ADVICE_ENTER_GUARDED.get());
+        System.out.println("EnterOk:    " + ADVICE_ENTER_ACCEPTED.get());
         if (LAST_INSTRUMENTATION_STATS != null) {
             System.out.println("Discovered: " + LAST_INSTRUMENTATION_STATS.discovered.get());
             System.out.println("Transformed:" + LAST_INSTRUMENTATION_STATS.transformed.get());
@@ -531,18 +547,29 @@ public class RuntimeSandboxSimulator {
         return matchesAnyPrefix(typeName, tracePrefixes);
     }
 
-    private static boolean isAdviceReentryGuarded() {
+    public static void debugAdviceLine(String message) {
+        if (!ADVICE_DIAG_ENABLED) {
+            return;
+        }
+        int line = ADVICE_DIAG_LINES.incrementAndGet();
+        if (line > 120) {
+            return;
+        }
+        System.out.println("[RUNTIME_DEBUG] " + message);
+    }
+
+    public static boolean isAdviceReentryGuarded() {
         Integer depth = ADVICE_REENTRY_DEPTH.get();
         return depth != null && depth.intValue() > 0;
     }
 
-    private static void enterAdviceReentryGuard() {
+    public static void enterAdviceReentryGuard() {
         Integer depth = ADVICE_REENTRY_DEPTH.get();
         int next = (depth == null ? 0 : depth.intValue()) + 1;
         ADVICE_REENTRY_DEPTH.set(Integer.valueOf(next));
     }
 
-    private static void exitAdviceReentryGuard() {
+    public static void exitAdviceReentryGuard() {
         Integer depth = ADVICE_REENTRY_DEPTH.get();
         int current = depth == null ? 0 : depth.intValue();
         if (current <= 1) {
@@ -1552,34 +1579,73 @@ public class RuntimeSandboxSimulator {
                                      @Advice.AllArguments Object[] args) {
             ADVICE_HITS.incrementAndGet();
             if (isAdviceReentryGuarded()) {
+                ADVICE_ENTER_GUARDED.incrementAndGet();
+                debugAdviceLine("ADVICE_ENTER_SKIP_GUARD type="
+                        + (typeName == null || typeName.trim().isEmpty() ? "unknown" : typeName) + " method="
+                        + (methodName == null || methodName.trim().isEmpty() ? "unknown" : methodName));
                 return null;
             }
             enterAdviceReentryGuard();
             try {
-            RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
-            RuntimeTypeSnapshotCollector typeCollector = ACTIVE_TYPE_COLLECTOR;
-            RuntimeExecutionSnapshotCollector executionCollector = ACTIVE_EXECUTION_COLLECTOR;
-            String methodId = (typeName == null ? "unknown" : typeName)
-                    + "#"
-                    + (methodName == null ? "unknown" : methodName);
-            if (collector == null || methodId == null) {
-                NULL_COLLECTOR_HITS.incrementAndGet();
+                RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
+                RuntimeTypeSnapshotCollector typeCollector = ACTIVE_TYPE_COLLECTOR;
+                RuntimeExecutionSnapshotCollector executionCollector = ACTIVE_EXECUTION_COLLECTOR;
+                String methodId = (typeName == null ? "unknown" : typeName)
+                        + "#"
+                        + (methodName == null ? "unknown" : methodName);
+                if (collector == null || methodId == null) {
+                    NULL_COLLECTOR_HITS.incrementAndGet();
+                    debugAdviceLine("ADVICE_ENTER_NO_COLLECTOR methodId=" + methodId
+                            + " collector=" + (collector == null ? "null" : String.valueOf(System.identityHashCode(collector))));
+                    if (typeCollector != null) {
+                        try {
+                            typeCollector.onMethodEnter(typeName, methodName, self, args);
+                        } catch (Throwable error) {
+                            debugAdviceLine("TYPE_COLLECTOR_ENTER_ERROR methodId=" + methodId
+                                    + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                        }
+                    }
+                    if (executionCollector != null) {
+                        try {
+                            executionCollector.onMethodEnter(typeName, methodName, self, args);
+                        } catch (Throwable error) {
+                            debugAdviceLine("EXEC_COLLECTOR_ENTER_ERROR methodId=" + methodId
+                                    + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                        }
+                    }
+                    return null;
+                }
+                int beforeCount = collector.getCallCount();
+                try {
+                    collector.onEnter(methodId);
+                } catch (Throwable error) {
+                    debugAdviceLine("TRACE_COLLECTOR_ENTER_ERROR methodId=" + methodId
+                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    return null;
+                }
+                int afterCount = collector.getCallCount();
+                ADVICE_ENTER_ACCEPTED.incrementAndGet();
+                debugAdviceLine("ADVICE_ENTER_OK methodId=" + methodId
+                        + " collector=" + System.identityHashCode(collector)
+                        + " callCount=" + beforeCount + "->" + afterCount
+                        + " thread=" + Thread.currentThread().getName());
                 if (typeCollector != null) {
-                    typeCollector.onMethodEnter(typeName, methodName, self, args);
+                    try {
+                        typeCollector.onMethodEnter(typeName, methodName, self, args);
+                    } catch (Throwable error) {
+                        debugAdviceLine("TYPE_COLLECTOR_ENTER_ERROR methodId=" + methodId
+                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    }
                 }
                 if (executionCollector != null) {
-                    executionCollector.onMethodEnter(typeName, methodName, self, args);
+                    try {
+                        executionCollector.onMethodEnter(typeName, methodName, self, args);
+                    } catch (Throwable error) {
+                        debugAdviceLine("EXEC_COLLECTOR_ENTER_ERROR methodId=" + methodId
+                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    }
                 }
-                return null;
-            }
-            collector.onEnter(methodId);
-            if (typeCollector != null) {
-                typeCollector.onMethodEnter(typeName, methodName, self, args);
-            }
-            if (executionCollector != null) {
-                executionCollector.onMethodEnter(typeName, methodName, self, args);
-            }
-            return methodId;
+                return methodId;
             } finally {
                 exitAdviceReentryGuard();
             }
@@ -1611,19 +1677,45 @@ public class RuntimeSandboxSimulator {
             }
             if (collector == null || methodId == null) {
                 if (typeCollector != null) {
-                    typeCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown);
+                    try {
+                        typeCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown);
+                    } catch (Throwable error) {
+                        debugAdviceLine("TYPE_COLLECTOR_EXIT_ERROR methodId=" + methodId
+                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    }
                 }
                 if (executionCollector != null) {
-                    executionCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown, softFailSuppressed);
+                    try {
+                        executionCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown, softFailSuppressed);
+                    } catch (Throwable error) {
+                        debugAdviceLine("EXEC_COLLECTOR_EXIT_ERROR methodId=" + methodId
+                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    }
                 }
                 return;
             }
-            collector.onExit(methodId);
+            try {
+                collector.onExit(methodId);
+            } catch (Throwable error) {
+                debugAdviceLine("TRACE_COLLECTOR_EXIT_ERROR methodId=" + methodId
+                        + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                return;
+            }
             if (typeCollector != null) {
-                typeCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown);
+                try {
+                    typeCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown);
+                } catch (Throwable error) {
+                    debugAdviceLine("TYPE_COLLECTOR_EXIT_ERROR methodId=" + methodId
+                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
             }
             if (executionCollector != null) {
-                executionCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown, softFailSuppressed);
+                try {
+                    executionCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown, softFailSuppressed);
+                } catch (Throwable error) {
+                    debugAdviceLine("EXEC_COLLECTOR_EXIT_ERROR methodId=" + methodId
+                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
             }
             } finally {
                 exitAdviceReentryGuard();
@@ -2726,7 +2818,10 @@ public class RuntimeSandboxSimulator {
         }
 
         public void onEnter(String methodId) {
-            if (callCount.incrementAndGet() > maxCalls) {
+            int current = callCount.incrementAndGet();
+            if (current > maxCalls) {
+                debugAdviceLine("COLLECTOR_ON_ENTER_OVERFLOW methodId=" + methodId
+                        + " callCount=" + current + " maxCalls=" + maxCalls);
                 return;
             }
             Deque<String> stack = stackByThread.get();
@@ -2742,6 +2837,10 @@ public class RuntimeSandboxSimulator {
                 });
             }
             stack.addLast(methodId);
+            debugAdviceLine("COLLECTOR_ON_ENTER methodId=" + methodId
+                    + " callCount=" + current
+                    + " stackDepth=" + stack.size()
+                    + " collector=" + System.identityHashCode(this));
         }
 
         public void onExit(String methodId) {
