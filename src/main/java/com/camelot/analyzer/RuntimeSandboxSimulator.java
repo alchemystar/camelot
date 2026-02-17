@@ -77,6 +77,7 @@ public class RuntimeSandboxSimulator {
     public static volatile RuntimeTypeSnapshotCollector ACTIVE_TYPE_COLLECTOR;
     public static volatile RuntimeExecutionSnapshotCollector ACTIVE_EXECUTION_COLLECTOR;
     public static volatile SoftFailController ACTIVE_SOFT_FAIL_CONTROLLER;
+    public static volatile Map<String, String> ACTIVE_UNIQUE_IMPL_BY_TYPE = Collections.emptyMap();
     public static volatile boolean ADVICE_DIAG_ENABLED = false;
     private static volatile boolean AGENT_INSTALLED = false;
     private static volatile InstrumentationStats LAST_INSTRUMENTATION_STATS;
@@ -113,6 +114,7 @@ public class RuntimeSandboxSimulator {
         ACTIVE_TYPE_COLLECTOR = typeCollector;
         ACTIVE_EXECUTION_COLLECTOR = executionCollector;
         ACTIVE_SOFT_FAIL_CONTROLLER = softFailController;
+        ACTIVE_UNIQUE_IMPL_BY_TYPE = Collections.emptyMap();
         ADVICE_DIAG_ENABLED = options.debugRuntime;
         ADVICE_DIAG_LINES.set(0);
         ADVICE_ENTER_GUARDED.set(0);
@@ -161,6 +163,7 @@ public class RuntimeSandboxSimulator {
                     report.springContextActive = false;
                 }
             }
+            ACTIVE_UNIQUE_IMPL_BY_TYPE = buildUniqueConcreteTypeIndex(beanFactory, springRuntime, options.debugRuntime);
 
             Class<?> entryClass = Class.forName(options.entryClass, true, classLoader);
             Method entryMethod = resolveEntryMethod(entryClass, options.entryMethod, options.arguments.size());
@@ -213,6 +216,7 @@ public class RuntimeSandboxSimulator {
             ACTIVE_TYPE_COLLECTOR = null;
             ACTIVE_EXECUTION_COLLECTOR = null;
             ACTIVE_SOFT_FAIL_CONTROLLER = null;
+            ACTIVE_UNIQUE_IMPL_BY_TYPE = Collections.emptyMap();
             if (springRuntime != null) {
                 springRuntime.close();
             }
@@ -611,6 +615,16 @@ public class RuntimeSandboxSimulator {
             return fallback;
         }
         if (Proxy.isProxyClass(runtimeClass)) {
+            String mappedFromDeclared = mapDeclaredTypeToConcrete(fallback);
+            if (mappedFromDeclared != null) {
+                debugAdviceLine("ADVICE_TYPE_RESOLVE_PROXY declared=" + fallback + " mapped=" + mappedFromDeclared);
+                return mappedFromDeclared;
+            }
+            String mappedFromInterfaces = mapProxyInterfacesToConcrete(runtimeClass);
+            if (mappedFromInterfaces != null) {
+                debugAdviceLine("ADVICE_TYPE_RESOLVE_PROXY ifaceMapped=" + mappedFromInterfaces + " proxy=" + runtimeClass.getName());
+                return mappedFromInterfaces;
+            }
             return fallback;
         }
         String runtimeName = runtimeClass.getName();
@@ -627,6 +641,105 @@ public class RuntimeSandboxSimulator {
             }
         }
         return runtimeName;
+    }
+
+    private static String mapProxyInterfacesToConcrete(Class<?> proxyClass) {
+        if (proxyClass == null) {
+            return null;
+        }
+        Class<?>[] interfaces = proxyClass.getInterfaces();
+        if (interfaces == null || interfaces.length == 0) {
+            return null;
+        }
+        for (Class<?> iface : interfaces) {
+            if (iface == null) {
+                continue;
+            }
+            String mapped = mapDeclaredTypeToConcrete(iface.getName());
+            if (mapped != null) {
+                return mapped;
+            }
+        }
+        return null;
+    }
+
+    private static String mapDeclaredTypeToConcrete(String declaredTypeName) {
+        if (declaredTypeName == null) {
+            return null;
+        }
+        Map<String, String> index = ACTIVE_UNIQUE_IMPL_BY_TYPE;
+        if (index == null || index.isEmpty()) {
+            return null;
+        }
+        String mapped = index.get(declaredTypeName);
+        if (mapped == null || mapped.trim().isEmpty()) {
+            return null;
+        }
+        return mapped;
+    }
+
+    private static Map<String, String> buildUniqueConcreteTypeIndex(SandboxBeanFactory beanFactory,
+                                                                    SpringContextRuntime springRuntime,
+                                                                    boolean debugRuntime) {
+        List<RuntimeBeanTypeInfo> merged = new ArrayList<RuntimeBeanTypeInfo>();
+        if (beanFactory != null) {
+            merged.addAll(beanFactory.snapshotBeanTypeInfos(20000));
+        }
+        if (springRuntime != null) {
+            merged.addAll(springRuntime.snapshotBeanTypeInfos(20000));
+        }
+        if (merged.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<String, LinkedHashSet<String>> candidatesByType = new LinkedHashMap<String, LinkedHashSet<String>>();
+        for (RuntimeBeanTypeInfo info : merged) {
+            if (info == null || isBlank(info.concreteClass)) {
+                continue;
+            }
+            String concrete = info.concreteClass.trim();
+            registerUniqueTypeCandidate(candidatesByType, concrete, concrete);
+            List<String> assignables = info.assignableTypes == null
+                    ? Collections.<String>emptyList()
+                    : info.assignableTypes;
+            for (String assignable : assignables) {
+                registerUniqueTypeCandidate(candidatesByType, assignable, concrete);
+            }
+        }
+        Map<String, String> index = new LinkedHashMap<String, String>();
+        int ambiguous = 0;
+        for (Map.Entry<String, LinkedHashSet<String>> entry : candidatesByType.entrySet()) {
+            String declared = entry.getKey();
+            LinkedHashSet<String> candidates = entry.getValue();
+            if (isBlank(declared) || candidates == null || candidates.isEmpty()) {
+                continue;
+            }
+            if (candidates.size() == 1) {
+                index.put(declared, candidates.iterator().next());
+            } else {
+                ambiguous++;
+            }
+        }
+        if (debugRuntime) {
+            System.out.println("[RUNTIME_DEBUG] TYPE_UNIQUE_IMPL_INDEX size=" + index.size()
+                    + " ambiguous=" + ambiguous);
+        }
+        return index.isEmpty() ? Collections.<String, String>emptyMap() : index;
+    }
+
+    private static void registerUniqueTypeCandidate(Map<String, LinkedHashSet<String>> candidatesByType,
+                                                    String declaredType,
+                                                    String concreteType) {
+        if (candidatesByType == null || isBlank(declaredType) || isBlank(concreteType)) {
+            return;
+        }
+        String declared = declaredType.trim();
+        String concrete = concreteType.trim();
+        LinkedHashSet<String> candidates = candidatesByType.get(declared);
+        if (candidates == null) {
+            candidates = new LinkedHashSet<String>();
+            candidatesByType.put(declared, candidates);
+        }
+        candidates.add(concrete);
     }
 
     private static Method resolveEntryMethod(Class<?> entryClass, String methodRaw, int argCount) {
