@@ -582,6 +582,53 @@ public class RuntimeSandboxSimulator {
         ADVICE_REENTRY_DEPTH.set(Integer.valueOf(current - 1));
     }
 
+    public static String normalizeAdviceMethodName(String methodName) {
+        if (methodName == null) {
+            return "unknown";
+        }
+        String trimmed = methodName.trim();
+        if (trimmed.isEmpty()) {
+            return "unknown";
+        }
+        return trimmed;
+    }
+
+    public static String resolveAdviceTypeName(String declaredTypeName, Object self) {
+        String fallback = declaredTypeName == null ? "unknown" : declaredTypeName.trim();
+        if (fallback.isEmpty()) {
+            fallback = "unknown";
+        }
+        if (self == null) {
+            return fallback;
+        }
+        Class<?> runtimeClass;
+        try {
+            runtimeClass = self.getClass();
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+        if (runtimeClass == null) {
+            return fallback;
+        }
+        if (Proxy.isProxyClass(runtimeClass)) {
+            return fallback;
+        }
+        String runtimeName = runtimeClass.getName();
+        if (runtimeName == null || runtimeName.trim().isEmpty()) {
+            return fallback;
+        }
+        if (runtimeName.contains("$$") || runtimeName.contains("$ByteBuddy$")) {
+            Class<?> superClass = runtimeClass.getSuperclass();
+            if (superClass != null && !Object.class.equals(superClass)) {
+                String superName = superClass.getName();
+                if (superName != null && !superName.trim().isEmpty()) {
+                    return superName;
+                }
+            }
+        }
+        return runtimeName;
+    }
+
     private static Method resolveEntryMethod(Class<?> entryClass, String methodRaw, int argCount) {
         MethodSelector selector = MethodSelector.parse(methodRaw);
         Method fallback = null;
@@ -1621,11 +1668,12 @@ public class RuntimeSandboxSimulator {
                                      @Advice.This Object self,
                                      @Advice.AllArguments Object[] args) {
             ADVICE_HITS.incrementAndGet();
+            String ownerTypeName = resolveAdviceTypeName(typeName, self);
+            String ownerMethodName = normalizeAdviceMethodName(methodName);
             if (isAdviceReentryGuarded()) {
                 ADVICE_ENTER_GUARDED.incrementAndGet();
                 debugAdviceLine("ADVICE_ENTER_SKIP_GUARD type="
-                        + (typeName == null || typeName.trim().isEmpty() ? "unknown" : typeName) + " method="
-                        + (methodName == null || methodName.trim().isEmpty() ? "unknown" : methodName));
+                        + ownerTypeName + " method=" + ownerMethodName);
                 return null;
             }
             enterAdviceReentryGuard();
@@ -1633,16 +1681,14 @@ public class RuntimeSandboxSimulator {
                 RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
                 RuntimeTypeSnapshotCollector typeCollector = ACTIVE_TYPE_COLLECTOR;
                 RuntimeExecutionSnapshotCollector executionCollector = ACTIVE_EXECUTION_COLLECTOR;
-                String methodId = (typeName == null ? "unknown" : typeName)
-                        + "#"
-                        + (methodName == null ? "unknown" : methodName);
+                String methodId = ownerTypeName + "#" + ownerMethodName;
                 if (collector == null || methodId == null) {
                     NULL_COLLECTOR_HITS.incrementAndGet();
                     debugAdviceLine("ADVICE_ENTER_NO_COLLECTOR methodId=" + methodId
                             + " collector=" + (collector == null ? "null" : String.valueOf(System.identityHashCode(collector))));
                     if (typeCollector != null) {
                         try {
-                            typeCollector.onMethodEnter(typeName, methodName, self, args);
+                            typeCollector.onMethodEnter(ownerTypeName, ownerMethodName, self, args);
                         } catch (Throwable error) {
                             debugAdviceLine("TYPE_COLLECTOR_ENTER_ERROR methodId=" + methodId
                                     + " error=" + error.getClass().getName() + ": " + error.getMessage());
@@ -1650,7 +1696,7 @@ public class RuntimeSandboxSimulator {
                     }
                     if (executionCollector != null) {
                         try {
-                            executionCollector.onMethodEnter(typeName, methodName, self, args);
+                            executionCollector.onMethodEnter(ownerTypeName, ownerMethodName, self, args);
                         } catch (Throwable error) {
                             debugAdviceLine("EXEC_COLLECTOR_ENTER_ERROR methodId=" + methodId
                                     + " error=" + error.getClass().getName() + ": " + error.getMessage());
@@ -1674,7 +1720,7 @@ public class RuntimeSandboxSimulator {
                         + " thread=" + Thread.currentThread().getName());
                 if (typeCollector != null) {
                     try {
-                        typeCollector.onMethodEnter(typeName, methodName, self, args);
+                        typeCollector.onMethodEnter(ownerTypeName, ownerMethodName, self, args);
                     } catch (Throwable error) {
                         debugAdviceLine("TYPE_COLLECTOR_ENTER_ERROR methodId=" + methodId
                                 + " error=" + error.getClass().getName() + ": " + error.getMessage());
@@ -1682,7 +1728,7 @@ public class RuntimeSandboxSimulator {
                 }
                 if (executionCollector != null) {
                     try {
-                        executionCollector.onMethodEnter(typeName, methodName, self, args);
+                        executionCollector.onMethodEnter(ownerTypeName, ownerMethodName, self, args);
                     } catch (Throwable error) {
                         debugAdviceLine("EXEC_COLLECTOR_ENTER_ERROR methodId=" + methodId
                                 + " error=" + error.getClass().getName() + ": " + error.getMessage());
@@ -1704,6 +1750,8 @@ public class RuntimeSandboxSimulator {
             if (methodId == null || isAdviceReentryGuarded()) {
                 return;
             }
+            String ownerTypeName = resolveAdviceTypeName(typeName, self);
+            String ownerMethodName = normalizeAdviceMethodName(methodName);
             enterAdviceReentryGuard();
             try {
             RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
@@ -1713,7 +1761,7 @@ public class RuntimeSandboxSimulator {
             Throwable observedThrown = thrown;
             boolean softFailSuppressed = false;
             if (softFailController != null
-                    && softFailController.shouldSuppress(typeName, methodName, thrown)) {
+                    && softFailController.shouldSuppress(ownerTypeName, ownerMethodName, thrown)) {
                 softFailController.recordSuppressed(methodId, thrown);
                 softFailSuppressed = true;
                 thrown = null;
@@ -1721,7 +1769,7 @@ public class RuntimeSandboxSimulator {
             if (collector == null || methodId == null) {
                 if (typeCollector != null) {
                     try {
-                        typeCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown);
+                        typeCollector.onMethodExit(ownerTypeName, ownerMethodName, self, args, null, observedThrown);
                     } catch (Throwable error) {
                         debugAdviceLine("TYPE_COLLECTOR_EXIT_ERROR methodId=" + methodId
                                 + " error=" + error.getClass().getName() + ": " + error.getMessage());
@@ -1729,7 +1777,7 @@ public class RuntimeSandboxSimulator {
                 }
                 if (executionCollector != null) {
                     try {
-                        executionCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown, softFailSuppressed);
+                        executionCollector.onMethodExit(ownerTypeName, ownerMethodName, self, args, null, observedThrown, softFailSuppressed);
                     } catch (Throwable error) {
                         debugAdviceLine("EXEC_COLLECTOR_EXIT_ERROR methodId=" + methodId
                                 + " error=" + error.getClass().getName() + ": " + error.getMessage());
@@ -1746,7 +1794,7 @@ public class RuntimeSandboxSimulator {
             }
             if (typeCollector != null) {
                 try {
-                    typeCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown);
+                    typeCollector.onMethodExit(ownerTypeName, ownerMethodName, self, args, null, observedThrown);
                 } catch (Throwable error) {
                     debugAdviceLine("TYPE_COLLECTOR_EXIT_ERROR methodId=" + methodId
                             + " error=" + error.getClass().getName() + ": " + error.getMessage());
@@ -1754,7 +1802,7 @@ public class RuntimeSandboxSimulator {
             }
             if (executionCollector != null) {
                 try {
-                    executionCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown, softFailSuppressed);
+                    executionCollector.onMethodExit(ownerTypeName, ownerMethodName, self, args, null, observedThrown, softFailSuppressed);
                 } catch (Throwable error) {
                     debugAdviceLine("EXEC_COLLECTOR_EXIT_ERROR methodId=" + methodId
                             + " error=" + error.getClass().getName() + ": " + error.getMessage());
