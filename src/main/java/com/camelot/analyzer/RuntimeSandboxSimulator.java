@@ -79,6 +79,11 @@ public class RuntimeSandboxSimulator {
     public static volatile SoftFailController ACTIVE_SOFT_FAIL_CONTROLLER;
     public static volatile Map<String, String> ACTIVE_UNIQUE_IMPL_BY_TYPE = Collections.emptyMap();
     public static volatile boolean ADVICE_DIAG_ENABLED = false;
+    private static volatile Method SPRING_AOP_UTILS_GET_TARGET_CLASS_METHOD;
+    private static volatile Method SPRING_AOP_PROXY_UTILS_ULTIMATE_TARGET_CLASS_METHOD;
+    private static volatile boolean SPRING_PROXY_METHODS_INITIALIZED = false;
+    private static final Map<String, String> PROXY_RUNTIME_TYPE_CACHE =
+            new ConcurrentHashMap<String, String>();
     private static volatile boolean AGENT_INSTALLED = false;
     private static volatile InstrumentationStats LAST_INSTRUMENTATION_STATS;
     public static final AtomicInteger ADVICE_HITS = new AtomicInteger(0);
@@ -86,6 +91,11 @@ public class RuntimeSandboxSimulator {
     public static final AtomicInteger ADVICE_DIAG_LINES = new AtomicInteger(0);
     public static final AtomicInteger ADVICE_ENTER_GUARDED = new AtomicInteger(0);
     public static final AtomicInteger ADVICE_ENTER_ACCEPTED = new AtomicInteger(0);
+    public static final int ADVICE_DIAG_MAX_LINES = Integer.getInteger(
+            "camelot.runtime.debug.maxLines",
+            5000
+    ).intValue();
+    public static final AtomicInteger ADVICE_DIAG_SUPPRESSED = new AtomicInteger(0);
     private static final ThreadLocal<Integer> ADVICE_REENTRY_DEPTH =
             new ThreadLocal<Integer>() {
                 @Override
@@ -115,15 +125,18 @@ public class RuntimeSandboxSimulator {
         ACTIVE_EXECUTION_COLLECTOR = executionCollector;
         ACTIVE_SOFT_FAIL_CONTROLLER = softFailController;
         ACTIVE_UNIQUE_IMPL_BY_TYPE = Collections.emptyMap();
+        PROXY_RUNTIME_TYPE_CACHE.clear();
         ADVICE_DIAG_ENABLED = options.debugRuntime;
         ADVICE_DIAG_LINES.set(0);
+        ADVICE_DIAG_SUPPRESSED.set(0);
         ADVICE_ENTER_GUARDED.set(0);
         ADVICE_ENTER_ACCEPTED.set(0);
         if (options.debugRuntime) {
             System.out.println("[RUNTIME_DEBUG] COLLECTOR_INIT collector=" + System.identityHashCode(collector)
                     + " typeCollector=" + System.identityHashCode(typeCollector)
                     + " executionCollector=" + System.identityHashCode(executionCollector)
-                    + " runtimeClassLoader=" + RuntimeSandboxSimulator.class.getClassLoader());
+                    + " runtimeClassLoader=" + RuntimeSandboxSimulator.class.getClassLoader()
+                    + " debugMaxLines=" + ADVICE_DIAG_MAX_LINES);
         }
 
         RuntimeTraceReport report = new RuntimeTraceReport();
@@ -258,6 +271,7 @@ public class RuntimeSandboxSimulator {
         System.out.println("NullCollect:" + NULL_COLLECTOR_HITS.get());
         System.out.println("GuardSkip:  " + ADVICE_ENTER_GUARDED.get());
         System.out.println("EnterOk:    " + ADVICE_ENTER_ACCEPTED.get());
+        System.out.println("DbgSupp:    " + ADVICE_DIAG_SUPPRESSED.get());
         if (LAST_INSTRUMENTATION_STATS != null) {
             System.out.println("Discovered: " + LAST_INSTRUMENTATION_STATS.discovered.get());
             System.out.println("Transformed:" + LAST_INSTRUMENTATION_STATS.transformed.get());
@@ -559,7 +573,11 @@ public class RuntimeSandboxSimulator {
             return;
         }
         int line = ADVICE_DIAG_LINES.incrementAndGet();
-        if (line > 120) {
+        if (line > ADVICE_DIAG_MAX_LINES) {
+            if (ADVICE_DIAG_SUPPRESSED.getAndIncrement() == 0) {
+                System.out.println("[RUNTIME_DEBUG] ADVICE_DEBUG_LOG_SUPPRESSED maxLines="
+                        + ADVICE_DIAG_MAX_LINES + " (set -Dcamelot.runtime.debug.maxLines=...)");
+            }
             return;
         }
         System.out.println("[RUNTIME_DEBUG] " + message);
@@ -614,6 +632,11 @@ public class RuntimeSandboxSimulator {
         if (runtimeClass == null) {
             return fallback;
         }
+        String runtimeName = runtimeClass.getName();
+        String springTargetType = resolveSpringAopTargetTypeName(self, runtimeClass, fallback);
+        if (springTargetType != null) {
+            return springTargetType;
+        }
         if (Proxy.isProxyClass(runtimeClass)) {
             String mappedFromDeclared = mapDeclaredTypeToConcrete(fallback);
             if (mappedFromDeclared != null) {
@@ -627,7 +650,6 @@ public class RuntimeSandboxSimulator {
             }
             return fallback;
         }
-        String runtimeName = runtimeClass.getName();
         if (runtimeName == null || runtimeName.trim().isEmpty()) {
             return fallback;
         }
@@ -641,6 +663,121 @@ public class RuntimeSandboxSimulator {
             }
         }
         return runtimeName;
+    }
+
+    private static String resolveSpringAopTargetTypeName(Object self, Class<?> runtimeClass, String fallback) {
+        if (self == null || runtimeClass == null) {
+            return null;
+        }
+        String runtimeName = runtimeClass.getName();
+        if (isBlank(runtimeName)) {
+            return null;
+        }
+        if (!Proxy.isProxyClass(runtimeClass)
+                && runtimeName.indexOf("$$") < 0
+                && runtimeName.indexOf("$ByteBuddy$") < 0) {
+            return null;
+        }
+        String cacheKey = runtimeName + "|" + fallback;
+        String cached = PROXY_RUNTIME_TYPE_CACHE.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+        Class<?> targetClass = invokeSpringTargetClassResolver(self);
+        if (targetClass == null || Object.class.equals(targetClass)) {
+            return null;
+        }
+        String targetName = targetClass.getName();
+        if (isBlank(targetName)) {
+            return null;
+        }
+        PROXY_RUNTIME_TYPE_CACHE.put(cacheKey, targetName);
+        debugAdviceLine("ADVICE_TYPE_RESOLVE_SPRING_PROXY proxy=" + runtimeName + " target=" + targetName);
+        return targetName;
+    }
+
+    private static Class<?> invokeSpringTargetClassResolver(Object proxy) {
+        if (proxy == null) {
+            return null;
+        }
+        ensureSpringProxyMethodsInitialized(proxy.getClass().getClassLoader());
+        Method ultimate = SPRING_AOP_PROXY_UTILS_ULTIMATE_TARGET_CLASS_METHOD;
+        if (ultimate != null) {
+            try {
+                Object resolved = ultimate.invoke(null, proxy);
+                if (resolved instanceof Class) {
+                    return (Class<?>) resolved;
+                }
+            } catch (Throwable ignored) {
+                // fallback
+            }
+        }
+        Method direct = SPRING_AOP_UTILS_GET_TARGET_CLASS_METHOD;
+        if (direct != null) {
+            try {
+                Object resolved = direct.invoke(null, proxy);
+                if (resolved instanceof Class) {
+                    return (Class<?>) resolved;
+                }
+            } catch (Throwable ignored) {
+                // fallback
+            }
+        }
+        return null;
+    }
+
+    private static synchronized void ensureSpringProxyMethodsInitialized(ClassLoader preferredLoader) {
+        if (SPRING_PROXY_METHODS_INITIALIZED) {
+            return;
+        }
+        SPRING_AOP_UTILS_GET_TARGET_CLASS_METHOD = resolveStaticMethod(
+                "org.springframework.aop.support.AopUtils",
+                "getTargetClass",
+                preferredLoader,
+                Object.class
+        );
+        SPRING_AOP_PROXY_UTILS_ULTIMATE_TARGET_CLASS_METHOD = resolveStaticMethod(
+                "org.springframework.aop.framework.AopProxyUtils",
+                "ultimateTargetClass",
+                preferredLoader,
+                Object.class
+        );
+        SPRING_PROXY_METHODS_INITIALIZED = true;
+    }
+
+    private static Method resolveStaticMethod(String className,
+                                              String methodName,
+                                              ClassLoader preferredLoader,
+                                              Class<?>... parameterTypes) {
+        Class<?> targetClass = tryLoadClass(className, preferredLoader);
+        if (targetClass == null) {
+            targetClass = tryLoadClass(className, RuntimeSandboxSimulator.class.getClassLoader());
+        }
+        if (targetClass == null) {
+            ClassLoader contextLoader = Thread.currentThread().getContextClassLoader();
+            targetClass = tryLoadClass(className, contextLoader);
+        }
+        if (targetClass == null) {
+            return null;
+        }
+        try {
+            Method method = targetClass.getMethod(methodName, parameterTypes);
+            method.setAccessible(true);
+            return method;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Class<?> tryLoadClass(String className, ClassLoader loader) {
+        if (isBlank(className) || loader == null) {
+            return null;
+        }
+        try {
+            return Class.forName(className, false, loader);
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private static String mapProxyInterfacesToConcrete(Class<?> proxyClass) {
