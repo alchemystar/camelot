@@ -68,6 +68,7 @@ import static net.bytebuddy.matcher.ElementMatchers.isMethod;
 import static net.bytebuddy.matcher.ElementMatchers.isNative;
 import static net.bytebuddy.matcher.ElementMatchers.isSynthetic;
 import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
+import static net.bytebuddy.matcher.ElementMatchers.named;
 import static net.bytebuddy.matcher.ElementMatchers.not;
 
 public class RuntimeSandboxSimulator {
@@ -78,6 +79,13 @@ public class RuntimeSandboxSimulator {
     private static volatile InstrumentationStats LAST_INSTRUMENTATION_STATS;
     public static final AtomicInteger ADVICE_HITS = new AtomicInteger(0);
     public static final AtomicInteger NULL_COLLECTOR_HITS = new AtomicInteger(0);
+    private static final ThreadLocal<Integer> ADVICE_REENTRY_DEPTH =
+            new ThreadLocal<Integer>() {
+                @Override
+                protected Integer initialValue() {
+                    return Integer.valueOf(0);
+                }
+            };
 
     public static void main(String[] args) throws Exception {
         CliOptions options = CliOptions.parse(args);
@@ -467,6 +475,12 @@ public class RuntimeSandboxSimulator {
                         return builder.visit(
                                 Advice.to(TraceAdvice.class).on(
                                         isMethod()
+                                                .and(not(isAbstract()))
+                                                .and(not(isNative()))
+                                                .and(not(isSynthetic()))
+                                                .and(not(named("toString")))
+                                                .and(not(named("hashCode")))
+                                                .and(not(named("equals")))
                                 )
                         );
                     }
@@ -498,6 +512,27 @@ public class RuntimeSandboxSimulator {
             return true;
         }
         return matchesAnyPrefix(typeName, tracePrefixes);
+    }
+
+    private static boolean isAdviceReentryGuarded() {
+        Integer depth = ADVICE_REENTRY_DEPTH.get();
+        return depth != null && depth.intValue() > 0;
+    }
+
+    private static void enterAdviceReentryGuard() {
+        Integer depth = ADVICE_REENTRY_DEPTH.get();
+        int next = (depth == null ? 0 : depth.intValue()) + 1;
+        ADVICE_REENTRY_DEPTH.set(Integer.valueOf(next));
+    }
+
+    private static void exitAdviceReentryGuard() {
+        Integer depth = ADVICE_REENTRY_DEPTH.get();
+        int current = depth == null ? 0 : depth.intValue();
+        if (current <= 1) {
+            ADVICE_REENTRY_DEPTH.remove();
+            return;
+        }
+        ADVICE_REENTRY_DEPTH.set(Integer.valueOf(current - 1));
     }
 
     private static Method resolveEntryMethod(Class<?> entryClass, String methodRaw, int argCount) {
@@ -1448,6 +1483,11 @@ public class RuntimeSandboxSimulator {
                                      @Advice.This(optional = true) Object self,
                                      @Advice.AllArguments Object[] args) {
             ADVICE_HITS.incrementAndGet();
+            if (isAdviceReentryGuarded()) {
+                return null;
+            }
+            enterAdviceReentryGuard();
+            try {
             RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
             RuntimeTypeSnapshotCollector typeCollector = ACTIVE_TYPE_COLLECTOR;
             RuntimeExecutionSnapshotCollector executionCollector = ACTIVE_EXECUTION_COLLECTOR;
@@ -1472,6 +1512,9 @@ public class RuntimeSandboxSimulator {
                 executionCollector.onMethodEnter(typeName, methodName, self, args);
             }
             return methodId;
+            } finally {
+                exitAdviceReentryGuard();
+            }
         }
 
         @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
@@ -1481,6 +1524,11 @@ public class RuntimeSandboxSimulator {
                                   @Advice.This(optional = true) Object self,
                                   @Advice.AllArguments Object[] args,
                                   @Advice.Thrown Throwable thrown) {
+            if (methodId == null || isAdviceReentryGuarded()) {
+                return;
+            }
+            enterAdviceReentryGuard();
+            try {
             RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
             RuntimeTypeSnapshotCollector typeCollector = ACTIVE_TYPE_COLLECTOR;
             RuntimeExecutionSnapshotCollector executionCollector = ACTIVE_EXECUTION_COLLECTOR;
@@ -1499,6 +1547,9 @@ public class RuntimeSandboxSimulator {
             }
             if (executionCollector != null) {
                 executionCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+            }
+            } finally {
+                exitAdviceReentryGuard();
             }
         }
     }
@@ -1873,6 +1924,13 @@ public class RuntimeSandboxSimulator {
                         return new ArrayDeque<FrameState>();
                     }
                 };
+        private final ThreadLocal<Set<Integer>> objectCaptureInFlight =
+                new ThreadLocal<Set<Integer>>() {
+                    @Override
+                    protected Set<Integer> initialValue() {
+                        return new LinkedHashSet<Integer>();
+                    }
+                };
 
         public RuntimeExecutionSnapshotCollector(int maxEvents, int maxObjects, boolean debugRuntime) {
             this.maxEvents = Math.max(maxEvents, 2000);
@@ -2187,78 +2245,89 @@ public class RuntimeSandboxSimulator {
             if (objects.size() >= maxObjects) {
                 return;
             }
-
-            RuntimeObjectSnapshot snapshot = new RuntimeObjectSnapshot();
-            snapshot.identityId = identityId;
-            snapshot.typeName = type.getName();
-            Class<?> superType = type.getSuperclass();
-            snapshot.superTypeName = superType == null ? null : superType.getName();
-            snapshot.interfaceTypes = new ArrayList<String>();
-            for (Class<?> iface : type.getInterfaces()) {
-                if (iface != null) {
-                    snapshot.interfaceTypes.add(iface.getName());
+            Set<Integer> inFlight = objectCaptureInFlight.get();
+            if (!inFlight.add(Integer.valueOf(identityId))) {
+                return;
+            }
+            try {
+                RuntimeObjectSnapshot snapshot = new RuntimeObjectSnapshot();
+                snapshot.identityId = identityId;
+                snapshot.typeName = type.getName();
+                Class<?> superType = type.getSuperclass();
+                snapshot.superTypeName = superType == null ? null : superType.getName();
+                snapshot.interfaceTypes = new ArrayList<String>();
+                for (Class<?> iface : type.getInterfaces()) {
+                    if (iface != null) {
+                        snapshot.interfaceTypes.add(iface.getName());
+                    }
                 }
-            }
-            Collections.sort(snapshot.interfaceTypes);
-            snapshot.fieldRuntimeTypes = new LinkedHashMap<String, String>();
-            snapshot.fieldValueSummary = new LinkedHashMap<String, String>();
-            snapshot.collectionElementTypes = new ArrayList<String>();
-            snapshot.mapKeyTypes = new ArrayList<String>();
-            snapshot.mapValueTypes = new ArrayList<String>();
+                Collections.sort(snapshot.interfaceTypes);
+                snapshot.fieldRuntimeTypes = new LinkedHashMap<String, String>();
+                snapshot.fieldValueSummary = new LinkedHashMap<String, String>();
+                snapshot.collectionElementTypes = new ArrayList<String>();
+                snapshot.mapKeyTypes = new ArrayList<String>();
+                snapshot.mapValueTypes = new ArrayList<String>();
 
-            if (value instanceof Collection) {
-                snapshot.collectionElementTypes.addAll(sampleCollectionTypes((Collection<?>) value));
-            } else if (value instanceof Map) {
-                snapshot.mapKeyTypes.addAll(sampleMapKeyTypes((Map<?, ?>) value));
-                snapshot.mapValueTypes.addAll(sampleMapValueTypes((Map<?, ?>) value));
-            } else if (type.isArray()) {
-                snapshot.collectionElementTypes.addAll(sampleArrayElementTypes(value));
-            }
+                RuntimeObjectSnapshot existing = objects.putIfAbsent(identityId, snapshot);
+                if (existing != null) {
+                    return;
+                }
 
-            int scanned = 0;
-            int hierarchyDepth = 0;
-            Class<?> current = type;
-            while (current != null && current != Object.class && hierarchyDepth < MAX_OBJECT_HIERARCHY_DEPTH) {
-                Field[] fields = current.getDeclaredFields();
-                for (Field field : fields) {
-                    if (field == null || Modifier.isStatic(field.getModifiers())) {
-                        continue;
+                if (value instanceof Collection) {
+                    snapshot.collectionElementTypes.addAll(sampleCollectionTypes((Collection<?>) value));
+                } else if (value instanceof Map) {
+                    snapshot.mapKeyTypes.addAll(sampleMapKeyTypes((Map<?, ?>) value));
+                    snapshot.mapValueTypes.addAll(sampleMapValueTypes((Map<?, ?>) value));
+                } else if (type.isArray()) {
+                    snapshot.collectionElementTypes.addAll(sampleArrayElementTypes(value));
+                }
+
+                int scanned = 0;
+                int hierarchyDepth = 0;
+                Class<?> current = type;
+                while (current != null && current != Object.class && hierarchyDepth < MAX_OBJECT_HIERARCHY_DEPTH) {
+                    Field[] fields = current.getDeclaredFields();
+                    for (Field field : fields) {
+                        if (field == null || Modifier.isStatic(field.getModifiers())) {
+                            continue;
+                        }
+                        if (scanned >= MAX_OBJECT_FIELD_SCAN) {
+                            break;
+                        }
+                        scanned++;
+                        field.setAccessible(true);
+                        Object fieldValue;
+                        try {
+                            fieldValue = field.get(value);
+                        } catch (Throwable ignored) {
+                            continue;
+                        }
+                        String fieldKey = current.getSimpleName() + "." + field.getName();
+                        RuntimeValueInfo fieldInfo = summarizeValue("field", fieldValue, true);
+                        snapshot.fieldValueSummary.put(fieldKey, valueToSummary(fieldInfo));
+                        if (fieldValue == null) {
+                            continue;
+                        }
+                        snapshot.fieldRuntimeTypes.put(
+                                fieldKey,
+                                fieldValue.getClass().getName()
+                        );
                     }
                     if (scanned >= MAX_OBJECT_FIELD_SCAN) {
                         break;
                     }
-                    scanned++;
-                    field.setAccessible(true);
-                    Object fieldValue;
-                    try {
-                        fieldValue = field.get(value);
-                    } catch (Throwable ignored) {
-                        continue;
-                    }
-                    String fieldKey = current.getSimpleName() + "." + field.getName();
-                    RuntimeValueInfo fieldInfo = summarizeValue("field", fieldValue, true);
-                    snapshot.fieldValueSummary.put(fieldKey, valueToSummary(fieldInfo));
-                    if (fieldValue == null) {
-                        continue;
-                    }
-                    snapshot.fieldRuntimeTypes.put(
-                            fieldKey,
-                            fieldValue.getClass().getName()
-                    );
+                    current = current.getSuperclass();
+                    hierarchyDepth++;
                 }
-                if (scanned >= MAX_OBJECT_FIELD_SCAN) {
-                    break;
-                }
-                current = current.getSuperclass();
-                hierarchyDepth++;
-            }
 
-            objects.put(identityId, snapshot);
-            if (debugRuntime) {
-                // lightweight marker, avoids flooding log with full object content
-                System.out.println("[RUNTIME_DEBUG] RUNTIME_OBJECT_SNAPSHOT type="
-                        + snapshot.typeName + " id=" + snapshot.identityId
-                        + " fields=" + snapshot.fieldRuntimeTypes.size());
+                if (debugRuntime) {
+                    // lightweight marker, avoids flooding log with full object content
+                    System.out.println("[RUNTIME_DEBUG] RUNTIME_OBJECT_SNAPSHOT type="
+                            + snapshot.typeName + " id=" + snapshot.identityId
+                            + " fields=" + snapshot.fieldRuntimeTypes.size());
+                }
+            } finally {
+                inFlight.remove(Integer.valueOf(identityId));
             }
         }
 
@@ -2325,19 +2394,40 @@ public class RuntimeSandboxSimulator {
             if (value == null) {
                 return "null";
             }
-            String raw;
-            try {
-                raw = String.valueOf(value);
-            } catch (Throwable error) {
-                raw = value.getClass().getName() + "(toString-error)";
+            if (value instanceof CharSequence
+                    || value instanceof Number
+                    || value instanceof Boolean
+                    || value instanceof Character
+                    || value instanceof Enum) {
+                String raw;
+                try {
+                    raw = String.valueOf(value);
+                } catch (Throwable error) {
+                    raw = value.getClass().getName() + "(toString-error)";
+                }
+                if (raw == null) {
+                    return "null";
+                }
+                if (raw.length() > MAX_STRING_LENGTH) {
+                    return raw.substring(0, MAX_STRING_LENGTH) + "...";
+                }
+                return raw;
             }
-            if (raw == null) {
-                return "null";
+            if (value instanceof Class) {
+                return ((Class<?>) value).getName();
             }
-            if (raw.length() > MAX_STRING_LENGTH) {
-                return raw.substring(0, MAX_STRING_LENGTH) + "...";
+            if (value instanceof Throwable) {
+                Throwable error = (Throwable) value;
+                String message = error.getMessage();
+                if (isBlank(message)) {
+                    return error.getClass().getName();
+                }
+                if (message.length() > MAX_STRING_LENGTH) {
+                    message = message.substring(0, MAX_STRING_LENGTH) + "...";
+                }
+                return error.getClass().getName() + ":" + message;
             }
-            return raw;
+            return value.getClass().getName() + "@" + System.identityHashCode(value);
         }
 
         private String methodId(String typeName, String methodName) {
