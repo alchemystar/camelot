@@ -100,6 +100,7 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 - 第 1 个参数：目标工程目录（会自动探测 `target/classes` 与常见 jar 依赖）
 - 第 2 个参数：`entry-method`，建议写成 `全限定类名#方法名/参数个数`
 - 其他参数可选追加（例如 `--arg`、`--out`、`--trace-prefix`、`--debug-runtime`、`--use-spring-context`）
+- 需要“校验失败也继续往下跑”时可加 `--soft-fail`（受控吞异常并给调用方默认返回值，继续后续链路）
 - 不传 `--arg` 时会按方法签名自动生成入参；也可对单个参数传 `--arg __auto__` 或 `--arg @auto`
 - `--use-spring-context`：优先使用真实 Spring `ApplicationContext` 装配 Bean（失败自动回退到内置 SandboxBeanFactory）
 - 若目标工程有 `pom.xml`，脚本会自动解析其 runtime 依赖并通过 `--classpath` 传给模拟器
@@ -110,12 +111,17 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
   - `runtimeEvents` / `runtimeObjects`：整个调用阶段的 ENTER/EXIT 运行时事件与对象快照（线程、栈深、this/args/throw）
     - 事件中包含 `receiverFields`（当前实例成员变量快照）与 `receiverFieldChanges`（方法执行前后字段变化）
 - 并输出 `runtime-execution.txt`（事件流文本）用于快速人工排查
+- 并输出 `runtime-call-stack.txt`（按 ENTER/EXIT 还原的调用栈树）
 - 可直接把 `runtime-trace.json` 回灌到静态分析：`--runtime-trace-json /path/to/runtime-trace.json`
   - 会利用 `edges/runtimeEvents/runtimeObjects` 中的证据给候选调用加权与收敛
   - 会在 `analysis-debug.log` 输出 `RUNTIME_EVIDENCE_*` 调试日志
 - 可选参数：
   - `--max-runtime-events N`：最大保留运行时事件数（默认 60000）
   - `--max-runtime-objects N`：最大保留运行时对象快照数（默认 20000）
+  - `--soft-fail`：开启软失败模式（方法抛异常时吞掉异常并返回默认值，继续调用链）
+  - `--soft-fail-max N`：最多软失败次数（默认 2000）
+  - `--soft-fail-exception-prefix P`：仅对指定异常前缀生效（可重复传，支持逗号分隔）
+  - `--soft-fail-method-token T`：仅对方法名/类名命中 token 生效（可重复传，支持逗号分隔）
 
 ## 示例
 

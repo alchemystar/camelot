@@ -7,6 +7,7 @@ import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.DynamicType;
+import net.bytebuddy.implementation.bytecode.assign.Assigner;
 import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 import net.bytebuddy.utility.JavaModule;
@@ -75,6 +76,7 @@ public class RuntimeSandboxSimulator {
     public static volatile RuntimeTraceCollector ACTIVE_COLLECTOR;
     public static volatile RuntimeTypeSnapshotCollector ACTIVE_TYPE_COLLECTOR;
     public static volatile RuntimeExecutionSnapshotCollector ACTIVE_EXECUTION_COLLECTOR;
+    public static volatile SoftFailController ACTIVE_SOFT_FAIL_CONTROLLER;
     private static volatile boolean AGENT_INSTALLED = false;
     private static volatile InstrumentationStats LAST_INSTRUMENTATION_STATS;
     public static final AtomicInteger ADVICE_HITS = new AtomicInteger(0);
@@ -102,9 +104,11 @@ public class RuntimeSandboxSimulator {
                 options.maxRuntimeObjects,
                 options.debugRuntime
         );
+        SoftFailController softFailController = SoftFailController.fromOptions(options);
         ACTIVE_COLLECTOR = collector;
         ACTIVE_TYPE_COLLECTOR = typeCollector;
         ACTIVE_EXECUTION_COLLECTOR = executionCollector;
+        ACTIVE_SOFT_FAIL_CONTROLLER = softFailController;
 
         RuntimeTraceReport report = new RuntimeTraceReport();
         report.generatedAt = Instant.now().toString();
@@ -116,6 +120,10 @@ public class RuntimeSandboxSimulator {
         report.arguments = new ArrayList<String>(options.arguments);
         report.discoveredProjectClassCount = projectClassIndex.classNames.size();
         report.useSpringContext = options.useSpringContext;
+        report.softFailEnabled = options.softFail;
+        report.softFailMaxSuppressions = options.softFailMaxSuppressions;
+        report.softFailExceptionPrefixes = new ArrayList<String>(options.softFailExceptionPrefixes);
+        report.softFailMethodTokens = new ArrayList<String>(options.softFailMethodTokens);
 
         long startedAt = System.currentTimeMillis();
         SandboxBeanFactory beanFactory = null;
@@ -179,6 +187,8 @@ public class RuntimeSandboxSimulator {
             report.runtimeObjectCount = executionCollector.getObjectCount();
             report.runtimeEvents = executionCollector.snapshotEvents(options.maxRuntimeEvents);
             report.runtimeObjects = executionCollector.snapshotObjects(options.maxRuntimeObjects);
+            report.softFailSuppressedCount = softFailController.getSuppressedCount();
+            report.softFailSuppressedSamples = softFailController.snapshotSuppressedSamples(500);
             if (beanFactory != null) {
                 report.sandboxBeanTypeInfos = beanFactory.snapshotBeanTypeInfos(500);
             }
@@ -188,6 +198,7 @@ public class RuntimeSandboxSimulator {
             ACTIVE_COLLECTOR = null;
             ACTIVE_TYPE_COLLECTOR = null;
             ACTIVE_EXECUTION_COLLECTOR = null;
+            ACTIVE_SOFT_FAIL_CONTROLLER = null;
             if (springRuntime != null) {
                 springRuntime.close();
             }
@@ -198,17 +209,20 @@ public class RuntimeSandboxSimulator {
         Path treePath = options.outputDir.resolve("runtime-trace-tree.txt");
         Path typesPath = options.outputDir.resolve("runtime-types.txt");
         Path executionPath = options.outputDir.resolve("runtime-execution.txt");
+        Path callStackPath = options.outputDir.resolve("runtime-call-stack.txt");
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         mapper.writeValue(jsonPath.toFile(), report);
         Files.write(treePath, buildTraceTree(report).getBytes(StandardCharsets.UTF_8));
         Files.write(typesPath, buildRuntimeTypeSummary(report).getBytes(StandardCharsets.UTF_8));
         Files.write(executionPath, buildRuntimeExecutionSummary(report).getBytes(StandardCharsets.UTF_8));
+        Files.write(callStackPath, buildRuntimeCallStackSummary(report).getBytes(StandardCharsets.UTF_8));
 
         System.out.println("Runtime sandbox finished.");
         System.out.println("Trace JSON: " + jsonPath.toAbsolutePath());
         System.out.println("Trace tree: " + treePath.toAbsolutePath());
         System.out.println("Type info:  " + typesPath.toAbsolutePath());
         System.out.println("Exec info:  " + executionPath.toAbsolutePath());
+        System.out.println("Stack info: " + callStackPath.toAbsolutePath());
         System.out.println("Calls:      " + report.callCount);
         System.out.println("Edges:      " + report.edges.size());
         System.out.println("Pipelines:  " + report.pipelineTypeInfos.size());
@@ -217,6 +231,8 @@ public class RuntimeSandboxSimulator {
         System.out.println("RuntimeEvt: " + report.runtimeEventCount
                 + " (dropped=" + report.runtimeDroppedEvents + ")");
         System.out.println("RuntimeObj: " + report.runtimeObjectCount);
+        System.out.println("SoftFail:   " + report.softFailSuppressedCount + "/" + report.softFailMaxSuppressions
+                + " enabled=" + report.softFailEnabled);
         System.out.println("AdviceHits: " + ADVICE_HITS.get());
         System.out.println("NullCollect:" + NULL_COLLECTOR_HITS.get());
         if (LAST_INSTRUMENTATION_STATS != null) {
@@ -1054,7 +1070,8 @@ public class RuntimeSandboxSimulator {
         sb.append("Entry: ").append(report.entryClass).append("#").append(report.entryMethod).append("\n");
         sb.append("Events=").append(report.runtimeEventCount)
                 .append(", Dropped=").append(report.runtimeDroppedEvents)
-                .append(", Objects=").append(report.runtimeObjectCount).append("\n\n");
+                .append(", Objects=").append(report.runtimeObjectCount)
+                .append(", SoftFailSuppressed=").append(report.softFailSuppressedCount).append("\n\n");
 
         List<RuntimeExecutionEvent> events = report.runtimeEvents == null
                 ? Collections.<RuntimeExecutionEvent>emptyList() : report.runtimeEvents;
@@ -1094,6 +1111,9 @@ public class RuntimeSandboxSimulator {
             if (!isBlank(event.thrown)) {
                 sb.append("  thrown=").append(event.thrown).append("\n");
             }
+            if (event.softFailSuppressed) {
+                sb.append("  softFailSuppressed=true\n");
+            }
         }
 
         List<RuntimeObjectSnapshot> objects = report.runtimeObjects == null
@@ -1118,6 +1138,53 @@ public class RuntimeSandboxSimulator {
             }
             if (object.mapValueTypes != null && !object.mapValueTypes.isEmpty()) {
                 sb.append("  mapValues=").append(object.mapValueTypes).append("\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String buildRuntimeCallStackSummary(RuntimeTraceReport report) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Runtime Call Stack\n");
+        sb.append("Entry: ").append(report.entryClass).append("#").append(report.entryMethod).append("\n");
+        sb.append("Events=").append(report.runtimeEventCount)
+                .append(", SoftFailSuppressed=").append(report.softFailSuppressedCount).append("\n\n");
+        List<RuntimeExecutionEvent> events = report.runtimeEvents == null
+                ? Collections.<RuntimeExecutionEvent>emptyList()
+                : report.runtimeEvents;
+        for (RuntimeExecutionEvent event : events) {
+            if (event == null) {
+                continue;
+            }
+            int depth = Math.max(0, event.stackDepth - 1);
+            for (int i = 0; i < depth; i++) {
+                sb.append("  ");
+            }
+            String marker = "ENTER".equals(event.eventType) ? "->" : "<-";
+            sb.append(marker).append(" ").append(event.methodId == null ? "" : event.methodId);
+            if (!isBlank(event.thrown)) {
+                sb.append(" [THROW ").append(event.thrown).append("]");
+            }
+            if (event.softFailSuppressed) {
+                sb.append(" [SOFT_FAIL_SUPPRESSED]");
+            }
+            if (event.returnValue != null && !isBlank(event.returnValue.typeName)) {
+                sb.append(" [RET ").append(event.returnValue.typeName).append("]");
+            }
+            sb.append("\n");
+        }
+        if (report.softFailSuppressedSamples != null && !report.softFailSuppressedSamples.isEmpty()) {
+            sb.append("\nSuppressed Exceptions:\n");
+            for (SoftFailSuppressedSample sample : report.softFailSuppressedSamples) {
+                if (sample == null) {
+                    continue;
+                }
+                sb.append("- #").append(sample.seq)
+                        .append(" ").append(sample.methodId)
+                        .append(" ").append(sample.throwableClass)
+                        .append(": ").append(sample.message)
+                        .append(" thread=").append(sample.threadName)
+                        .append("\n");
             }
         }
         return sb.toString();
@@ -1521,9 +1588,11 @@ public class RuntimeSandboxSimulator {
         public static void onExit(@Advice.Enter String methodId,
                                   @Advice.Origin("#t") String typeName,
                                   @Advice.Origin("#m") String methodName,
+                                  @Advice.Origin Method originMethod,
                                   @Advice.This(optional = true) Object self,
                                   @Advice.AllArguments Object[] args,
-                                  @Advice.Thrown Throwable thrown) {
+                                  @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC, optional = true) Object returned,
+                                  @Advice.Thrown(readOnly = false, typing = Assigner.Typing.DYNAMIC) Throwable thrown) {
             if (methodId == null || isAdviceReentryGuarded()) {
                 return;
             }
@@ -1532,21 +1601,33 @@ public class RuntimeSandboxSimulator {
             RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
             RuntimeTypeSnapshotCollector typeCollector = ACTIVE_TYPE_COLLECTOR;
             RuntimeExecutionSnapshotCollector executionCollector = ACTIVE_EXECUTION_COLLECTOR;
+            SoftFailController softFailController = ACTIVE_SOFT_FAIL_CONTROLLER;
+            Throwable observedThrown = thrown;
+            boolean softFailSuppressed = false;
+            if (softFailController != null
+                    && softFailController.shouldSuppress(typeName, methodName, thrown)) {
+                softFailController.recordSuppressed(methodId, thrown);
+                softFailSuppressed = true;
+                if (originMethod != null && !Void.TYPE.equals(originMethod.getReturnType())) {
+                    returned = SoftFailController.defaultReturnValue(originMethod.getReturnType());
+                }
+                thrown = null;
+            }
             if (collector == null || methodId == null) {
                 if (typeCollector != null) {
-                    typeCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+                    typeCollector.onMethodExit(typeName, methodName, self, args, returned, observedThrown);
                 }
                 if (executionCollector != null) {
-                    executionCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+                    executionCollector.onMethodExit(typeName, methodName, self, args, returned, observedThrown, softFailSuppressed);
                 }
                 return;
             }
             collector.onExit(methodId);
             if (typeCollector != null) {
-                typeCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+                typeCollector.onMethodExit(typeName, methodName, self, args, returned, observedThrown);
             }
             if (executionCollector != null) {
-                executionCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+                executionCollector.onMethodExit(typeName, methodName, self, args, returned, observedThrown, softFailSuppressed);
             }
             } finally {
                 exitAdviceReentryGuard();
@@ -1621,7 +1702,8 @@ public class RuntimeSandboxSimulator {
                                  Object self,
                                  Object[] args,
                                  Object returned,
-                                 Throwable thrown) {
+                                 Throwable thrown,
+                                 boolean softFailSuppressed) {
             if (!shouldObserve(typeName, methodName, self, args) && returned == null && thrown == null) {
                 return;
             }
@@ -2003,6 +2085,7 @@ public class RuntimeSandboxSimulator {
             if (thrown != null) {
                 event.thrown = thrown.getClass().getName() + ": " + thrown.getMessage();
             }
+            event.softFailSuppressed = softFailSuppressed;
             appendEvent(event);
         }
 
@@ -2456,6 +2539,161 @@ public class RuntimeSandboxSimulator {
         }
     }
 
+    public static class SoftFailController {
+        private static final int DEFAULT_SAMPLE_LIMIT = 500;
+
+        private final boolean enabled;
+        private final int maxSuppressions;
+        private final List<String> exceptionPrefixes;
+        private final List<String> methodTokens;
+        private final AtomicInteger suppressedCount = new AtomicInteger(0);
+        private final AtomicInteger suppressedSeq = new AtomicInteger(0);
+        private final ConcurrentLinkedQueue<SoftFailSuppressedSample> samples =
+                new ConcurrentLinkedQueue<SoftFailSuppressedSample>();
+
+        private SoftFailController(boolean enabled,
+                                   int maxSuppressions,
+                                   List<String> exceptionPrefixes,
+                                   List<String> methodTokens) {
+            this.enabled = enabled;
+            this.maxSuppressions = maxSuppressions <= 0 ? 0 : maxSuppressions;
+            this.exceptionPrefixes = exceptionPrefixes == null
+                    ? Collections.<String>emptyList()
+                    : new ArrayList<String>(exceptionPrefixes);
+            this.methodTokens = methodTokens == null
+                    ? Collections.<String>emptyList()
+                    : new ArrayList<String>(methodTokens);
+        }
+
+        public static SoftFailController fromOptions(CliOptions options) {
+            if (options == null) {
+                return new SoftFailController(false, 0, Collections.<String>emptyList(), Collections.<String>emptyList());
+            }
+            return new SoftFailController(
+                    options.softFail,
+                    options.softFailMaxSuppressions,
+                    options.softFailExceptionPrefixes,
+                    options.softFailMethodTokens
+            );
+        }
+
+        public boolean shouldSuppress(String typeName, String methodName, Throwable thrown) {
+            if (!enabled || thrown == null) {
+                return false;
+            }
+            if (thrown instanceof VirtualMachineError
+                    || thrown instanceof ThreadDeath
+                    || thrown instanceof LinkageError) {
+                return false;
+            }
+            if (maxSuppressions > 0 && suppressedCount.get() >= maxSuppressions) {
+                return false;
+            }
+            if (!exceptionPrefixes.isEmpty()) {
+                String throwableClass = thrown.getClass().getName();
+                boolean matched = false;
+                for (String prefix : exceptionPrefixes) {
+                    if (!isBlank(prefix) && throwableClass.startsWith(prefix)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    return false;
+                }
+            }
+            if (!methodTokens.isEmpty()) {
+                String method = methodName == null ? "" : methodName.toLowerCase(Locale.ROOT);
+                String type = typeName == null ? "" : typeName.toLowerCase(Locale.ROOT);
+                boolean matched = false;
+                for (String token : methodTokens) {
+                    if (isBlank(token)) {
+                        continue;
+                    }
+                    String normalized = token.toLowerCase(Locale.ROOT);
+                    if (method.contains(normalized) || type.contains(normalized)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public void recordSuppressed(String methodId, Throwable thrown) {
+            int next = suppressedCount.incrementAndGet();
+            if (maxSuppressions > 0 && next > maxSuppressions) {
+                return;
+            }
+            if (samples.size() >= DEFAULT_SAMPLE_LIMIT) {
+                return;
+            }
+            SoftFailSuppressedSample sample = new SoftFailSuppressedSample();
+            sample.seq = suppressedSeq.incrementAndGet();
+            sample.methodId = methodId == null ? "" : methodId;
+            sample.throwableClass = thrown == null ? "" : thrown.getClass().getName();
+            sample.message = thrown == null || thrown.getMessage() == null ? "" : thrown.getMessage();
+            sample.timestampMs = System.currentTimeMillis();
+            sample.threadName = Thread.currentThread().getName();
+            samples.add(sample);
+        }
+
+        public int getSuppressedCount() {
+            return suppressedCount.get();
+        }
+
+        public List<SoftFailSuppressedSample> snapshotSuppressedSamples(int limit) {
+            int max = limit <= 0 ? DEFAULT_SAMPLE_LIMIT : Math.min(limit, DEFAULT_SAMPLE_LIMIT);
+            List<SoftFailSuppressedSample> result = new ArrayList<SoftFailSuppressedSample>();
+            int count = 0;
+            for (SoftFailSuppressedSample sample : samples) {
+                result.add(sample);
+                count++;
+                if (count >= max) {
+                    break;
+                }
+            }
+            return result;
+        }
+
+        public static Object defaultReturnValue(Class<?> returnType) {
+            if (returnType == null || Void.TYPE.equals(returnType)) {
+                return null;
+            }
+            if (!returnType.isPrimitive()) {
+                return null;
+            }
+            if (Boolean.TYPE.equals(returnType)) {
+                return Boolean.FALSE;
+            }
+            if (Byte.TYPE.equals(returnType)) {
+                return Byte.valueOf((byte) 0);
+            }
+            if (Short.TYPE.equals(returnType)) {
+                return Short.valueOf((short) 0);
+            }
+            if (Integer.TYPE.equals(returnType)) {
+                return Integer.valueOf(0);
+            }
+            if (Long.TYPE.equals(returnType)) {
+                return Long.valueOf(0L);
+            }
+            if (Float.TYPE.equals(returnType)) {
+                return Float.valueOf(0.0f);
+            }
+            if (Double.TYPE.equals(returnType)) {
+                return Double.valueOf(0.0d);
+            }
+            if (Character.TYPE.equals(returnType)) {
+                return Character.valueOf('\0');
+            }
+            return null;
+        }
+    }
+
     public static class RuntimeTraceCollector {
         private final int maxCalls;
         private final AtomicInteger callCount = new AtomicInteger(0);
@@ -2563,6 +2801,12 @@ public class RuntimeSandboxSimulator {
         public int runtimeObjectCount;
         public List<RuntimeExecutionEvent> runtimeEvents;
         public List<RuntimeObjectSnapshot> runtimeObjects;
+        public boolean softFailEnabled;
+        public int softFailMaxSuppressions;
+        public List<String> softFailExceptionPrefixes;
+        public List<String> softFailMethodTokens;
+        public int softFailSuppressedCount;
+        public List<SoftFailSuppressedSample> softFailSuppressedSamples;
     }
 
     public static class RuntimeBeanTypeInfo {
@@ -2598,6 +2842,16 @@ public class RuntimeSandboxSimulator {
         public List<RuntimeValueInfo> arguments;
         public RuntimeValueInfo returnValue;
         public String thrown;
+        public boolean softFailSuppressed;
+    }
+
+    public static class SoftFailSuppressedSample {
+        public int seq;
+        public String methodId;
+        public String throwableClass;
+        public String message;
+        public long timestampMs;
+        public String threadName;
     }
 
     public static class RuntimeFieldValue {
@@ -3955,6 +4209,10 @@ public class RuntimeSandboxSimulator {
         public final int maxRuntimeObjects;
         public final boolean debugRuntime;
         public final boolean useSpringContext;
+        public final boolean softFail;
+        public final int softFailMaxSuppressions;
+        public final List<String> softFailExceptionPrefixes;
+        public final List<String> softFailMethodTokens;
 
         public CliOptions(Path projectDir,
                           List<Path> classesRoots,
@@ -3968,7 +4226,11 @@ public class RuntimeSandboxSimulator {
                           int maxRuntimeEvents,
                           int maxRuntimeObjects,
                           boolean debugRuntime,
-                          boolean useSpringContext) {
+                          boolean useSpringContext,
+                          boolean softFail,
+                          int softFailMaxSuppressions,
+                          List<String> softFailExceptionPrefixes,
+                          List<String> softFailMethodTokens) {
             this.projectDir = projectDir;
             this.classesRoots = classesRoots;
             this.classpathEntries = classpathEntries;
@@ -3982,6 +4244,14 @@ public class RuntimeSandboxSimulator {
             this.maxRuntimeObjects = maxRuntimeObjects;
             this.debugRuntime = debugRuntime;
             this.useSpringContext = useSpringContext;
+            this.softFail = softFail;
+            this.softFailMaxSuppressions = softFailMaxSuppressions;
+            this.softFailExceptionPrefixes = softFailExceptionPrefixes == null
+                    ? new ArrayList<String>()
+                    : softFailExceptionPrefixes;
+            this.softFailMethodTokens = softFailMethodTokens == null
+                    ? new ArrayList<String>()
+                    : softFailMethodTokens;
         }
 
         public static CliOptions parse(String[] args) {
@@ -3998,6 +4268,10 @@ public class RuntimeSandboxSimulator {
             int maxRuntimeObjects = 20000;
             boolean debugRuntime = false;
             boolean useSpringContext = false;
+            boolean softFail = false;
+            int softFailMaxSuppressions = 2000;
+            List<String> softFailExceptionPrefixes = new ArrayList<String>();
+            List<String> softFailMethodTokens = new ArrayList<String>();
             boolean outExplicitlySpecified = false;
 
             for (int i = 0; i < args.length; i++) {
@@ -4029,6 +4303,14 @@ public class RuntimeSandboxSimulator {
                     debugRuntime = true;
                 } else if ("--use-spring-context".equals(arg)) {
                     useSpringContext = true;
+                } else if ("--soft-fail".equals(arg)) {
+                    softFail = true;
+                } else if ("--soft-fail-max".equals(arg) && i + 1 < args.length) {
+                    softFailMaxSuppressions = Integer.parseInt(args[++i]);
+                } else if ("--soft-fail-exception-prefix".equals(arg) && i + 1 < args.length) {
+                    collectTokens(softFailExceptionPrefixes, args[++i]);
+                } else if ("--soft-fail-method-token".equals(arg) && i + 1 < args.length) {
+                    collectTokens(softFailMethodTokens, args[++i]);
                 }
             }
 
@@ -4079,7 +4361,11 @@ public class RuntimeSandboxSimulator {
                     maxRuntimeEvents,
                     maxRuntimeObjects,
                     debugRuntime,
-                    useSpringContext
+                    useSpringContext,
+                    softFail,
+                    softFailMaxSuppressions,
+                    normalizeTokens(softFailExceptionPrefixes),
+                    normalizeTokens(softFailMethodTokens)
             );
         }
 

@@ -5,6 +5,7 @@ set -euo pipefail
 if [ "$#" -lt 2 ]; then
   echo "Usage: $0 <project-dir> <entry-method> [extra-args...]"
   echo "Example: $0 /path/to/project com.foo.UserService#findUser/1 --arg 42"
+  echo "Example: $0 /path/to/project com.foo.UserService#findUser/1 --soft-fail --soft-fail-max 500"
   exit 1
 fi
 
