@@ -40,6 +40,7 @@ mvn -q compile
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --max-depth 50 --max-paths 200 --endpoint /users/{id}"
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --entry-method com.example.api.UserService#findUser/1"
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --entry-method com.example.api.UserService#findUser/1 --debug"
+mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --out /path/to/output --entry-method com.example.api.UserService#findUser/1 --runtime-trace-json /path/to/runtime-trace.json --debug"
 mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-rpc-prefix com.partner.api --non-external-rpc-prefix com.mycorp --non-external-rpc-prefix com.mycorp.shared"
 ```
 
@@ -53,6 +54,7 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 - `--entry-method`：仅分析某个方法入口（如 `com.foo.UserService#getById/1` 或 `UserService#getById`）
 - `--debug`：输出解析调试日志（默认写到输出目录下 `analysis-debug.log`）
 - `--debug-out`：指定调试日志文件路径
+- `--runtime-trace-json`：加载 Runtime Sandbox 产出的 `runtime-trace.json`，用运行时证据收敛静态分派（候选打分、字段/参数类型绑定）
 - `--external-rpc-prefix`：强制判定为外部 RPC 的包前缀（仅对 jar 类生效；可重复传，支持 `a,b` / `a;b` / `[a,b]` / `["a","b"]`）
 - `--non-external-rpc-prefix`：强制判定为非外部 RPC 的包前缀（仅对 jar 类生效；可重复传，支持 `a,b` / `a;b` / `[a,b]` / `["a","b"]`）
 - `--internal-jar-prefix`：兼容旧参数，等价于 `--non-external-rpc-prefix`
@@ -102,6 +104,18 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 - `--use-spring-context`：优先使用真实 Spring `ApplicationContext` 装配 Bean（失败自动回退到内置 SandboxBeanFactory）
 - 若目标工程有 `pom.xml`，脚本会自动解析其 runtime 依赖并通过 `--classpath` 传给模拟器
 - 若报 `ClassNotFoundException`，加 `--debug-runtime` 可打印类加载器 URL、扫描类数量、候选类名建议等排查日志
+- 运行结束会额外输出 `runtime-types.txt`，并在 `runtime-trace.json` 中附加：
+  - `sandboxBeanTypeInfos` / `springBeanTypeInfos`：Bean 运行时类型快照（含 beanName、concreteClass、assignableTypes）
+  - `pipelineTypeInfos`：运行时观察到的 Pipeline/Builder/Chain 对象及其 stage 类型（用于辅助静态分析收敛）
+  - `runtimeEvents` / `runtimeObjects`：整个调用阶段的 ENTER/EXIT 运行时事件与对象快照（线程、栈深、this/args/throw）
+    - 事件中包含 `receiverFields`（当前实例成员变量快照）与 `receiverFieldChanges`（方法执行前后字段变化）
+- 并输出 `runtime-execution.txt`（事件流文本）用于快速人工排查
+- 可直接把 `runtime-trace.json` 回灌到静态分析：`--runtime-trace-json /path/to/runtime-trace.json`
+  - 会利用 `edges/runtimeEvents/runtimeObjects` 中的证据给候选调用加权与收敛
+  - 会在 `analysis-debug.log` 输出 `RUNTIME_EVIDENCE_*` 调试日志
+- 可选参数：
+  - `--max-runtime-events N`：最大保留运行时事件数（默认 60000）
+  - `--max-runtime-objects N`：最大保留运行时对象快照数（默认 20000）
 
 ## 示例
 

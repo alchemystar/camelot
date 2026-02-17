@@ -28,7 +28,8 @@ public class DependencyAnalysisModule {
                                                                          String entryMethodFilter,
                                                                          SpringCallPathAnalyzer.DebugLogger debugLogger,
                                                                          Set<String> externalRpcPrefixes,
-                                                                         Set<String> nonExternalRpcPrefixes)
+                                                                         Set<String> nonExternalRpcPrefixes,
+                                                                         java.nio.file.Path runtimeTraceJson)
             throws IOException {
         SpringCallPathAnalyzer.DebugLogger logger = debugLogger == null
                 ? SpringCallPathAnalyzer.DebugLogger.disabled()
@@ -46,7 +47,8 @@ public class DependencyAnalysisModule {
                 maxPathsPerEndpoint,
                 endpointPathFilter,
                 entryMethodFilter,
-                logger
+                logger,
+                runtimeTraceJson
         );
 
         List<SpringCallPathAnalyzer.CallEdge> enrichedEdges = enrichDependencyTypes(

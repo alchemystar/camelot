@@ -55,6 +55,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -71,6 +72,8 @@ import static net.bytebuddy.matcher.ElementMatchers.not;
 
 public class RuntimeSandboxSimulator {
     public static volatile RuntimeTraceCollector ACTIVE_COLLECTOR;
+    public static volatile RuntimeTypeSnapshotCollector ACTIVE_TYPE_COLLECTOR;
+    public static volatile RuntimeExecutionSnapshotCollector ACTIVE_EXECUTION_COLLECTOR;
     private static volatile boolean AGENT_INSTALLED = false;
     private static volatile InstrumentationStats LAST_INSTRUMENTATION_STATS;
     public static final AtomicInteger ADVICE_HITS = new AtomicInteger(0);
@@ -85,7 +88,15 @@ public class RuntimeSandboxSimulator {
         installTracingAgent(options, projectClassIndex);
 
         RuntimeTraceCollector collector = new RuntimeTraceCollector(options.maxCalls);
+        RuntimeTypeSnapshotCollector typeCollector = new RuntimeTypeSnapshotCollector(options.debugRuntime);
+        RuntimeExecutionSnapshotCollector executionCollector = new RuntimeExecutionSnapshotCollector(
+                options.maxRuntimeEvents,
+                options.maxRuntimeObjects,
+                options.debugRuntime
+        );
         ACTIVE_COLLECTOR = collector;
+        ACTIVE_TYPE_COLLECTOR = typeCollector;
+        ACTIVE_EXECUTION_COLLECTOR = executionCollector;
 
         RuntimeTraceReport report = new RuntimeTraceReport();
         report.generatedAt = Instant.now().toString();
@@ -153,7 +164,22 @@ public class RuntimeSandboxSimulator {
             report.durationMs = System.currentTimeMillis() - startedAt;
             report.loadedProjectClasses = classLoader.snapshotLoadedProjectClasses();
             report.skippedProjectClasses = classLoader.snapshotFailedProjectClasses();
+            report.pipelineTypeInfos = typeCollector.snapshotPipelineTypeInfos(500);
+            report.pipelineObservationCount = typeCollector.getObservationCount();
+            report.runtimeEventCount = executionCollector.getEventCount();
+            report.runtimeDroppedEvents = executionCollector.getDroppedEventCount();
+            report.runtimeObjectCount = executionCollector.getObjectCount();
+            report.runtimeEvents = executionCollector.snapshotEvents(options.maxRuntimeEvents);
+            report.runtimeObjects = executionCollector.snapshotObjects(options.maxRuntimeObjects);
+            if (beanFactory != null) {
+                report.sandboxBeanTypeInfos = beanFactory.snapshotBeanTypeInfos(500);
+            }
+            if (springRuntime != null) {
+                report.springBeanTypeInfos = springRuntime.snapshotBeanTypeInfos(500);
+            }
             ACTIVE_COLLECTOR = null;
+            ACTIVE_TYPE_COLLECTOR = null;
+            ACTIVE_EXECUTION_COLLECTOR = null;
             if (springRuntime != null) {
                 springRuntime.close();
             }
@@ -162,15 +188,27 @@ public class RuntimeSandboxSimulator {
 
         Path jsonPath = options.outputDir.resolve("runtime-trace.json");
         Path treePath = options.outputDir.resolve("runtime-trace-tree.txt");
+        Path typesPath = options.outputDir.resolve("runtime-types.txt");
+        Path executionPath = options.outputDir.resolve("runtime-execution.txt");
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         mapper.writeValue(jsonPath.toFile(), report);
         Files.write(treePath, buildTraceTree(report).getBytes(StandardCharsets.UTF_8));
+        Files.write(typesPath, buildRuntimeTypeSummary(report).getBytes(StandardCharsets.UTF_8));
+        Files.write(executionPath, buildRuntimeExecutionSummary(report).getBytes(StandardCharsets.UTF_8));
 
         System.out.println("Runtime sandbox finished.");
         System.out.println("Trace JSON: " + jsonPath.toAbsolutePath());
         System.out.println("Trace tree: " + treePath.toAbsolutePath());
+        System.out.println("Type info:  " + typesPath.toAbsolutePath());
+        System.out.println("Exec info:  " + executionPath.toAbsolutePath());
         System.out.println("Calls:      " + report.callCount);
         System.out.println("Edges:      " + report.edges.size());
+        System.out.println("Pipelines:  " + report.pipelineTypeInfos.size());
+        System.out.println("BeanTypes:  " + (report.sandboxBeanTypeInfos == null ? 0 : report.sandboxBeanTypeInfos.size())
+                + "/" + (report.springBeanTypeInfos == null ? 0 : report.springBeanTypeInfos.size()));
+        System.out.println("RuntimeEvt: " + report.runtimeEventCount
+                + " (dropped=" + report.runtimeDroppedEvents + ")");
+        System.out.println("RuntimeObj: " + report.runtimeObjectCount);
         System.out.println("AdviceHits: " + ADVICE_HITS.get());
         System.out.println("NullCollect:" + NULL_COLLECTOR_HITS.get());
         if (LAST_INSTRUMENTATION_STATS != null) {
@@ -936,6 +974,188 @@ public class RuntimeSandboxSimulator {
         return sb.toString();
     }
 
+    private static String buildRuntimeTypeSummary(RuntimeTraceReport report) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Runtime Type Summary\n");
+        sb.append("Entry: ").append(report.entryClass).append("#").append(report.entryMethod).append("\n");
+        sb.append("Calls=").append(report.callCount).append(", Edges=")
+                .append(report.edges == null ? 0 : report.edges.size()).append("\n\n");
+
+        List<RuntimeBeanTypeInfo> sandboxBeans = report.sandboxBeanTypeInfos == null
+                ? Collections.<RuntimeBeanTypeInfo>emptyList() : report.sandboxBeanTypeInfos;
+        List<RuntimeBeanTypeInfo> springBeans = report.springBeanTypeInfos == null
+                ? Collections.<RuntimeBeanTypeInfo>emptyList() : report.springBeanTypeInfos;
+        sb.append("Sandbox Bean Types: ").append(sandboxBeans.size()).append("\n");
+        for (RuntimeBeanTypeInfo bean : sandboxBeans) {
+            sb.append("- ").append(bean.beanName).append(" -> ").append(bean.concreteClass)
+                    .append(" [instantiated=").append(bean.instantiated).append("]\n");
+        }
+        sb.append("\nSpring Bean Types: ").append(springBeans.size()).append("\n");
+        for (RuntimeBeanTypeInfo bean : springBeans) {
+            sb.append("- ").append(bean.beanName).append(" -> ").append(bean.concreteClass)
+                    .append(" [instantiated=").append(bean.instantiated).append("]\n");
+        }
+
+        List<RuntimePipelineTypeInfo> pipelineInfos = report.pipelineTypeInfos == null
+                ? Collections.<RuntimePipelineTypeInfo>emptyList() : report.pipelineTypeInfos;
+        sb.append("\nPipeline Types: ").append(pipelineInfos.size()).append("\n");
+        for (RuntimePipelineTypeInfo pipeline : pipelineInfos) {
+            sb.append("- ").append(pipeline.className).append("@").append(pipeline.instanceId)
+                    .append(" methods=").append(pipeline.observedMethods)
+                    .append(" stages=").append(pipeline.stageTypes).append("\n");
+            if (!isBlank(pipeline.producedBy)) {
+                sb.append("  producedBy=").append(pipeline.producedBy).append("\n");
+            }
+            if (!isBlank(pipeline.lastError)) {
+                sb.append("  lastError=").append(pipeline.lastError).append("\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String buildRuntimeExecutionSummary(RuntimeTraceReport report) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Runtime Execution Summary\n");
+        sb.append("Entry: ").append(report.entryClass).append("#").append(report.entryMethod).append("\n");
+        sb.append("Events=").append(report.runtimeEventCount)
+                .append(", Dropped=").append(report.runtimeDroppedEvents)
+                .append(", Objects=").append(report.runtimeObjectCount).append("\n\n");
+
+        List<RuntimeExecutionEvent> events = report.runtimeEvents == null
+                ? Collections.<RuntimeExecutionEvent>emptyList() : report.runtimeEvents;
+        sb.append("Events:\n");
+        for (RuntimeExecutionEvent event : events) {
+            sb.append("#").append(event.seq)
+                    .append(" ").append(event.eventType)
+                    .append(" ").append(event.methodId)
+                    .append(" thread=").append(event.threadName)
+                    .append(" depth=").append(event.stackDepth);
+            if (!isBlank(event.parentMethodId)) {
+                sb.append(" parent=").append(event.parentMethodId);
+            }
+            sb.append("\n");
+            if (event.receiver != null && !isBlank(event.receiver.typeName)) {
+                sb.append("  this=").append(event.receiver.typeName)
+                        .append("@").append(event.receiver.identityId).append("\n");
+            }
+            if (event.receiverFields != null && !event.receiverFields.isEmpty()) {
+                sb.append("  thisFields=").append(formatRuntimeFieldValues(event.receiverFields)).append("\n");
+            }
+            if (event.receiverFieldChanges != null && !event.receiverFieldChanges.isEmpty()) {
+                sb.append("  thisFieldChanges=").append(formatRuntimeFieldChanges(event.receiverFieldChanges)).append("\n");
+            }
+            if (event.arguments != null && !event.arguments.isEmpty()) {
+                sb.append("  args=");
+                List<String> values = new ArrayList<String>();
+                for (RuntimeValueInfo arg : event.arguments) {
+                    values.add(arg == null ? "null" : arg.typeName + "@" + arg.identityId);
+                }
+                sb.append(values).append("\n");
+            }
+            if (event.returnValue != null && !isBlank(event.returnValue.typeName)) {
+                sb.append("  return=").append(event.returnValue.typeName)
+                        .append("@").append(event.returnValue.identityId).append("\n");
+            }
+            if (!isBlank(event.thrown)) {
+                sb.append("  thrown=").append(event.thrown).append("\n");
+            }
+        }
+
+        List<RuntimeObjectSnapshot> objects = report.runtimeObjects == null
+                ? Collections.<RuntimeObjectSnapshot>emptyList() : report.runtimeObjects;
+        sb.append("\nObjects:\n");
+        for (RuntimeObjectSnapshot object : objects) {
+            sb.append("- ").append(object.typeName).append("@").append(object.identityId).append("\n");
+            if (object.interfaceTypes != null && !object.interfaceTypes.isEmpty()) {
+                sb.append("  interfaces=").append(object.interfaceTypes).append("\n");
+            }
+            if (object.fieldRuntimeTypes != null && !object.fieldRuntimeTypes.isEmpty()) {
+                sb.append("  fields=").append(object.fieldRuntimeTypes).append("\n");
+            }
+            if (object.fieldValueSummary != null && !object.fieldValueSummary.isEmpty()) {
+                sb.append("  fieldValues=").append(object.fieldValueSummary).append("\n");
+            }
+            if (object.collectionElementTypes != null && !object.collectionElementTypes.isEmpty()) {
+                sb.append("  elements=").append(object.collectionElementTypes).append("\n");
+            }
+            if (object.mapKeyTypes != null && !object.mapKeyTypes.isEmpty()) {
+                sb.append("  mapKeys=").append(object.mapKeyTypes).append("\n");
+            }
+            if (object.mapValueTypes != null && !object.mapValueTypes.isEmpty()) {
+                sb.append("  mapValues=").append(object.mapValueTypes).append("\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    private static List<String> formatRuntimeFieldValues(List<RuntimeFieldValue> fields) {
+        if (fields == null || fields.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> out = new ArrayList<String>();
+        for (RuntimeFieldValue field : fields) {
+            if (field == null) {
+                continue;
+            }
+            String value = "null";
+            if (field.value != null) {
+                if (!isBlank(field.value.simpleValue)) {
+                    value = field.value.typeName + ":" + field.value.simpleValue;
+                } else {
+                    value = field.value.typeName + "@" + field.value.identityId;
+                }
+            }
+            out.add(field.ownerType + "." + field.fieldName + "=" + value);
+        }
+        return out;
+    }
+
+    private static List<String> formatRuntimeFieldChanges(List<RuntimeFieldChange> changes) {
+        if (changes == null || changes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> out = new ArrayList<String>();
+        for (RuntimeFieldChange change : changes) {
+            if (change == null) {
+                continue;
+            }
+            out.add(change.ownerType + "." + change.fieldName + ": "
+                    + change.before + " -> " + change.after);
+        }
+        return out;
+    }
+
+    private static List<String> collectAssignableTypeNames(Class<?> type) {
+        if (type == null) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> ordered = new LinkedHashSet<String>();
+        Deque<Class<?>> queue = new ArrayDeque<Class<?>>();
+        queue.add(type);
+        while (!queue.isEmpty()) {
+            Class<?> current = queue.removeFirst();
+            if (current == null) {
+                continue;
+            }
+            if (!ordered.add(current.getName())) {
+                continue;
+            }
+            Class<?> superClass = current.getSuperclass();
+            if (superClass != null && superClass != Object.class) {
+                queue.add(superClass);
+            }
+            Class<?>[] interfaces = current.getInterfaces();
+            if (interfaces != null) {
+                for (Class<?> iface : interfaces) {
+                    if (iface != null) {
+                        queue.add(iface);
+                    }
+                }
+            }
+        }
+        return new ArrayList<String>(ordered);
+    }
+
     private static void appendTree(StringBuilder sb,
                                    String current,
                                    Map<String, List<RuntimeEdge>> outgoing,
@@ -1169,6 +1389,46 @@ public class RuntimeSandboxSimulator {
             return values;
         }
 
+        public List<RuntimeBeanTypeInfo> snapshotBeanTypeInfos(int limit) {
+            if (context == null) {
+                return Collections.emptyList();
+            }
+            List<RuntimeBeanTypeInfo> result = new ArrayList<RuntimeBeanTypeInfo>();
+            String[] names = context.getBeanDefinitionNames();
+            if (names == null || names.length == 0) {
+                return result;
+            }
+            List<String> sorted = new ArrayList<String>(Arrays.asList(names));
+            Collections.sort(sorted);
+            for (String beanName : sorted) {
+                if (limit > 0 && result.size() >= limit) {
+                    break;
+                }
+                if (isBlank(beanName)) {
+                    continue;
+                }
+                try {
+                    Class<?> type = context.getType(beanName);
+                    if (type == null) {
+                        continue;
+                    }
+                    RuntimeBeanTypeInfo info = new RuntimeBeanTypeInfo();
+                    info.source = "SpringContext";
+                    info.beanName = beanName;
+                    info.concreteClass = type.getName();
+                    info.assignableTypes = collectAssignableTypeNames(type);
+                    info.instantiated = context.getBeanFactory().containsSingleton(beanName);
+                    result.add(info);
+                } catch (Throwable error) {
+                    if (debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_BEAN_TYPE_SKIP bean=" + beanName
+                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    }
+                }
+            }
+            return result;
+        }
+
         public void close() {
             if (context != null) {
                 context.close();
@@ -1184,27 +1444,925 @@ public class RuntimeSandboxSimulator {
     public static class TraceAdvice {
         @Advice.OnMethodEnter(suppress = Throwable.class)
         public static String onEnter(@Advice.Origin("#t") String typeName,
-                                     @Advice.Origin("#m") String methodName) {
+                                     @Advice.Origin("#m") String methodName,
+                                     @Advice.This(optional = true) Object self,
+                                     @Advice.AllArguments Object[] args) {
             ADVICE_HITS.incrementAndGet();
             RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
+            RuntimeTypeSnapshotCollector typeCollector = ACTIVE_TYPE_COLLECTOR;
+            RuntimeExecutionSnapshotCollector executionCollector = ACTIVE_EXECUTION_COLLECTOR;
             String methodId = (typeName == null ? "unknown" : typeName)
                     + "#"
                     + (methodName == null ? "unknown" : methodName);
             if (collector == null || methodId == null) {
                 NULL_COLLECTOR_HITS.incrementAndGet();
+                if (typeCollector != null) {
+                    typeCollector.onMethodEnter(typeName, methodName, self, args);
+                }
+                if (executionCollector != null) {
+                    executionCollector.onMethodEnter(typeName, methodName, self, args);
+                }
                 return null;
             }
             collector.onEnter(methodId);
+            if (typeCollector != null) {
+                typeCollector.onMethodEnter(typeName, methodName, self, args);
+            }
+            if (executionCollector != null) {
+                executionCollector.onMethodEnter(typeName, methodName, self, args);
+            }
             return methodId;
         }
 
         @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
-        public static void onExit(@Advice.Enter String methodId) {
+        public static void onExit(@Advice.Enter String methodId,
+                                  @Advice.Origin("#t") String typeName,
+                                  @Advice.Origin("#m") String methodName,
+                                  @Advice.This(optional = true) Object self,
+                                  @Advice.AllArguments Object[] args,
+                                  @Advice.Thrown Throwable thrown) {
             RuntimeTraceCollector collector = ACTIVE_COLLECTOR;
+            RuntimeTypeSnapshotCollector typeCollector = ACTIVE_TYPE_COLLECTOR;
+            RuntimeExecutionSnapshotCollector executionCollector = ACTIVE_EXECUTION_COLLECTOR;
             if (collector == null || methodId == null) {
+                if (typeCollector != null) {
+                    typeCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+                }
+                if (executionCollector != null) {
+                    executionCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+                }
                 return;
             }
             collector.onExit(methodId);
+            if (typeCollector != null) {
+                typeCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+            }
+            if (executionCollector != null) {
+                executionCollector.onMethodExit(typeName, methodName, self, args, null, thrown);
+            }
+        }
+    }
+
+    public static class RuntimeTypeSnapshotCollector {
+        private static final Set<String> PIPELINE_METHOD_HINTS = new LinkedHashSet<String>(
+                Arrays.asList("pipeline", "builder", "chain", "stage", "handler", "flow")
+        );
+        private static final Set<String> PIPELINE_ASSEMBLY_METHODS = new LinkedHashSet<String>(
+                Arrays.asList("add", "append", "register", "link", "then", "stage",
+                        "addstage", "addhandler", "addstep", "push", "attach")
+        );
+        private static final Set<String> PIPELINE_BUILD_METHODS = new LinkedHashSet<String>(
+                Arrays.asList("build", "create", "compose", "assemble")
+        );
+        private static final Set<String> STAGE_TYPE_HINTS = new LinkedHashSet<String>(
+                Arrays.asList("stage", "handler", "step", "processor", "filter", "observer",
+                        "visitor", "node", "task", "action")
+        );
+        private static final Set<String> STAGE_FIELD_HINTS = new LinkedHashSet<String>(
+                Arrays.asList("stage", "handler", "step", "chain", "pipeline", "node", "filter")
+        );
+
+        private final boolean debugRuntime;
+        private final Map<Integer, PipelineState> pipelineStates = new ConcurrentHashMap<Integer, PipelineState>();
+        private final AtomicInteger observationCount = new AtomicInteger(0);
+
+        public RuntimeTypeSnapshotCollector(boolean debugRuntime) {
+            this.debugRuntime = debugRuntime;
+        }
+
+        public int getObservationCount() {
+            return observationCount.get();
+        }
+
+        public void onMethodEnter(String typeName,
+                                  String methodName,
+                                  Object self,
+                                  Object[] args) {
+            if (!shouldObserve(typeName, methodName, self, args)) {
+                return;
+            }
+            observationCount.incrementAndGet();
+            String normalizedMethod = normalizeMethodName(methodName);
+            String displayMethod = safeMethodName(methodName);
+            if (self != null) {
+                PipelineState selfState = getOrCreateState(self);
+                selfState.observedMethods.add(displayMethod);
+                selfState.evidence.add("enter:" + safeType(typeName) + "#" + displayMethod);
+                if (isAssemblyMethod(normalizedMethod)) {
+                    captureStageArgs(args, selfState, "arg");
+                }
+                captureContainerTypes(self, selfState, "self");
+            }
+            if (args != null) {
+                for (Object arg : args) {
+                    if (arg == null || !isPipelineLike(arg.getClass().getName())) {
+                        continue;
+                    }
+                    PipelineState argState = getOrCreateState(arg);
+                    argState.observedMethods.add("(as-arg)");
+                    captureContainerTypes(arg, argState, "arg-pipeline");
+                }
+            }
+        }
+
+        public void onMethodExit(String typeName,
+                                 String methodName,
+                                 Object self,
+                                 Object[] args,
+                                 Object returned,
+                                 Throwable thrown) {
+            if (!shouldObserve(typeName, methodName, self, args) && returned == null && thrown == null) {
+                return;
+            }
+            String normalizedMethod = normalizeMethodName(methodName);
+            String displayMethod = safeMethodName(methodName);
+            PipelineState selfState = null;
+            if (self != null && isPipelineLike(self.getClass().getName())) {
+                selfState = getOrCreateState(self);
+                selfState.observedMethods.add(displayMethod);
+                captureContainerTypes(self, selfState, "self-exit");
+                if (thrown != null) {
+                    selfState.lastError = thrown.getClass().getName() + ": " + thrown.getMessage();
+                }
+            }
+            if (returned != null
+                    && (isPipelineLike(returned.getClass().getName()) || isBuildMethod(normalizedMethod))) {
+                PipelineState returnedState = getOrCreateState(returned);
+                returnedState.observedMethods.add("return@" + displayMethod);
+                returnedState.producedBy = safeType(typeName) + "#" + displayMethod;
+                if (selfState != null && !selfState.stageTypes.isEmpty()) {
+                    returnedState.stageTypes.addAll(selfState.stageTypes);
+                    returnedState.evidence.add("copy-from:" + selfState.className + "@" + selfState.instanceId);
+                }
+                captureContainerTypes(returned, returnedState, "return");
+            }
+        }
+
+        public List<RuntimePipelineTypeInfo> snapshotPipelineTypeInfos(int limit) {
+            List<PipelineState> states = new ArrayList<PipelineState>(pipelineStates.values());
+            states.sort(Comparator
+                    .comparing((PipelineState s) -> s.className)
+                    .thenComparingInt(s -> s.instanceId));
+            List<RuntimePipelineTypeInfo> result = new ArrayList<RuntimePipelineTypeInfo>();
+            for (PipelineState state : states) {
+                if (state == null) {
+                    continue;
+                }
+                if (state.stageTypes.isEmpty()
+                        && state.observedMethods.isEmpty()
+                        && isBlank(state.producedBy)
+                        && isBlank(state.lastError)) {
+                    continue;
+                }
+                if (limit > 0 && result.size() >= limit) {
+                    break;
+                }
+                RuntimePipelineTypeInfo info = new RuntimePipelineTypeInfo();
+                info.instanceId = state.instanceId;
+                info.className = state.className;
+                info.producedBy = state.producedBy;
+                info.lastError = state.lastError;
+                info.observedMethods = new ArrayList<String>(state.observedMethods);
+                info.stageTypes = new ArrayList<String>(state.stageTypes);
+                info.evidence = new ArrayList<String>(state.evidence);
+                result.add(info);
+            }
+            return result;
+        }
+
+        private PipelineState getOrCreateState(Object value) {
+            int instanceId = System.identityHashCode(value);
+            PipelineState state = pipelineStates.get(instanceId);
+            if (state != null) {
+                return state;
+            }
+            PipelineState created = new PipelineState(instanceId, value.getClass().getName());
+            PipelineState existing = pipelineStates.putIfAbsent(instanceId, created);
+            return existing == null ? created : existing;
+        }
+
+        private boolean shouldObserve(String typeName, String methodName, Object self, Object[] args) {
+            String normalizedMethod = normalizeMethodName(methodName);
+            if (isPipelineMethodHint(normalizedMethod) || isAssemblyMethod(normalizedMethod) || isBuildMethod(normalizedMethod)) {
+                return true;
+            }
+            if (self != null && isPipelineLike(self.getClass().getName())) {
+                return true;
+            }
+            if (isPipelineLike(typeName)) {
+                return true;
+            }
+            if (args != null) {
+                for (Object arg : args) {
+                    if (arg != null && isPipelineLike(arg.getClass().getName())) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private void captureStageArgs(Object[] args, PipelineState state, String source) {
+            if (args == null || state == null) {
+                return;
+            }
+            for (Object arg : args) {
+                if (arg == null) {
+                    continue;
+                }
+                String typeName = arg.getClass().getName();
+                if (isSimpleType(arg.getClass())) {
+                    continue;
+                }
+                if (isLikelyStageType(typeName) || !isPipelineLike(typeName)) {
+                    state.stageTypes.add(typeName);
+                    state.evidence.add(source + ":" + typeName);
+                }
+            }
+        }
+
+        private void captureContainerTypes(Object target, PipelineState state, String source) {
+            if (target == null || state == null) {
+                return;
+            }
+            Class<?> current = target.getClass();
+            int depth = 0;
+            while (current != null && current != Object.class && depth < 8) {
+                Field[] fields = current.getDeclaredFields();
+                for (Field field : fields) {
+                    if (field == null || Modifier.isStatic(field.getModifiers())) {
+                        continue;
+                    }
+                    field.setAccessible(true);
+                    Object fieldValue;
+                    try {
+                        fieldValue = field.get(target);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    if (fieldValue == null) {
+                        continue;
+                    }
+                    String fieldName = field.getName() == null ? "" : field.getName().toLowerCase(Locale.ROOT);
+                    if (fieldValue instanceof Collection) {
+                        captureFromCollection((Collection<?>) fieldValue, state, source + ":field=" + fieldName);
+                        continue;
+                    }
+                    if (fieldValue instanceof Map) {
+                        captureFromCollection(((Map<?, ?>) fieldValue).values(), state, source + ":field=" + fieldName);
+                        continue;
+                    }
+                    if (fieldValue.getClass().isArray()) {
+                        int len = Array.getLength(fieldValue);
+                        int upper = Math.min(len, 40);
+                        for (int i = 0; i < upper; i++) {
+                            Object element = Array.get(fieldValue, i);
+                            captureStageValue(element, state, source + ":field=" + fieldName);
+                        }
+                        continue;
+                    }
+                    if (containsAny(fieldName, STAGE_FIELD_HINTS)) {
+                        captureStageValue(fieldValue, state, source + ":field=" + fieldName);
+                    }
+                }
+                current = current.getSuperclass();
+                depth++;
+            }
+        }
+
+        private void captureFromCollection(Collection<?> collection, PipelineState state, String source) {
+            if (collection == null || state == null) {
+                return;
+            }
+            int index = 0;
+            for (Object item : collection) {
+                if (index++ > 40) {
+                    break;
+                }
+                captureStageValue(item, state, source);
+            }
+        }
+
+        private void captureStageValue(Object value, PipelineState state, String source) {
+            if (value == null || state == null) {
+                return;
+            }
+            Class<?> valueType = value.getClass();
+            if (isSimpleType(valueType)) {
+                return;
+            }
+            String typeName = valueType.getName();
+            if (isLikelyStageType(typeName) || !isPipelineLike(typeName)) {
+                state.stageTypes.add(typeName);
+                state.evidence.add(source + ":" + typeName);
+            }
+        }
+
+        private boolean isPipelineMethodHint(String methodName) {
+            if (isBlank(methodName)) {
+                return false;
+            }
+            String normalized = methodName.toLowerCase(Locale.ROOT);
+            return containsAny(normalized, PIPELINE_METHOD_HINTS);
+        }
+
+        private boolean isAssemblyMethod(String methodName) {
+            if (isBlank(methodName)) {
+                return false;
+            }
+            return PIPELINE_ASSEMBLY_METHODS.contains(methodName.toLowerCase(Locale.ROOT));
+        }
+
+        private boolean isBuildMethod(String methodName) {
+            if (isBlank(methodName)) {
+                return false;
+            }
+            return PIPELINE_BUILD_METHODS.contains(methodName.toLowerCase(Locale.ROOT));
+        }
+
+        private boolean isPipelineLike(String typeName) {
+            if (isBlank(typeName)) {
+                return false;
+            }
+            String normalized = typeName.toLowerCase(Locale.ROOT);
+            return containsAny(normalized, PIPELINE_METHOD_HINTS);
+        }
+
+        private boolean isLikelyStageType(String typeName) {
+            if (isBlank(typeName)) {
+                return false;
+            }
+            String normalized = typeName.toLowerCase(Locale.ROOT);
+            return containsAny(normalized, STAGE_TYPE_HINTS);
+        }
+
+        private boolean containsAny(String text, Set<String> tokens) {
+            if (isBlank(text) || tokens == null || tokens.isEmpty()) {
+                return false;
+            }
+            for (String token : tokens) {
+                if (text.contains(token)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private String safeType(String value) {
+            return value == null ? "unknown" : value;
+        }
+
+        private String normalizeMethodName(String methodName) {
+            if (methodName == null) {
+                return "unknown";
+            }
+            return methodName.trim().toLowerCase(Locale.ROOT);
+        }
+
+        private String safeMethodName(String methodName) {
+            if (isBlank(methodName)) {
+                return "unknown";
+            }
+            return methodName.trim();
+        }
+
+        private static class PipelineState {
+            private final int instanceId;
+            private final String className;
+            private final Set<String> observedMethods = new LinkedHashSet<String>();
+            private final Set<String> stageTypes = new LinkedHashSet<String>();
+            private final List<String> evidence = new ArrayList<String>();
+            private String producedBy;
+            private String lastError;
+
+            private PipelineState(int instanceId, String className) {
+                this.instanceId = instanceId;
+                this.className = className;
+            }
+        }
+    }
+
+    public static class RuntimeExecutionSnapshotCollector {
+        private static final int MAX_COLLECTION_SAMPLE = 24;
+        private static final int MAX_OBJECT_FIELD_SCAN = 48;
+        private static final int MAX_OBJECT_HIERARCHY_DEPTH = 6;
+        private static final int MAX_EVENT_FIELD_CAPTURE = 40;
+        private static final int MAX_STRING_LENGTH = 220;
+
+        private final int maxEvents;
+        private final int maxObjects;
+        private final boolean debugRuntime;
+        private final AtomicInteger eventSeq = new AtomicInteger(0);
+        private final AtomicInteger droppedEvents = new AtomicInteger(0);
+        private final AtomicInteger storedEvents = new AtomicInteger(0);
+        private final ConcurrentLinkedQueue<RuntimeExecutionEvent> events =
+                new ConcurrentLinkedQueue<RuntimeExecutionEvent>();
+        private final Map<Integer, RuntimeObjectSnapshot> objects =
+                new ConcurrentHashMap<Integer, RuntimeObjectSnapshot>();
+        private final ThreadLocal<Deque<String>> stackByThread =
+                new ThreadLocal<Deque<String>>() {
+                    @Override
+                    protected Deque<String> initialValue() {
+                        return new ArrayDeque<String>();
+                    }
+                };
+        private final ThreadLocal<Deque<FrameState>> frameByThread =
+                new ThreadLocal<Deque<FrameState>>() {
+                    @Override
+                    protected Deque<FrameState> initialValue() {
+                        return new ArrayDeque<FrameState>();
+                    }
+                };
+
+        public RuntimeExecutionSnapshotCollector(int maxEvents, int maxObjects, boolean debugRuntime) {
+            this.maxEvents = Math.max(maxEvents, 2000);
+            this.maxObjects = Math.max(maxObjects, 1000);
+            this.debugRuntime = debugRuntime;
+        }
+
+        public void onMethodEnter(String typeName, String methodName, Object self, Object[] args) {
+            String methodId = methodId(typeName, methodName);
+            Deque<String> stack = stackByThread.get();
+            String parent = stack.peekLast();
+            stack.addLast(methodId);
+            Deque<FrameState> frameStack = frameByThread.get();
+            frameStack.addLast(FrameState.forEnter(methodId, self, snapshotInstanceFieldSummaryMap(self)));
+
+            RuntimeExecutionEvent event = new RuntimeExecutionEvent();
+            event.seq = eventSeq.incrementAndGet();
+            event.eventType = "ENTER";
+            event.timestampMs = System.currentTimeMillis();
+            event.threadId = Thread.currentThread().getId();
+            event.threadName = Thread.currentThread().getName();
+            event.methodId = methodId;
+            event.parentMethodId = parent;
+            event.stackDepth = stack.size();
+            event.receiver = summarizeValue("this", self, true);
+            event.receiverFields = snapshotInstanceFieldValues(self);
+            event.arguments = summarizeArguments(args);
+            appendEvent(event);
+        }
+
+        public void onMethodExit(String typeName,
+                                 String methodName,
+                                 Object self,
+                                 Object[] args,
+                                 Object returned,
+                                 Throwable thrown) {
+            String methodId = methodId(typeName, methodName);
+            Deque<String> stack = stackByThread.get();
+            Deque<FrameState> frameStack = frameByThread.get();
+            FrameState frameState = popFrameState(frameStack, methodId);
+            if (!stack.isEmpty()) {
+                if (methodId.equals(stack.peekLast())) {
+                    stack.removeLast();
+                } else {
+                    while (!stack.isEmpty()) {
+                        String popped = stack.removeLast();
+                        if (methodId.equals(popped)) {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            RuntimeExecutionEvent event = new RuntimeExecutionEvent();
+            event.seq = eventSeq.incrementAndGet();
+            event.eventType = "EXIT";
+            event.timestampMs = System.currentTimeMillis();
+            event.threadId = Thread.currentThread().getId();
+            event.threadName = Thread.currentThread().getName();
+            event.methodId = methodId;
+            event.parentMethodId = stack.peekLast();
+            event.stackDepth = stack.size();
+            event.receiver = summarizeValue("this", self, true);
+            event.receiverFields = snapshotInstanceFieldValues(self);
+            event.receiverFieldChanges = computeFieldChanges(frameState, self);
+            event.arguments = summarizeArguments(args);
+            if (returned != null) {
+                event.returnValue = summarizeValue("return", returned, true);
+            }
+            if (thrown != null) {
+                event.thrown = thrown.getClass().getName() + ": " + thrown.getMessage();
+            }
+            appendEvent(event);
+        }
+
+        public int getEventCount() {
+            return eventSeq.get();
+        }
+
+        public int getDroppedEventCount() {
+            return droppedEvents.get();
+        }
+
+        public int getObjectCount() {
+            return objects.size();
+        }
+
+        public List<RuntimeExecutionEvent> snapshotEvents(int limit) {
+            List<RuntimeExecutionEvent> result = new ArrayList<RuntimeExecutionEvent>();
+            int max = limit <= 0 ? maxEvents : Math.min(limit, maxEvents);
+            int count = 0;
+            for (RuntimeExecutionEvent event : events) {
+                result.add(event);
+                count++;
+                if (count >= max) {
+                    break;
+                }
+            }
+            return result;
+        }
+
+        public List<RuntimeObjectSnapshot> snapshotObjects(int limit) {
+            List<RuntimeObjectSnapshot> list = new ArrayList<RuntimeObjectSnapshot>();
+            list.addAll(objects.values());
+            list.sort(Comparator.comparing((RuntimeObjectSnapshot s) -> s.typeName)
+                    .thenComparingInt(s -> s.identityId));
+            if (limit > 0 && list.size() > limit) {
+                return new ArrayList<RuntimeObjectSnapshot>(list.subList(0, limit));
+            }
+            return list;
+        }
+
+        private void appendEvent(RuntimeExecutionEvent event) {
+            if (event == null) {
+                return;
+            }
+            if (storedEvents.get() >= maxEvents) {
+                droppedEvents.incrementAndGet();
+                return;
+            }
+            events.add(event);
+            storedEvents.incrementAndGet();
+        }
+
+        private FrameState popFrameState(Deque<FrameState> frameStack, String methodId) {
+            if (frameStack == null || frameStack.isEmpty()) {
+                return null;
+            }
+            FrameState last = frameStack.peekLast();
+            if (last != null && methodId.equals(last.methodId)) {
+                return frameStack.removeLast();
+            }
+            while (!frameStack.isEmpty()) {
+                FrameState candidate = frameStack.removeLast();
+                if (methodId.equals(candidate.methodId)) {
+                    return candidate;
+                }
+            }
+            return null;
+        }
+
+        private List<RuntimeFieldValue> snapshotInstanceFieldValues(Object target) {
+            if (target == null) {
+                return Collections.emptyList();
+            }
+            List<RuntimeFieldValue> result = new ArrayList<RuntimeFieldValue>();
+            int scanned = 0;
+            int depth = 0;
+            Class<?> current = target.getClass();
+            while (current != null && current != Object.class && depth < MAX_OBJECT_HIERARCHY_DEPTH) {
+                Field[] fields = current.getDeclaredFields();
+                for (Field field : fields) {
+                    if (field == null || Modifier.isStatic(field.getModifiers())) {
+                        continue;
+                    }
+                    if (scanned++ >= MAX_EVENT_FIELD_CAPTURE) {
+                        break;
+                    }
+                    field.setAccessible(true);
+                    Object fieldValue;
+                    try {
+                        fieldValue = field.get(target);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    RuntimeFieldValue item = new RuntimeFieldValue();
+                    item.ownerType = current.getName();
+                    item.fieldName = field.getName();
+                    item.value = summarizeValue("field", fieldValue, true);
+                    result.add(item);
+                }
+                if (scanned >= MAX_EVENT_FIELD_CAPTURE) {
+                    break;
+                }
+                current = current.getSuperclass();
+                depth++;
+            }
+            result.sort(Comparator.comparing((RuntimeFieldValue f) -> f.ownerType)
+                    .thenComparing(f -> f.fieldName));
+            return result;
+        }
+
+        private Map<String, String> snapshotInstanceFieldSummaryMap(Object target) {
+            if (target == null) {
+                return Collections.emptyMap();
+            }
+            Map<String, String> summary = new LinkedHashMap<String, String>();
+            for (RuntimeFieldValue value : snapshotInstanceFieldValues(target)) {
+                if (value == null) {
+                    continue;
+                }
+                String key = value.ownerType + "." + value.fieldName;
+                summary.put(key, valueToSummary(value.value));
+            }
+            return summary;
+        }
+
+        private List<RuntimeFieldChange> computeFieldChanges(FrameState frameState, Object target) {
+            if (frameState == null || frameState.receiverIdentityId == 0 || target == null) {
+                return Collections.emptyList();
+            }
+            if (frameState.receiverIdentityId != System.identityHashCode(target)) {
+                return Collections.emptyList();
+            }
+            Map<String, String> before = frameState.receiverFieldSummary == null
+                    ? Collections.<String, String>emptyMap()
+                    : frameState.receiverFieldSummary;
+            Map<String, String> after = snapshotInstanceFieldSummaryMap(target);
+            if (before.isEmpty() && after.isEmpty()) {
+                return Collections.emptyList();
+            }
+            LinkedHashSet<String> keys = new LinkedHashSet<String>();
+            keys.addAll(before.keySet());
+            keys.addAll(after.keySet());
+            List<RuntimeFieldChange> changes = new ArrayList<RuntimeFieldChange>();
+            for (String key : keys) {
+                String b = before.get(key);
+                String a = after.get(key);
+                if ((b == null && a == null) || (b != null && b.equals(a))) {
+                    continue;
+                }
+                RuntimeFieldChange change = new RuntimeFieldChange();
+                int dot = key.lastIndexOf('.');
+                if (dot > 0) {
+                    change.ownerType = key.substring(0, dot);
+                    change.fieldName = key.substring(dot + 1);
+                } else {
+                    change.ownerType = "";
+                    change.fieldName = key;
+                }
+                change.before = b == null ? "(absent)" : b;
+                change.after = a == null ? "(absent)" : a;
+                changes.add(change);
+            }
+            return changes;
+        }
+
+        private String valueToSummary(RuntimeValueInfo value) {
+            if (value == null || isBlank(value.typeName) || "null".equals(value.typeName)) {
+                return "null";
+            }
+            if (!isBlank(value.simpleValue)) {
+                return value.typeName + ":" + value.simpleValue;
+            }
+            String base = value.typeName + "@" + value.identityId;
+            if (value.size > 0) {
+                return base + "(size=" + value.size + ")";
+            }
+            return base;
+        }
+
+        private List<RuntimeValueInfo> summarizeArguments(Object[] args) {
+            if (args == null || args.length == 0) {
+                return Collections.emptyList();
+            }
+            List<RuntimeValueInfo> values = new ArrayList<RuntimeValueInfo>();
+            for (Object arg : args) {
+                values.add(summarizeValue("arg", arg, true));
+            }
+            return values;
+        }
+
+        private RuntimeValueInfo summarizeValue(String kind, Object value, boolean captureObject) {
+            RuntimeValueInfo info = new RuntimeValueInfo();
+            info.kind = kind;
+            if (value == null) {
+                info.typeName = "null";
+                info.identityId = 0;
+                return info;
+            }
+            Class<?> type = value.getClass();
+            info.typeName = type.getName();
+            info.identityId = System.identityHashCode(value);
+            if (isSimpleType(type)) {
+                info.simpleValue = summarizeSimpleValue(value);
+                return info;
+            }
+            if (type.isArray()) {
+                int size = Array.getLength(value);
+                info.size = size;
+                info.elementTypes = sampleArrayElementTypes(value);
+            } else if (value instanceof Collection) {
+                Collection<?> collection = (Collection<?>) value;
+                info.size = collection.size();
+                info.elementTypes = sampleCollectionTypes(collection);
+            } else if (value instanceof Map) {
+                Map<?, ?> map = (Map<?, ?>) value;
+                info.size = map.size();
+                info.mapKeyTypes = sampleMapKeyTypes(map);
+                info.mapValueTypes = sampleMapValueTypes(map);
+            } else {
+                info.simpleValue = summarizeSimpleValue(value);
+            }
+            if (captureObject) {
+                captureObjectSnapshot(value);
+            }
+            return info;
+        }
+
+        private void captureObjectSnapshot(Object value) {
+            if (value == null) {
+                return;
+            }
+            Class<?> type = value.getClass();
+            if (isSimpleType(type)) {
+                return;
+            }
+            int identityId = System.identityHashCode(value);
+            if (objects.containsKey(identityId)) {
+                return;
+            }
+            if (objects.size() >= maxObjects) {
+                return;
+            }
+
+            RuntimeObjectSnapshot snapshot = new RuntimeObjectSnapshot();
+            snapshot.identityId = identityId;
+            snapshot.typeName = type.getName();
+            Class<?> superType = type.getSuperclass();
+            snapshot.superTypeName = superType == null ? null : superType.getName();
+            snapshot.interfaceTypes = new ArrayList<String>();
+            for (Class<?> iface : type.getInterfaces()) {
+                if (iface != null) {
+                    snapshot.interfaceTypes.add(iface.getName());
+                }
+            }
+            Collections.sort(snapshot.interfaceTypes);
+            snapshot.fieldRuntimeTypes = new LinkedHashMap<String, String>();
+            snapshot.fieldValueSummary = new LinkedHashMap<String, String>();
+            snapshot.collectionElementTypes = new ArrayList<String>();
+            snapshot.mapKeyTypes = new ArrayList<String>();
+            snapshot.mapValueTypes = new ArrayList<String>();
+
+            if (value instanceof Collection) {
+                snapshot.collectionElementTypes.addAll(sampleCollectionTypes((Collection<?>) value));
+            } else if (value instanceof Map) {
+                snapshot.mapKeyTypes.addAll(sampleMapKeyTypes((Map<?, ?>) value));
+                snapshot.mapValueTypes.addAll(sampleMapValueTypes((Map<?, ?>) value));
+            } else if (type.isArray()) {
+                snapshot.collectionElementTypes.addAll(sampleArrayElementTypes(value));
+            }
+
+            int scanned = 0;
+            int hierarchyDepth = 0;
+            Class<?> current = type;
+            while (current != null && current != Object.class && hierarchyDepth < MAX_OBJECT_HIERARCHY_DEPTH) {
+                Field[] fields = current.getDeclaredFields();
+                for (Field field : fields) {
+                    if (field == null || Modifier.isStatic(field.getModifiers())) {
+                        continue;
+                    }
+                    if (scanned >= MAX_OBJECT_FIELD_SCAN) {
+                        break;
+                    }
+                    scanned++;
+                    field.setAccessible(true);
+                    Object fieldValue;
+                    try {
+                        fieldValue = field.get(value);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    String fieldKey = current.getSimpleName() + "." + field.getName();
+                    RuntimeValueInfo fieldInfo = summarizeValue("field", fieldValue, true);
+                    snapshot.fieldValueSummary.put(fieldKey, valueToSummary(fieldInfo));
+                    if (fieldValue == null) {
+                        continue;
+                    }
+                    snapshot.fieldRuntimeTypes.put(
+                            fieldKey,
+                            fieldValue.getClass().getName()
+                    );
+                }
+                if (scanned >= MAX_OBJECT_FIELD_SCAN) {
+                    break;
+                }
+                current = current.getSuperclass();
+                hierarchyDepth++;
+            }
+
+            objects.put(identityId, snapshot);
+            if (debugRuntime) {
+                // lightweight marker, avoids flooding log with full object content
+                System.out.println("[RUNTIME_DEBUG] RUNTIME_OBJECT_SNAPSHOT type="
+                        + snapshot.typeName + " id=" + snapshot.identityId
+                        + " fields=" + snapshot.fieldRuntimeTypes.size());
+            }
+        }
+
+        private List<String> sampleArrayElementTypes(Object array) {
+            LinkedHashSet<String> types = new LinkedHashSet<String>();
+            int length = Array.getLength(array);
+            int upper = Math.min(length, MAX_COLLECTION_SAMPLE);
+            for (int i = 0; i < upper; i++) {
+                Object element = Array.get(array, i);
+                if (element != null) {
+                    types.add(element.getClass().getName());
+                    captureObjectSnapshot(element);
+                }
+            }
+            return new ArrayList<String>(types);
+        }
+
+        private List<String> sampleCollectionTypes(Collection<?> values) {
+            LinkedHashSet<String> types = new LinkedHashSet<String>();
+            int count = 0;
+            for (Object value : values) {
+                if (count++ >= MAX_COLLECTION_SAMPLE) {
+                    break;
+                }
+                if (value != null) {
+                    types.add(value.getClass().getName());
+                    captureObjectSnapshot(value);
+                }
+            }
+            return new ArrayList<String>(types);
+        }
+
+        private List<String> sampleMapKeyTypes(Map<?, ?> map) {
+            LinkedHashSet<String> types = new LinkedHashSet<String>();
+            int count = 0;
+            for (Object key : map.keySet()) {
+                if (count++ >= MAX_COLLECTION_SAMPLE) {
+                    break;
+                }
+                if (key != null) {
+                    types.add(key.getClass().getName());
+                    captureObjectSnapshot(key);
+                }
+            }
+            return new ArrayList<String>(types);
+        }
+
+        private List<String> sampleMapValueTypes(Map<?, ?> map) {
+            LinkedHashSet<String> types = new LinkedHashSet<String>();
+            int count = 0;
+            for (Object value : map.values()) {
+                if (count++ >= MAX_COLLECTION_SAMPLE) {
+                    break;
+                }
+                if (value != null) {
+                    types.add(value.getClass().getName());
+                    captureObjectSnapshot(value);
+                }
+            }
+            return new ArrayList<String>(types);
+        }
+
+        private String summarizeSimpleValue(Object value) {
+            if (value == null) {
+                return "null";
+            }
+            String raw;
+            try {
+                raw = String.valueOf(value);
+            } catch (Throwable error) {
+                raw = value.getClass().getName() + "(toString-error)";
+            }
+            if (raw == null) {
+                return "null";
+            }
+            if (raw.length() > MAX_STRING_LENGTH) {
+                return raw.substring(0, MAX_STRING_LENGTH) + "...";
+            }
+            return raw;
+        }
+
+        private String methodId(String typeName, String methodName) {
+            String t = isBlank(typeName) ? "unknown" : typeName;
+            String m = isBlank(methodName) ? "unknown" : methodName;
+            return t + "#" + m;
+        }
+
+        private static class FrameState {
+            private final String methodId;
+            private final int receiverIdentityId;
+            private final Map<String, String> receiverFieldSummary;
+
+            private FrameState(String methodId, int receiverIdentityId, Map<String, String> receiverFieldSummary) {
+                this.methodId = methodId;
+                this.receiverIdentityId = receiverIdentityId;
+                this.receiverFieldSummary = receiverFieldSummary == null
+                        ? Collections.<String, String>emptyMap()
+                        : new LinkedHashMap<String, String>(receiverFieldSummary);
+            }
+
+            private static FrameState forEnter(String methodId, Object self, Map<String, String> fieldSummary) {
+                int identity = self == null ? 0 : System.identityHashCode(self);
+                return new FrameState(methodId, identity, fieldSummary);
+            }
         }
     }
 
@@ -1306,6 +2464,86 @@ public class RuntimeSandboxSimulator {
         public boolean springContextActive;
         public int springBeanDefinitionCount;
         public List<String> springBeanDefinitions;
+        public List<RuntimeBeanTypeInfo> sandboxBeanTypeInfos;
+        public List<RuntimeBeanTypeInfo> springBeanTypeInfos;
+        public int pipelineObservationCount;
+        public List<RuntimePipelineTypeInfo> pipelineTypeInfos;
+        public int runtimeEventCount;
+        public int runtimeDroppedEvents;
+        public int runtimeObjectCount;
+        public List<RuntimeExecutionEvent> runtimeEvents;
+        public List<RuntimeObjectSnapshot> runtimeObjects;
+    }
+
+    public static class RuntimeBeanTypeInfo {
+        public String source;
+        public String beanName;
+        public String concreteClass;
+        public List<String> assignableTypes;
+        public boolean instantiated;
+    }
+
+    public static class RuntimePipelineTypeInfo {
+        public int instanceId;
+        public String className;
+        public String producedBy;
+        public List<String> observedMethods;
+        public List<String> stageTypes;
+        public String lastError;
+        public List<String> evidence;
+    }
+
+    public static class RuntimeExecutionEvent {
+        public int seq;
+        public String eventType;
+        public long timestampMs;
+        public long threadId;
+        public String threadName;
+        public String methodId;
+        public String parentMethodId;
+        public int stackDepth;
+        public RuntimeValueInfo receiver;
+        public List<RuntimeFieldValue> receiverFields;
+        public List<RuntimeFieldChange> receiverFieldChanges;
+        public List<RuntimeValueInfo> arguments;
+        public RuntimeValueInfo returnValue;
+        public String thrown;
+    }
+
+    public static class RuntimeFieldValue {
+        public String ownerType;
+        public String fieldName;
+        public RuntimeValueInfo value;
+    }
+
+    public static class RuntimeFieldChange {
+        public String ownerType;
+        public String fieldName;
+        public String before;
+        public String after;
+    }
+
+    public static class RuntimeValueInfo {
+        public String kind;
+        public String typeName;
+        public int identityId;
+        public String simpleValue;
+        public int size;
+        public List<String> elementTypes;
+        public List<String> mapKeyTypes;
+        public List<String> mapValueTypes;
+    }
+
+    public static class RuntimeObjectSnapshot {
+        public int identityId;
+        public String typeName;
+        public String superTypeName;
+        public List<String> interfaceTypes;
+        public Map<String, String> fieldRuntimeTypes;
+        public Map<String, String> fieldValueSummary;
+        public List<String> collectionElementTypes;
+        public List<String> mapKeyTypes;
+        public List<String> mapValueTypes;
     }
 
     public static class ProjectClassIndex {
@@ -1525,6 +2763,82 @@ public class RuntimeSandboxSimulator {
         @Override
         public String providerName() {
             return "SandboxBeanFactory";
+        }
+
+        public List<RuntimeBeanTypeInfo> snapshotBeanTypeInfos(int limit) {
+            List<RuntimeBeanTypeInfo> result = new ArrayList<RuntimeBeanTypeInfo>();
+            LinkedHashSet<String> dedup = new LinkedHashSet<String>();
+
+            for (Map.Entry<String, List<Class<?>>> entry : beanClassesByName.entrySet()) {
+                String beanName = entry.getKey();
+                List<Class<?>> classes = entry.getValue();
+                if (classes == null || classes.isEmpty()) {
+                    continue;
+                }
+                for (Class<?> clazz : classes) {
+                    if (clazz == null) {
+                        continue;
+                    }
+                    if (limit > 0 && result.size() >= limit) {
+                        return result;
+                    }
+                    String key = beanName + "|" + clazz.getName();
+                    if (!dedup.add(key)) {
+                        continue;
+                    }
+                    RuntimeBeanTypeInfo info = new RuntimeBeanTypeInfo();
+                    info.source = "SandboxBeanFactory";
+                    info.beanName = beanName;
+                    info.concreteClass = clazz.getName();
+                    info.assignableTypes = collectAssignableTypeNames(clazz);
+                    info.instantiated = singletonByConcreteClass.containsKey(clazz);
+                    result.add(info);
+                }
+            }
+
+            for (Map.Entry<Class<?>, Object> entry : singletonByConcreteClass.entrySet()) {
+                Class<?> clazz = entry.getKey();
+                if (clazz == null) {
+                    continue;
+                }
+                if (limit > 0 && result.size() >= limit) {
+                    return result;
+                }
+                Set<String> names = beanNamesByClass.getOrDefault(clazz, Collections.<String>emptySet());
+                if (names.isEmpty()) {
+                    String key = "(auto)|" + clazz.getName();
+                    if (!dedup.add(key)) {
+                        continue;
+                    }
+                    RuntimeBeanTypeInfo info = new RuntimeBeanTypeInfo();
+                    info.source = "SandboxBeanFactory";
+                    info.beanName = "(auto)";
+                    info.concreteClass = clazz.getName();
+                    info.assignableTypes = collectAssignableTypeNames(clazz);
+                    info.instantiated = true;
+                    result.add(info);
+                    continue;
+                }
+                List<String> sortedNames = new ArrayList<String>(names);
+                Collections.sort(sortedNames);
+                for (String beanName : sortedNames) {
+                    if (limit > 0 && result.size() >= limit) {
+                        return result;
+                    }
+                    String key = beanName + "|" + clazz.getName();
+                    if (!dedup.add(key)) {
+                        continue;
+                    }
+                    RuntimeBeanTypeInfo info = new RuntimeBeanTypeInfo();
+                    info.source = "SandboxBeanFactory";
+                    info.beanName = beanName;
+                    info.concreteClass = clazz.getName();
+                    info.assignableTypes = collectAssignableTypeNames(clazz);
+                    info.instantiated = true;
+                    result.add(info);
+                }
+            }
+            return result;
         }
 
         private void debugBean(String pattern, Object... args) {
@@ -2547,6 +3861,8 @@ public class RuntimeSandboxSimulator {
         public final List<String> tracePrefixes;
         public final Path outputDir;
         public final int maxCalls;
+        public final int maxRuntimeEvents;
+        public final int maxRuntimeObjects;
         public final boolean debugRuntime;
         public final boolean useSpringContext;
 
@@ -2559,6 +3875,8 @@ public class RuntimeSandboxSimulator {
                           List<String> tracePrefixes,
                           Path outputDir,
                           int maxCalls,
+                          int maxRuntimeEvents,
+                          int maxRuntimeObjects,
                           boolean debugRuntime,
                           boolean useSpringContext) {
             this.projectDir = projectDir;
@@ -2570,6 +3888,8 @@ public class RuntimeSandboxSimulator {
             this.tracePrefixes = tracePrefixes;
             this.outputDir = outputDir;
             this.maxCalls = maxCalls;
+            this.maxRuntimeEvents = maxRuntimeEvents;
+            this.maxRuntimeObjects = maxRuntimeObjects;
             this.debugRuntime = debugRuntime;
             this.useSpringContext = useSpringContext;
         }
@@ -2584,6 +3904,8 @@ public class RuntimeSandboxSimulator {
             List<String> tracePrefixes = new ArrayList<String>();
             Path outputDir = Paths.get(".").toAbsolutePath().normalize().resolve("build/reports/runtime-sandbox");
             int maxCalls = 200000;
+            int maxRuntimeEvents = 60000;
+            int maxRuntimeObjects = 20000;
             boolean debugRuntime = false;
             boolean useSpringContext = false;
             boolean outExplicitlySpecified = false;
@@ -2609,6 +3931,10 @@ public class RuntimeSandboxSimulator {
                     outExplicitlySpecified = true;
                 } else if ("--max-calls".equals(arg) && i + 1 < args.length) {
                     maxCalls = Integer.parseInt(args[++i]);
+                } else if ("--max-runtime-events".equals(arg) && i + 1 < args.length) {
+                    maxRuntimeEvents = Integer.parseInt(args[++i]);
+                } else if ("--max-runtime-objects".equals(arg) && i + 1 < args.length) {
+                    maxRuntimeObjects = Integer.parseInt(args[++i]);
                 } else if ("--debug-runtime".equals(arg)) {
                     debugRuntime = true;
                 } else if ("--use-spring-context".equals(arg)) {
@@ -2660,6 +3986,8 @@ public class RuntimeSandboxSimulator {
                     normalizeTokens(tracePrefixes),
                     outputDir,
                     maxCalls,
+                    maxRuntimeEvents,
+                    maxRuntimeObjects,
                     debugRuntime,
                     useSpringContext
             );

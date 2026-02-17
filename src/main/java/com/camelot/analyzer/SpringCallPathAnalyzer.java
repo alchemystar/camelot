@@ -2,6 +2,7 @@ package com.camelot.analyzer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParseResult;
 import com.github.javaparser.ast.CompilationUnit;
@@ -62,6 +63,7 @@ import java.util.stream.Stream;
 
 public class SpringCallPathAnalyzer {
     private DebugLogger debugLogger = DebugLogger.disabled();
+    private RuntimeEvidence runtimeEvidence = RuntimeEvidence.empty();
     private static final Set<String> COMPONENT_ANNOTATIONS = setOf(
             "Component", "Service", "Repository", "Controller", "RestController", "Configuration"
     );
@@ -105,7 +107,8 @@ public class SpringCallPathAnalyzer {
                 options.entryMethod,
                 debugLogger,
                 options.externalRpcPrefixes,
-                options.nonExternalRpcPrefixes
+                options.nonExternalRpcPrefixes,
+                options.runtimeTraceJson
         );
         Path jsonPath = options.outputDir.resolve("analysis-report.json");
         Path dotPath = options.outputDir.resolve("call-graph.dot");
@@ -134,6 +137,9 @@ public class SpringCallPathAnalyzer {
         if (!options.nonExternalRpcPrefixes.isEmpty()) {
             System.out.println("Non-external RPC prefixes: " + options.nonExternalRpcPrefixes);
         }
+        if (options.runtimeTraceJson != null) {
+            System.out.println("Runtime evidence: " + options.runtimeTraceJson.toAbsolutePath());
+        }
         if (!isBlank(options.endpointPath)) {
             System.out.println("Endpoint filter: " + options.endpointPath);
             if (report.endpoints.isEmpty()) {
@@ -161,7 +167,8 @@ public class SpringCallPathAnalyzer {
                 null,
                 DebugLogger.disabled(),
                 Collections.<String>emptySet(),
-                Collections.<String>emptySet()
+                Collections.<String>emptySet(),
+                null
         );
     }
 
@@ -177,7 +184,8 @@ public class SpringCallPathAnalyzer {
                 null,
                 DebugLogger.disabled(),
                 Collections.<String>emptySet(),
-                Collections.<String>emptySet()
+                Collections.<String>emptySet(),
+                null
         );
     }
 
@@ -194,7 +202,8 @@ public class SpringCallPathAnalyzer {
                 entryMethodFilter,
                 DebugLogger.disabled(),
                 Collections.<String>emptySet(),
-                Collections.<String>emptySet()
+                Collections.<String>emptySet(),
+                null
         );
     }
 
@@ -212,7 +221,8 @@ public class SpringCallPathAnalyzer {
                 entryMethodFilter,
                 debugLogger,
                 Collections.<String>emptySet(),
-                Collections.<String>emptySet()
+                Collections.<String>emptySet(),
+                null
         );
     }
 
@@ -224,6 +234,28 @@ public class SpringCallPathAnalyzer {
                                   DebugLogger debugLogger,
                                   Set<String> externalRpcPrefixes,
                                   Set<String> nonExternalRpcPrefixes) throws IOException {
+        return analyze(
+                projectRoot,
+                maxDepth,
+                maxPathsPerEndpoint,
+                endpointPathFilter,
+                entryMethodFilter,
+                debugLogger,
+                externalRpcPrefixes,
+                nonExternalRpcPrefixes,
+                null
+        );
+    }
+
+    public AnalysisReport analyze(Path projectRoot,
+                                  int maxDepth,
+                                  int maxPathsPerEndpoint,
+                                  String endpointPathFilter,
+                                  String entryMethodFilter,
+                                  DebugLogger debugLogger,
+                                  Set<String> externalRpcPrefixes,
+                                  Set<String> nonExternalRpcPrefixes,
+                                  Path runtimeTraceJson) throws IOException {
         DependencyAnalysisModule dependencyAnalysisModule = new DependencyAnalysisModule(this);
         return dependencyAnalysisModule.analyzeWithDependencies(
                 projectRoot,
@@ -233,7 +265,8 @@ public class SpringCallPathAnalyzer {
                 entryMethodFilter,
                 debugLogger,
                 externalRpcPrefixes,
-                nonExternalRpcPrefixes
+                nonExternalRpcPrefixes,
+                runtimeTraceJson
         );
     }
 
@@ -243,23 +276,45 @@ public class SpringCallPathAnalyzer {
                                           String endpointPathFilter,
                                           String entryMethodFilter,
                                           DebugLogger debugLogger) throws IOException {
+        return analyzeCode(
+                projectRoot,
+                maxDepth,
+                maxPathsPerEndpoint,
+                endpointPathFilter,
+                entryMethodFilter,
+                debugLogger,
+                null
+        );
+    }
+
+    public CodeAnalysisResult analyzeCode(Path projectRoot,
+                                          int maxDepth,
+                                          int maxPathsPerEndpoint,
+                                          String endpointPathFilter,
+                                          String entryMethodFilter,
+                                          DebugLogger debugLogger,
+                                          Path runtimeTraceJson) throws IOException {
         DebugLogger previousLogger = this.debugLogger;
+        RuntimeEvidence previousEvidence = this.runtimeEvidence;
         this.debugLogger = debugLogger == null ? DebugLogger.disabled() : debugLogger;
+        this.runtimeEvidence = RuntimeEvidence.empty();
         try {
         JavaModel javaModel = parseJava(projectRoot);
         XmlModel xmlModel = parseXml(projectRoot);
         this.debugLogger.log(
-                "START project=%s endpointFilter=%s entryMethodFilter=%s maxDepth=%d maxPaths=%d",
+                "START project=%s endpointFilter=%s entryMethodFilter=%s maxDepth=%d maxPaths=%d runtimeTraceJson=%s",
                 projectRoot.toAbsolutePath(),
                 endpointPathFilter,
                 entryMethodFilter,
                 maxDepth,
-                maxPathsPerEndpoint
+                maxPathsPerEndpoint,
+                runtimeTraceJson == null ? "" : runtimeTraceJson.toAbsolutePath().toString()
         );
 
         BeanRegistry beanRegistry = buildBeanRegistry(javaModel, xmlModel);
         InjectionRegistry injectionRegistry = buildInjectionRegistry(javaModel, xmlModel, beanRegistry);
         Map<String, MethodModel> methodsById = collectMethods(javaModel);
+        this.runtimeEvidence = loadRuntimeEvidence(runtimeTraceJson, methodsById, javaModel);
         List<Endpoint> endpoints = buildEndpoints(javaModel, xmlModel, beanRegistry);
         List<Endpoint> selectedEndpoints = new ArrayList<Endpoint>();
         if (!isBlank(endpointPathFilter)) {
@@ -330,6 +385,7 @@ public class SpringCallPathAnalyzer {
         );
         } finally {
             this.debugLogger = previousLogger;
+            this.runtimeEvidence = previousEvidence;
         }
     }
 
@@ -345,6 +401,231 @@ public class SpringCallPathAnalyzer {
             beans.addAll(classes);
         }
         return beans;
+    }
+
+    private RuntimeEvidence loadRuntimeEvidence(Path runtimeTraceJson,
+                                                Map<String, MethodModel> methodsById,
+                                                JavaModel javaModel) {
+        if (runtimeTraceJson == null) {
+            debugLogger.log("RUNTIME_EVIDENCE_SKIP reason=no-trace-file");
+            return RuntimeEvidence.empty();
+        }
+        Path tracePath = runtimeTraceJson.toAbsolutePath().normalize();
+        if (!Files.exists(tracePath) || !Files.isRegularFile(tracePath)) {
+            debugLogger.log("RUNTIME_EVIDENCE_SKIP reason=file-not-found path=%s", tracePath);
+            return RuntimeEvidence.empty();
+        }
+        ObjectMapper mapper = new ObjectMapper();
+        try {
+            JsonNode root = mapper.readTree(Files.newBufferedReader(tracePath, StandardCharsets.UTF_8));
+            RuntimeEvidenceBuilder builder = new RuntimeEvidenceBuilder(tracePath);
+            JsonNode edgesNode = root == null ? null : root.get("edges");
+            if (edgesNode != null && edgesNode.isArray()) {
+                for (JsonNode edgeNode : edgesNode) {
+                    String from = normalizeRuntimeMethodKey(textValue(edgeNode == null ? null : edgeNode.get("from")));
+                    String to = normalizeRuntimeMethodKey(textValue(edgeNode == null ? null : edgeNode.get("to")));
+                    int count = intValue(edgeNode == null ? null : edgeNode.get("count"), 1);
+                    builder.addEdge(from, to, count <= 0 ? 1 : count);
+                }
+            }
+
+            JsonNode eventsNode = root == null ? null : root.get("runtimeEvents");
+            if (eventsNode != null && eventsNode.isArray()) {
+                for (JsonNode eventNode : eventsNode) {
+                    if (eventNode == null || !eventNode.isObject()) {
+                        continue;
+                    }
+                    String methodCoarse = normalizeRuntimeMethodKey(textValue(eventNode.get("methodId")));
+                    if (isBlank(methodCoarse)) {
+                        continue;
+                    }
+                    String parentCoarse = normalizeRuntimeMethodKey(textValue(eventNode.get("parentMethodId")));
+                    if (!isBlank(parentCoarse)) {
+                        builder.addEdge(parentCoarse, methodCoarse, 1);
+                    }
+
+                    JsonNode argsNode = eventNode.get("arguments");
+                    int argumentCount = argsNode != null && argsNode.isArray()
+                            ? argsNode.size()
+                            : extractArityFromRuntimeMethodId(textValue(eventNode.get("methodId")));
+                    if (argumentCount < 0) {
+                        argumentCount = 0;
+                    }
+                    String methodSignature = methodCoarse + "/" + argumentCount;
+                    builder.markObservedMethod(methodSignature);
+
+                    String receiverType = runtimeValueType(eventNode.get("receiver"));
+                    if (!isBlank(receiverType)) {
+                        builder.addReceiverType(methodCoarse, methodSignature, receiverType);
+                    }
+
+                    if (argsNode != null && argsNode.isArray()) {
+                        for (int i = 0; i < argsNode.size(); i++) {
+                            String argumentType = runtimeValueType(argsNode.get(i));
+                            if (isBlank(argumentType)) {
+                                continue;
+                            }
+                            builder.addParameterType(methodCoarse, methodSignature, i, argumentType);
+                        }
+                    }
+
+                    JsonNode receiverFields = eventNode.get("receiverFields");
+                    if (receiverFields != null && receiverFields.isArray()) {
+                        for (JsonNode fieldNode : receiverFields) {
+                            if (fieldNode == null || !fieldNode.isObject()) {
+                                continue;
+                            }
+                            String fieldName = textValue(fieldNode.get("fieldName"));
+                            String ownerType = normalizeTypeName(textValue(fieldNode.get("ownerType")));
+                            String fieldType = runtimeValueType(fieldNode.get("value"));
+                            builder.addFieldType(methodCoarse, methodSignature, ownerType, fieldName, fieldType);
+                        }
+                    }
+                }
+            }
+
+            JsonNode objectsNode = root == null ? null : root.get("runtimeObjects");
+            if (objectsNode != null && objectsNode.isArray()) {
+                for (JsonNode objectNode : objectsNode) {
+                    if (objectNode == null || !objectNode.isObject()) {
+                        continue;
+                    }
+                    JsonNode fieldTypesNode = objectNode.get("fieldRuntimeTypes");
+                    if (fieldTypesNode == null || !fieldTypesNode.isObject()) {
+                        continue;
+                    }
+                    Iterator<Map.Entry<String, JsonNode>> fields = fieldTypesNode.fields();
+                    while (fields.hasNext()) {
+                        Map.Entry<String, JsonNode> fieldEntry = fields.next();
+                        String fieldKey = normalizeOwnerFieldKey(fieldEntry.getKey());
+                        String fieldType = normalizeTypeName(textValue(fieldEntry.getValue()));
+                        if (isBlank(fieldKey) || isBlank(fieldType)) {
+                            continue;
+                        }
+                        builder.addOwnerFieldType(fieldKey, fieldType);
+                    }
+                }
+            }
+
+            RuntimeEvidence evidence = builder.build();
+            debugLogger.log(
+                    "RUNTIME_EVIDENCE_LOADED path=%s edgePairs=%d observedMethods=%d fieldKeys=%d",
+                    tracePath,
+                    evidence.edgeCountByFromTo.size(),
+                    evidence.observedMethods.size(),
+                    evidence.ownerFieldTypes.size()
+            );
+            if (methodsById != null && !methodsById.isEmpty()) {
+                int covered = 0;
+                for (String methodId : methodsById.keySet()) {
+                    if (evidence.isMethodObserved(methodId)) {
+                        covered++;
+                    }
+                }
+                debugLogger.log(
+                        "RUNTIME_EVIDENCE_COVERAGE staticMethods=%d covered=%d",
+                        methodsById.size(),
+                        covered
+                );
+            }
+            if (javaModel != null) {
+                debugLogger.log("RUNTIME_EVIDENCE_CLASS_CONTEXT classes=%d", javaModel.classesByName.size());
+            }
+            return evidence;
+        } catch (Exception ex) {
+            debugLogger.log("RUNTIME_EVIDENCE_LOAD_FAIL path=%s error=%s", tracePath, ex.toString());
+            return RuntimeEvidence.empty();
+        }
+    }
+
+    private static String textValue(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return "";
+        }
+        if (node.isTextual()) {
+            return node.asText().trim();
+        }
+        return String.valueOf(node.asText("")).trim();
+    }
+
+    private static int intValue(JsonNode node, int defaultValue) {
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+        if (node.isInt() || node.isLong()) {
+            return node.asInt(defaultValue);
+        }
+        String raw = textValue(node);
+        if (isBlank(raw)) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException ignored) {
+            return defaultValue;
+        }
+    }
+
+    private static String runtimeValueType(JsonNode valueNode) {
+        if (valueNode == null || valueNode.isNull()) {
+            return "";
+        }
+        String typeName = normalizeTypeName(textValue(valueNode.get("typeName")));
+        if (!isBlank(typeName)) {
+            return typeName;
+        }
+        return "";
+    }
+
+    private static String normalizeOwnerFieldKey(String raw) {
+        if (isBlank(raw)) {
+            return "";
+        }
+        String key = raw.trim();
+        int split = key.lastIndexOf('.');
+        if (split <= 0 || split + 1 >= key.length()) {
+            return "";
+        }
+        String owner = normalizeTypeName(key.substring(0, split));
+        String field = key.substring(split + 1).trim();
+        if (isBlank(owner) || isBlank(field)) {
+            return "";
+        }
+        return owner + "." + field;
+    }
+
+    private static String normalizeRuntimeMethodKey(String rawMethodId) {
+        if (isBlank(rawMethodId)) {
+            return "";
+        }
+        String raw = rawMethodId.trim();
+        int hash = raw.lastIndexOf('#');
+        if (hash <= 0) {
+            return "";
+        }
+        int slash = raw.lastIndexOf('/');
+        if (slash > hash) {
+            return raw.substring(0, slash).trim();
+        }
+        return raw;
+    }
+
+    private static int extractArityFromRuntimeMethodId(String rawMethodId) {
+        if (isBlank(rawMethodId)) {
+            return -1;
+        }
+        String raw = rawMethodId.trim();
+        int hash = raw.lastIndexOf('#');
+        int slash = raw.lastIndexOf('/');
+        if (hash <= 0 || slash <= hash || slash + 1 >= raw.length()) {
+            return -1;
+        }
+        String arityRaw = raw.substring(slash + 1).trim();
+        try {
+            return Integer.parseInt(arityRaw);
+        } catch (NumberFormatException ignored) {
+            return -1;
+        }
     }
 
     private List<Endpoint> selectEndpoints(List<Endpoint> endpoints, String endpointPathFilter) {
@@ -1207,6 +1488,14 @@ public class SpringCallPathAnalyzer {
                         injectionRegistry,
                         frameStack
                 );
+                applyRuntimeScopeEvidenceBeforeCall(
+                        classModel,
+                        methodModel,
+                        call,
+                        methodContext,
+                        frameStack,
+                        javaModel
+                );
                 List<ResolvedCallTarget> candidates = resolveCallTargetsWithContext(
                         classModel,
                         methodModel,
@@ -1246,6 +1535,7 @@ public class SpringCallPathAnalyzer {
                     ));
                 }
                 candidates = deduplicateResolvedTargets(candidates);
+                candidates = annotateCandidatesWithRuntimeEvidence(methodModel.id, candidates, javaModel);
                 if (depth >= Math.max(maxDepth, 0) && candidates.size() > MAX_DEPTH_FRONTIER_EDGE_LIMIT) {
                     candidates = limitFrontierCandidatesAtMaxDepth(candidates, methodModel.id, call, depth, maxDepth);
                 }
@@ -1527,7 +1817,201 @@ public class SpringCallPathAnalyzer {
                 context.variableTypes.put(parameterName, candidates);
             }
         }
+        applyRuntimeContextBootstrap(classModel, methodModel, context, javaModel);
         return context;
+    }
+
+    private void applyRuntimeContextBootstrap(ClassModel classModel,
+                                              MethodModel methodModel,
+                                              TypeFlowContext context,
+                                              JavaModel javaModel) {
+        if (classModel == null || methodModel == null || context == null || runtimeEvidence == null || !runtimeEvidence.isEnabled()) {
+            return;
+        }
+        Set<String> observedThisTypes = runtimeEvidence.receiverTypes(methodModel.id);
+        if (!observedThisTypes.isEmpty()) {
+            Set<String> mergedThisTypes = mergeTypeHints(context.thisTypeNames, observedThisTypes, javaModel);
+            if (!sameTypeSet(context.thisTypeNames, mergedThisTypes)) {
+                context.thisTypeNames.clear();
+                context.thisTypeNames.addAll(mergedThisTypes);
+                debugLogger.log(
+                        "RUNTIME_EVIDENCE_BIND_THIS method=%s types=%s source=%s",
+                        methodModel.id,
+                        context.thisTypeNames,
+                        runtimeEvidence.sourcePathText()
+                );
+            }
+        }
+
+        for (int i = 0; i < methodModel.parameterNames.size(); i++) {
+            String parameterName = methodModel.parameterNames.get(i);
+            if (isBlank(parameterName)) {
+                continue;
+            }
+            Set<String> observedParameterTypes = runtimeEvidence.parameterTypes(methodModel.id, i);
+            if (observedParameterTypes.isEmpty()) {
+                continue;
+            }
+            Set<String> existing = context.variableTypes.get(parameterName);
+            Set<String> merged = mergeTypeHints(existing, observedParameterTypes, javaModel);
+            if (merged.isEmpty() || sameTypeSet(existing, merged)) {
+                continue;
+            }
+            context.variableTypes.put(parameterName, merged);
+            debugLogger.log(
+                    "RUNTIME_EVIDENCE_BIND_PARAM method=%s index=%d name=%s types=%s",
+                    methodModel.id,
+                    i,
+                    parameterName,
+                    merged
+            );
+        }
+    }
+
+    private void applyRuntimeScopeEvidenceBeforeCall(ClassModel classModel,
+                                                     MethodModel methodModel,
+                                                     CallSite call,
+                                                     TypeFlowContext context,
+                                                     Deque<InvocationFrame> frameStack,
+                                                     JavaModel javaModel) {
+        if (classModel == null || methodModel == null || call == null || context == null) {
+            return;
+        }
+        if (runtimeEvidence == null || !runtimeEvidence.isEnabled()) {
+            return;
+        }
+        if (call.scopeType != ScopeType.NAME || isBlank(call.scopeToken) || isLikelyTypeReferenceToken(call.scopeToken)) {
+            return;
+        }
+        Set<String> observedTypes = new LinkedHashSet<String>();
+        observedTypes.addAll(runtimeEvidence.methodFieldTypes(methodModel.id, call.scopeToken));
+        observedTypes.addAll(runtimeEvidence.ownerFieldTypes(classModel.fqcn, call.scopeToken));
+
+        if (frameStack != null && !frameStack.isEmpty()) {
+            Iterator<InvocationFrame> iterator = frameStack.descendingIterator();
+            while (iterator.hasNext()) {
+                InvocationFrame frame = iterator.next();
+                observedTypes.addAll(runtimeEvidence.methodFieldTypes(frame.methodId, call.scopeToken));
+                if (!isBlank(frame.ownerClassName)) {
+                    observedTypes.addAll(runtimeEvidence.ownerFieldTypes(frame.ownerClassName, call.scopeToken));
+                }
+            }
+        }
+
+        observedTypes = retainKnownProjectTypes(observedTypes, javaModel);
+        if (observedTypes.isEmpty()) {
+            return;
+        }
+        Set<String> existingTypes = context.variableTypes.get(call.scopeToken);
+        Set<String> mergedTypes = mergeTypeHints(existingTypes, observedTypes, javaModel);
+        if (mergedTypes.isEmpty() || sameTypeSet(existingTypes, mergedTypes)) {
+            return;
+        }
+        context.variableTypes.put(call.scopeToken, mergedTypes);
+        debugLogger.log(
+                "RUNTIME_EVIDENCE_BIND_SCOPE method=%s line=%d token=%s observed=%s merged=%s",
+                methodModel.id,
+                call.line,
+                call.scopeToken,
+                observedTypes,
+                mergedTypes
+        );
+    }
+
+    private Set<String> retainKnownProjectTypes(Set<String> typeNames, JavaModel javaModel) {
+        if (typeNames == null || typeNames.isEmpty()) {
+            return Collections.emptySet();
+        }
+        if (javaModel == null || javaModel.classesByName.isEmpty()) {
+            return new LinkedHashSet<String>(typeNames);
+        }
+        Set<String> known = new LinkedHashSet<String>();
+        for (String typeName : typeNames) {
+            if (isBlank(typeName)) {
+                continue;
+            }
+            if (javaModel.classesByName.containsKey(typeName)) {
+                known.add(typeName);
+            }
+        }
+        if (!known.isEmpty()) {
+            return known;
+        }
+        return new LinkedHashSet<String>(typeNames);
+    }
+
+    private Set<String> mergeTypeHints(Set<String> existingTypes,
+                                       Set<String> observedTypes,
+                                       JavaModel javaModel) {
+        Set<String> existing = existingTypes == null
+                ? new LinkedHashSet<String>()
+                : new LinkedHashSet<String>(existingTypes);
+        Set<String> observed = observedTypes == null
+                ? new LinkedHashSet<String>()
+                : new LinkedHashSet<String>(observedTypes);
+        existing.removeIf(SpringCallPathAnalyzer::isBlank);
+        observed.removeIf(SpringCallPathAnalyzer::isBlank);
+        if (observed.isEmpty()) {
+            return existing;
+        }
+        if (existing.isEmpty()) {
+            return observed;
+        }
+
+        Set<String> intersection = intersectTypes(existing, observed);
+        if (!intersection.isEmpty()) {
+            return intersection;
+        }
+
+        Set<String> relatedObserved = new LinkedHashSet<String>();
+        for (String observedType : observed) {
+            for (String existingType : existing) {
+                if (areTypesRelated(observedType, existingType, javaModel)) {
+                    relatedObserved.add(observedType);
+                    break;
+                }
+            }
+        }
+        if (!relatedObserved.isEmpty()) {
+            return relatedObserved;
+        }
+
+        Set<String> merged = new LinkedHashSet<String>(existing);
+        merged.addAll(observed);
+        return merged;
+    }
+
+    private Set<String> intersectTypes(Set<String> left, Set<String> right) {
+        if (left == null || left.isEmpty() || right == null || right.isEmpty()) {
+            return Collections.emptySet();
+        }
+        Set<String> intersection = new LinkedHashSet<String>();
+        for (String item : left) {
+            if (right.contains(item)) {
+                intersection.add(item);
+            }
+        }
+        return intersection;
+    }
+
+    private boolean areTypesRelated(String leftType, String rightType, JavaModel javaModel) {
+        if (isBlank(leftType) || isBlank(rightType)) {
+            return false;
+        }
+        if (leftType.equals(rightType)) {
+            return true;
+        }
+        if (javaModel == null) {
+            return false;
+        }
+        return isAssignableTo(leftType, rightType, javaModel, new HashSet<String>())
+                || isAssignableTo(rightType, leftType, javaModel, new HashSet<String>());
+    }
+
+    private boolean sameTypeSet(Set<String> left, Set<String> right) {
+        Set<String> a = left == null ? Collections.<String>emptySet() : new LinkedHashSet<String>(left);
+        Set<String> b = right == null ? Collections.<String>emptySet() : new LinkedHashSet<String>(right);
+        return a.equals(b);
     }
 
     private List<ResolvedCallTarget> resolveCallTargetsWithContext(ClassModel classModel,
@@ -1802,6 +2286,45 @@ public class SpringCallPathAnalyzer {
         return new ArrayList<ResolvedCallTarget>(unique.values());
     }
 
+    private List<ResolvedCallTarget> annotateCandidatesWithRuntimeEvidence(String callerMethodId,
+                                                                           List<ResolvedCallTarget> candidates,
+                                                                           JavaModel javaModel) {
+        if (candidates == null || candidates.isEmpty()) {
+            return Collections.emptyList();
+        }
+        if (runtimeEvidence == null || !runtimeEvidence.isEnabled()) {
+            return candidates;
+        }
+        List<ResolvedCallTarget> annotated = new ArrayList<ResolvedCallTarget>();
+        for (ResolvedCallTarget candidate : candidates) {
+            if (candidate == null || isBlank(candidate.methodId)) {
+                continue;
+            }
+            String reason = candidate.reason;
+            int edgeCount = runtimeEvidence.edgeCount(callerMethodId, candidate.methodId);
+            if (edgeCount > 0) {
+                reason = appendReasonToken(reason, "RUNTIME:edge-count=" + edgeCount);
+            }
+            if (runtimeEvidence.isMethodObserved(candidate.methodId)) {
+                reason = appendReasonToken(reason, "RUNTIME:callee-observed");
+            }
+            String receiverType = selectRuntimeReceiverClass(candidate, null, javaModel);
+            if (!isBlank(receiverType) && runtimeEvidence.containsReceiverType(candidate.methodId, receiverType)) {
+                reason = appendReasonToken(reason, "RUNTIME:receiver=" + receiverType);
+            }
+            annotated.add(new ResolvedCallTarget(candidate.methodId, reason, candidate.receiverClassName));
+        }
+        return deduplicateResolvedTargets(annotated);
+    }
+
+    private String appendReasonToken(String reason, String token) {
+        String base = isBlank(reason) ? "JAVA:unknown" : reason;
+        if (isBlank(token) || base.contains(token)) {
+            return base;
+        }
+        return base + "|" + token;
+    }
+
     private List<ResolvedCallTarget> narrowAmbiguousTargets(List<ResolvedCallTarget> candidates,
                                                             ClassModel callerClass,
                                                             MethodModel callerMethod,
@@ -1815,7 +2338,7 @@ public class SpringCallPathAnalyzer {
         int bestScore = Integer.MIN_VALUE;
         List<ResolvedCallTarget> best = new ArrayList<ResolvedCallTarget>();
         for (ResolvedCallTarget candidate : candidates) {
-            int score = scoreResolvedTarget(candidate, callerClass, call, context, frameStack, javaModel);
+            int score = scoreResolvedTarget(candidate, callerClass, callerMethod, call, context, frameStack, javaModel);
             if (score > bestScore) {
                 bestScore = score;
                 best.clear();
@@ -1851,6 +2374,7 @@ public class SpringCallPathAnalyzer {
 
     private int scoreResolvedTarget(ResolvedCallTarget candidate,
                                     ClassModel callerClass,
+                                    MethodModel callerMethod,
                                     CallSite call,
                                     TypeFlowContext context,
                                     Deque<InvocationFrame> frameStack,
@@ -1881,9 +2405,33 @@ public class SpringCallPathAnalyzer {
         if (reason.contains("chain:")) {
             score += 80;
         }
+        if (reason.contains("runtime:edge-count=")) {
+            score += 800;
+        }
+        if (reason.contains("runtime:receiver=")) {
+            score += 300;
+        }
+        if (reason.contains("runtime:callee-observed")) {
+            score += 90;
+        }
+
+        if (runtimeEvidence != null && runtimeEvidence.isEnabled() && callerMethod != null) {
+            int edgeCount = runtimeEvidence.edgeCount(callerMethod.id, candidate.methodId);
+            if (edgeCount > 0) {
+                score += Math.min(1400, 640 + (edgeCount * 40));
+            }
+            if (runtimeEvidence.isMethodObserved(candidate.methodId)) {
+                score += 80;
+            }
+        }
 
         String targetClass = extractClassName(candidate.methodId);
         String receiverClass = selectRuntimeReceiverClass(candidate, null, javaModel);
+        if (!isBlank(receiverClass) && runtimeEvidence != null
+                && runtimeEvidence.isEnabled()
+                && runtimeEvidence.containsReceiverType(candidate.methodId, receiverClass)) {
+            score += 260;
+        }
         ClassModel targetModel = javaModel.classesByName.get(targetClass);
         if (targetModel != null) {
             if (targetModel.isInterface) {
@@ -4590,6 +5138,350 @@ public class SpringCallPathAnalyzer {
         OTHER
     }
 
+    private static class RuntimeEvidenceBuilder {
+        private final Path sourcePath;
+        private final Map<String, Integer> edgeCountByFromTo = new LinkedHashMap<String, Integer>();
+        private final Set<String> observedMethods = new LinkedHashSet<String>();
+        private final Map<String, Set<String>> receiverTypesByMethod = new LinkedHashMap<String, Set<String>>();
+        private final Map<String, Map<Integer, Set<String>>> parameterTypesByMethod =
+                new LinkedHashMap<String, Map<Integer, Set<String>>>();
+        private final Map<String, Map<String, Set<String>>> fieldTypesByMethodAndField =
+                new LinkedHashMap<String, Map<String, Set<String>>>();
+        private final Map<String, Set<String>> ownerFieldTypes = new LinkedHashMap<String, Set<String>>();
+
+        private RuntimeEvidenceBuilder(Path sourcePath) {
+            this.sourcePath = sourcePath;
+        }
+
+        private void addEdge(String fromCoarse, String toCoarse, int count) {
+            if (isBlank(fromCoarse) || isBlank(toCoarse)) {
+                return;
+            }
+            String key = fromCoarse + "->" + toCoarse;
+            Integer old = edgeCountByFromTo.get(key);
+            int merged = (old == null ? 0 : old.intValue()) + Math.max(count, 1);
+            edgeCountByFromTo.put(key, Integer.valueOf(merged));
+        }
+
+        private void markObservedMethod(String methodSignature) {
+            if (isBlank(methodSignature)) {
+                return;
+            }
+            observedMethods.add(methodSignature);
+        }
+
+        private void addReceiverType(String methodCoarse, String methodSignature, String receiverType) {
+            if (isBlank(receiverType)) {
+                return;
+            }
+            addStringSetValue(receiverTypesByMethod, methodCoarse, receiverType);
+            addStringSetValue(receiverTypesByMethod, methodSignature, receiverType);
+        }
+
+        private void addParameterType(String methodCoarse, String methodSignature, int index, String parameterType) {
+            if (index < 0 || isBlank(parameterType)) {
+                return;
+            }
+            addIndexedType(parameterTypesByMethod, methodCoarse, index, parameterType);
+            addIndexedType(parameterTypesByMethod, methodSignature, index, parameterType);
+        }
+
+        private void addFieldType(String methodCoarse,
+                                  String methodSignature,
+                                  String ownerType,
+                                  String fieldName,
+                                  String fieldType) {
+            if (isBlank(fieldName) || isBlank(fieldType)) {
+                return;
+            }
+            addFieldType(fieldTypesByMethodAndField, methodCoarse, fieldName, fieldType);
+            addFieldType(fieldTypesByMethodAndField, methodSignature, fieldName, fieldType);
+            if (!isBlank(ownerType)) {
+                addOwnerFieldType(ownerType + "." + fieldName, fieldType);
+            }
+        }
+
+        private void addOwnerFieldType(String ownerFieldKey, String fieldType) {
+            String normalizedKey = normalizeOwnerFieldKey(ownerFieldKey);
+            if (isBlank(normalizedKey) || isBlank(fieldType)) {
+                return;
+            }
+            addStringSetValue(ownerFieldTypes, normalizedKey, fieldType);
+        }
+
+        private void addStringSetValue(Map<String, Set<String>> container, String key, String value) {
+            if (container == null || isBlank(key) || isBlank(value)) {
+                return;
+            }
+            container.computeIfAbsent(key, k -> new LinkedHashSet<String>()).add(value);
+        }
+
+        private void addIndexedType(Map<String, Map<Integer, Set<String>>> container,
+                                    String methodKey,
+                                    int index,
+                                    String typeName) {
+            if (container == null || isBlank(methodKey) || isBlank(typeName) || index < 0) {
+                return;
+            }
+            Map<Integer, Set<String>> byIndex = container.computeIfAbsent(
+                    methodKey,
+                    k -> new LinkedHashMap<Integer, Set<String>>()
+            );
+            byIndex.computeIfAbsent(Integer.valueOf(index), k -> new LinkedHashSet<String>()).add(typeName);
+        }
+
+        private void addFieldType(Map<String, Map<String, Set<String>>> container,
+                                  String methodKey,
+                                  String fieldName,
+                                  String fieldType) {
+            if (container == null || isBlank(methodKey) || isBlank(fieldName) || isBlank(fieldType)) {
+                return;
+            }
+            Map<String, Set<String>> byField = container.computeIfAbsent(
+                    methodKey,
+                    k -> new LinkedHashMap<String, Set<String>>()
+            );
+            byField.computeIfAbsent(fieldName, k -> new LinkedHashSet<String>()).add(fieldType);
+        }
+
+        private RuntimeEvidence build() {
+            return new RuntimeEvidence(
+                    sourcePath,
+                    freezeIntegerMap(edgeCountByFromTo),
+                    Collections.unmodifiableSet(new LinkedHashSet<String>(observedMethods)),
+                    freezeStringSetMap(receiverTypesByMethod),
+                    freezeIndexedTypeMap(parameterTypesByMethod),
+                    freezeFieldTypeMap(fieldTypesByMethodAndField),
+                    freezeStringSetMap(ownerFieldTypes)
+            );
+        }
+
+        private static Map<String, Integer> freezeIntegerMap(Map<String, Integer> source) {
+            if (source == null || source.isEmpty()) {
+                return Collections.emptyMap();
+            }
+            return Collections.unmodifiableMap(new LinkedHashMap<String, Integer>(source));
+        }
+
+        private static Map<String, Set<String>> freezeStringSetMap(Map<String, Set<String>> source) {
+            if (source == null || source.isEmpty()) {
+                return Collections.emptyMap();
+            }
+            Map<String, Set<String>> frozen = new LinkedHashMap<String, Set<String>>();
+            for (Map.Entry<String, Set<String>> entry : source.entrySet()) {
+                Set<String> values = entry.getValue();
+                if (values == null || values.isEmpty()) {
+                    continue;
+                }
+                frozen.put(entry.getKey(), Collections.unmodifiableSet(new LinkedHashSet<String>(values)));
+            }
+            return Collections.unmodifiableMap(frozen);
+        }
+
+        private static Map<String, Map<Integer, Set<String>>> freezeIndexedTypeMap(
+                Map<String, Map<Integer, Set<String>>> source) {
+            if (source == null || source.isEmpty()) {
+                return Collections.emptyMap();
+            }
+            Map<String, Map<Integer, Set<String>>> frozen = new LinkedHashMap<String, Map<Integer, Set<String>>>();
+            for (Map.Entry<String, Map<Integer, Set<String>>> methodEntry : source.entrySet()) {
+                Map<Integer, Set<String>> byIndex = methodEntry.getValue();
+                if (byIndex == null || byIndex.isEmpty()) {
+                    continue;
+                }
+                Map<Integer, Set<String>> frozenByIndex = new LinkedHashMap<Integer, Set<String>>();
+                for (Map.Entry<Integer, Set<String>> indexEntry : byIndex.entrySet()) {
+                    Set<String> values = indexEntry.getValue();
+                    if (values == null || values.isEmpty()) {
+                        continue;
+                    }
+                    frozenByIndex.put(indexEntry.getKey(), Collections.unmodifiableSet(new LinkedHashSet<String>(values)));
+                }
+                if (!frozenByIndex.isEmpty()) {
+                    frozen.put(methodEntry.getKey(), Collections.unmodifiableMap(frozenByIndex));
+                }
+            }
+            return Collections.unmodifiableMap(frozen);
+        }
+
+        private static Map<String, Map<String, Set<String>>> freezeFieldTypeMap(
+                Map<String, Map<String, Set<String>>> source) {
+            if (source == null || source.isEmpty()) {
+                return Collections.emptyMap();
+            }
+            Map<String, Map<String, Set<String>>> frozen = new LinkedHashMap<String, Map<String, Set<String>>>();
+            for (Map.Entry<String, Map<String, Set<String>>> methodEntry : source.entrySet()) {
+                Map<String, Set<String>> byField = methodEntry.getValue();
+                if (byField == null || byField.isEmpty()) {
+                    continue;
+                }
+                Map<String, Set<String>> frozenByField = new LinkedHashMap<String, Set<String>>();
+                for (Map.Entry<String, Set<String>> fieldEntry : byField.entrySet()) {
+                    Set<String> values = fieldEntry.getValue();
+                    if (values == null || values.isEmpty()) {
+                        continue;
+                    }
+                    frozenByField.put(fieldEntry.getKey(), Collections.unmodifiableSet(new LinkedHashSet<String>(values)));
+                }
+                if (!frozenByField.isEmpty()) {
+                    frozen.put(methodEntry.getKey(), Collections.unmodifiableMap(frozenByField));
+                }
+            }
+            return Collections.unmodifiableMap(frozen);
+        }
+    }
+
+    private static class RuntimeEvidence {
+        private final Path sourcePath;
+        private final Map<String, Integer> edgeCountByFromTo;
+        private final Set<String> observedMethods;
+        private final Map<String, Set<String>> receiverTypesByMethod;
+        private final Map<String, Map<Integer, Set<String>>> parameterTypesByMethod;
+        private final Map<String, Map<String, Set<String>>> fieldTypesByMethodAndField;
+        private final Map<String, Set<String>> ownerFieldTypes;
+
+        private RuntimeEvidence(Path sourcePath,
+                                Map<String, Integer> edgeCountByFromTo,
+                                Set<String> observedMethods,
+                                Map<String, Set<String>> receiverTypesByMethod,
+                                Map<String, Map<Integer, Set<String>>> parameterTypesByMethod,
+                                Map<String, Map<String, Set<String>>> fieldTypesByMethodAndField,
+                                Map<String, Set<String>> ownerFieldTypes) {
+            this.sourcePath = sourcePath;
+            this.edgeCountByFromTo = edgeCountByFromTo == null ? Collections.<String, Integer>emptyMap() : edgeCountByFromTo;
+            this.observedMethods = observedMethods == null ? Collections.<String>emptySet() : observedMethods;
+            this.receiverTypesByMethod = receiverTypesByMethod == null
+                    ? Collections.<String, Set<String>>emptyMap()
+                    : receiverTypesByMethod;
+            this.parameterTypesByMethod = parameterTypesByMethod == null
+                    ? Collections.<String, Map<Integer, Set<String>>>emptyMap()
+                    : parameterTypesByMethod;
+            this.fieldTypesByMethodAndField = fieldTypesByMethodAndField == null
+                    ? Collections.<String, Map<String, Set<String>>>emptyMap()
+                    : fieldTypesByMethodAndField;
+            this.ownerFieldTypes = ownerFieldTypes == null
+                    ? Collections.<String, Set<String>>emptyMap()
+                    : ownerFieldTypes;
+        }
+
+        private static RuntimeEvidence empty() {
+            return new RuntimeEvidence(
+                    null,
+                    Collections.<String, Integer>emptyMap(),
+                    Collections.<String>emptySet(),
+                    Collections.<String, Set<String>>emptyMap(),
+                    Collections.<String, Map<Integer, Set<String>>>emptyMap(),
+                    Collections.<String, Map<String, Set<String>>>emptyMap(),
+                    Collections.<String, Set<String>>emptyMap()
+            );
+        }
+
+        private boolean isEnabled() {
+            return !edgeCountByFromTo.isEmpty()
+                    || !observedMethods.isEmpty()
+                    || !receiverTypesByMethod.isEmpty()
+                    || !parameterTypesByMethod.isEmpty()
+                    || !fieldTypesByMethodAndField.isEmpty()
+                    || !ownerFieldTypes.isEmpty();
+        }
+
+        private String sourcePathText() {
+            return sourcePath == null ? "" : sourcePath.toAbsolutePath().toString();
+        }
+
+        private int edgeCount(String fromMethodId, String toMethodId) {
+            String from = normalizeRuntimeMethodKey(fromMethodId);
+            String to = normalizeRuntimeMethodKey(toMethodId);
+            if (isBlank(from) || isBlank(to)) {
+                return 0;
+            }
+            Integer count = edgeCountByFromTo.get(from + "->" + to);
+            return count == null ? 0 : count.intValue();
+        }
+
+        private boolean isMethodObserved(String methodId) {
+            if (isBlank(methodId)) {
+                return false;
+            }
+            if (observedMethods.contains(methodId)) {
+                return true;
+            }
+            return observedMethods.contains(normalizeRuntimeMethodKey(methodId));
+        }
+
+        private Set<String> receiverTypes(String methodId) {
+            if (isBlank(methodId)) {
+                return Collections.emptySet();
+            }
+            Set<String> direct = receiverTypesByMethod.get(methodId);
+            if (direct != null && !direct.isEmpty()) {
+                return direct;
+            }
+            String coarse = normalizeRuntimeMethodKey(methodId);
+            if (isBlank(coarse)) {
+                return Collections.emptySet();
+            }
+            Set<String> coarseTypes = receiverTypesByMethod.get(coarse);
+            return coarseTypes == null ? Collections.<String>emptySet() : coarseTypes;
+        }
+
+        private boolean containsReceiverType(String methodId, String receiverType) {
+            if (isBlank(methodId) || isBlank(receiverType)) {
+                return false;
+            }
+            Set<String> observed = receiverTypes(methodId);
+            if (observed.contains(receiverType)) {
+                return true;
+            }
+            String normalized = normalizeTypeName(receiverType);
+            return !isBlank(normalized) && observed.contains(normalized);
+        }
+
+        private Set<String> parameterTypes(String methodId, int parameterIndex) {
+            if (isBlank(methodId) || parameterIndex < 0) {
+                return Collections.emptySet();
+            }
+            Map<Integer, Set<String>> byIndex = parameterTypesByMethod.get(methodId);
+            if (byIndex == null || byIndex.isEmpty()) {
+                String coarse = normalizeRuntimeMethodKey(methodId);
+                byIndex = parameterTypesByMethod.get(coarse);
+            }
+            if (byIndex == null || byIndex.isEmpty()) {
+                return Collections.emptySet();
+            }
+            Set<String> values = byIndex.get(Integer.valueOf(parameterIndex));
+            return values == null ? Collections.<String>emptySet() : values;
+        }
+
+        private Set<String> methodFieldTypes(String methodId, String fieldName) {
+            if (isBlank(methodId) || isBlank(fieldName)) {
+                return Collections.emptySet();
+            }
+            Map<String, Set<String>> byField = fieldTypesByMethodAndField.get(methodId);
+            if (byField == null || byField.isEmpty()) {
+                String coarse = normalizeRuntimeMethodKey(methodId);
+                byField = fieldTypesByMethodAndField.get(coarse);
+            }
+            if (byField == null || byField.isEmpty()) {
+                return Collections.emptySet();
+            }
+            Set<String> values = byField.get(fieldName);
+            return values == null ? Collections.<String>emptySet() : values;
+        }
+
+        private Set<String> ownerFieldTypes(String ownerType, String fieldName) {
+            if (isBlank(ownerType) || isBlank(fieldName)) {
+                return Collections.emptySet();
+            }
+            String key = normalizeOwnerFieldKey(ownerType + "." + fieldName);
+            if (isBlank(key)) {
+                return Collections.emptySet();
+            }
+            Set<String> values = ownerFieldTypes.get(key);
+            return values == null ? Collections.<String>emptySet() : values;
+        }
+    }
+
     public static class CliOptions {
         public final Path projectRoot;
         public final Path outputDir;
@@ -4599,6 +5491,7 @@ public class SpringCallPathAnalyzer {
         public final String entryMethod;
         public final boolean debug;
         public final Path debugOut;
+        public final Path runtimeTraceJson;
         public final Set<String> externalRpcPrefixes;
         public final Set<String> nonExternalRpcPrefixes;
 
@@ -4610,6 +5503,7 @@ public class SpringCallPathAnalyzer {
                            String entryMethod,
                            boolean debug,
                            Path debugOut,
+                           Path runtimeTraceJson,
                            Set<String> externalRpcPrefixes,
                            Set<String> nonExternalRpcPrefixes) {
             this.projectRoot = projectRoot;
@@ -4620,6 +5514,7 @@ public class SpringCallPathAnalyzer {
             this.entryMethod = entryMethod;
             this.debug = debug;
             this.debugOut = debugOut;
+            this.runtimeTraceJson = runtimeTraceJson;
             this.externalRpcPrefixes = externalRpcPrefixes;
             this.nonExternalRpcPrefixes = nonExternalRpcPrefixes;
         }
@@ -4633,6 +5528,7 @@ public class SpringCallPathAnalyzer {
             String entryMethod = null;
             boolean debug = false;
             Path debugOut = null;
+            Path runtimeTraceJson = null;
             Set<String> externalRpcPrefixes = new LinkedHashSet<String>();
             Set<String> nonExternalRpcPrefixes = new LinkedHashSet<String>();
 
@@ -4654,6 +5550,8 @@ public class SpringCallPathAnalyzer {
                     debug = true;
                 } else if ("--debug-out".equals(arg) && i + 1 < args.length) {
                     debugOut = Paths.get(args[++i]).toAbsolutePath().normalize();
+                } else if ("--runtime-trace-json".equals(arg) && i + 1 < args.length) {
+                    runtimeTraceJson = Paths.get(args[++i]).toAbsolutePath().normalize();
                 } else if ("--external-rpc-prefix".equals(arg) && i + 1 < args.length) {
                     collectPackagePrefixes(externalRpcPrefixes, args[++i]);
                 } else if ("--non-external-rpc-prefix".equals(arg) && i + 1 < args.length) {
@@ -4673,6 +5571,7 @@ public class SpringCallPathAnalyzer {
                     entryMethod,
                     debug,
                     debugOut,
+                    runtimeTraceJson,
                     normalizePackagePrefixes(externalRpcPrefixes),
                     normalizePackagePrefixes(nonExternalRpcPrefixes)
             );
