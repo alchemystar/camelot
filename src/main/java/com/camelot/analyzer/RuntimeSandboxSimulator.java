@@ -638,6 +638,10 @@ public class RuntimeSandboxSimulator {
             return springTargetType;
         }
         if (Proxy.isProxyClass(runtimeClass)) {
+            String handlerTargetType = resolveJdkProxyHandlerTargetTypeName(self, runtimeClass, fallback);
+            if (handlerTargetType != null) {
+                return handlerTargetType;
+            }
             String mappedFromDeclared = mapDeclaredTypeToConcrete(fallback);
             if (mappedFromDeclared != null) {
                 debugAdviceLine("ADVICE_TYPE_RESOLVE_PROXY declared=" + fallback + " mapped=" + mappedFromDeclared);
@@ -665,6 +669,206 @@ public class RuntimeSandboxSimulator {
         return runtimeName;
     }
 
+    private static String resolveJdkProxyHandlerTargetTypeName(Object self,
+                                                               Class<?> runtimeClass,
+                                                               String fallback) {
+        if (self == null || runtimeClass == null || !Proxy.isProxyClass(runtimeClass)) {
+            return null;
+        }
+        String runtimeName = runtimeClass.getName();
+        String cacheKey = runtimeName + "@handler@" + System.identityHashCode(self) + "|" + fallback;
+        String cached = PROXY_RUNTIME_TYPE_CACHE.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+        InvocationHandler handler;
+        try {
+            handler = Proxy.getInvocationHandler(self);
+        } catch (Throwable error) {
+            debugAdviceLine("ADVICE_TYPE_RESOLVE_HANDLER_FAIL proxy="
+                    + runtimeName + " error=" + error.getClass().getName());
+            return null;
+        }
+        if (handler == null) {
+            return null;
+        }
+        Class<?> declaredType = tryLoadClass(fallback, runtimeClass.getClassLoader());
+        if (declaredType == null) {
+            declaredType = tryLoadClass(fallback, Thread.currentThread().getContextClassLoader());
+        }
+        Class<?> targetClass = extractTargetClassFromHandler(handler, declaredType);
+        Class<?> normalizedTarget = normalizePotentialProxyClass(targetClass);
+        if (normalizedTarget == null || isBlank(normalizedTarget.getName())) {
+            return null;
+        }
+        String targetName = normalizedTarget.getName();
+        PROXY_RUNTIME_TYPE_CACHE.put(cacheKey, targetName);
+        debugAdviceLine("ADVICE_TYPE_RESOLVE_HANDLER proxy=" + runtimeName
+                + " handler=" + handler.getClass().getName()
+                + " target=" + targetName);
+        return targetName;
+    }
+
+    private static Class<?> extractTargetClassFromHandler(InvocationHandler handler, Class<?> declaredType) {
+        if (handler == null) {
+            return null;
+        }
+        Object advised = readFieldFromHierarchy(handler, "advised");
+        if (advised != null) {
+            Class<?> fromAdvised = extractTargetClassFromAdvised(advised, declaredType);
+            if (fromAdvised != null) {
+                return fromAdvised;
+            }
+        }
+        Object target = readFieldFromHierarchy(handler, "target");
+        if (target != null) {
+            Class<?> fromTargetField = normalizePotentialProxyClass(target.getClass());
+            if (isUsableResolvedClass(fromTargetField, declaredType)) {
+                return fromTargetField;
+            }
+        }
+
+        Class<?> current = handler.getClass();
+        int depth = 0;
+        while (current != null && current != Object.class && depth < 5) {
+            Field[] fields = current.getDeclaredFields();
+            if (fields != null) {
+                for (Field field : fields) {
+                    if (field == null || Modifier.isStatic(field.getModifiers())) {
+                        continue;
+                    }
+                    if (field.getType().isPrimitive()) {
+                        continue;
+                    }
+                    Object value = readFieldValue(handler, field);
+                    if (value == null) {
+                        continue;
+                    }
+                    Class<?> candidate;
+                    if (value instanceof Class<?>) {
+                        candidate = (Class<?>) value;
+                    } else {
+                        candidate = normalizePotentialProxyClass(value.getClass());
+                    }
+                    if (isUsableResolvedClass(candidate, declaredType)) {
+                        return candidate;
+                    }
+                }
+            }
+            current = current.getSuperclass();
+            depth++;
+        }
+        return null;
+    }
+
+    private static Class<?> extractTargetClassFromAdvised(Object advised, Class<?> declaredType) {
+        if (advised == null) {
+            return null;
+        }
+        Class<?> targetClass = invokeNoArgClass(advised, "getTargetClass");
+        if (isUsableResolvedClass(targetClass, declaredType)) {
+            return normalizePotentialProxyClass(targetClass);
+        }
+        Object targetSource = invokeNoArgObject(advised, "getTargetSource");
+        if (targetSource != null) {
+            Class<?> sourceTargetClass = invokeNoArgClass(targetSource, "getTargetClass");
+            if (isUsableResolvedClass(sourceTargetClass, declaredType)) {
+                return normalizePotentialProxyClass(sourceTargetClass);
+            }
+            Object sourceTarget = invokeNoArgObject(targetSource, "getTarget");
+            if (sourceTarget != null) {
+                Class<?> sourceTargetType = normalizePotentialProxyClass(sourceTarget.getClass());
+                if (isUsableResolvedClass(sourceTargetType, declaredType)) {
+                    return sourceTargetType;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isUsableResolvedClass(Class<?> candidate, Class<?> declaredType) {
+        if (candidate == null || Object.class.equals(candidate) || Proxy.isProxyClass(candidate)) {
+            return false;
+        }
+        if (declaredType == null) {
+            return true;
+        }
+        return declaredType.isAssignableFrom(candidate);
+    }
+
+    private static Class<?> normalizePotentialProxyClass(Class<?> rawClass) {
+        if (rawClass == null) {
+            return null;
+        }
+        if (Proxy.isProxyClass(rawClass)) {
+            return null;
+        }
+        String name = rawClass.getName();
+        if (isBlank(name)) {
+            return null;
+        }
+        if (name.contains("$$") || name.contains("$ByteBuddy$")) {
+            Class<?> superClass = rawClass.getSuperclass();
+            if (superClass != null && !Object.class.equals(superClass)) {
+                return superClass;
+            }
+        }
+        return rawClass;
+    }
+
+    private static Object readFieldFromHierarchy(Object owner, String fieldName) {
+        if (owner == null || isBlank(fieldName)) {
+            return null;
+        }
+        Class<?> current = owner.getClass();
+        int depth = 0;
+        while (current != null && current != Object.class && depth < 6) {
+            try {
+                Field field = current.getDeclaredField(fieldName);
+                return readFieldValue(owner, field);
+            } catch (NoSuchFieldException ignore) {
+                current = current.getSuperclass();
+                depth++;
+            } catch (Throwable ignore) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static Object readFieldValue(Object owner, Field field) {
+        if (owner == null || field == null) {
+            return null;
+        }
+        try {
+            field.setAccessible(true);
+            return field.get(owner);
+        } catch (Throwable ignore) {
+            return null;
+        }
+    }
+
+    private static Object invokeNoArgObject(Object target, String methodName) {
+        if (target == null || isBlank(methodName)) {
+            return null;
+        }
+        try {
+            Method method = target.getClass().getMethod(methodName);
+            method.setAccessible(true);
+            return method.invoke(target);
+        } catch (Throwable ignore) {
+            return null;
+        }
+    }
+
+    private static Class<?> invokeNoArgClass(Object target, String methodName) {
+        Object result = invokeNoArgObject(target, methodName);
+        if (result instanceof Class<?>) {
+            return (Class<?>) result;
+        }
+        return null;
+    }
+
     private static String resolveSpringAopTargetTypeName(Object self, Class<?> runtimeClass, String fallback) {
         if (self == null || runtimeClass == null) {
             return null;
@@ -678,7 +882,7 @@ public class RuntimeSandboxSimulator {
                 && runtimeName.indexOf("$ByteBuddy$") < 0) {
             return null;
         }
-        String cacheKey = runtimeName + "|" + fallback;
+        String cacheKey = runtimeName + "@" + System.identityHashCode(self) + "|" + fallback;
         String cached = PROXY_RUNTIME_TYPE_CACHE.get(cacheKey);
         if (cached != null) {
             return cached;
