@@ -2054,6 +2054,16 @@ public class RuntimeSandboxSimulator {
                                  Object[] args,
                                  Object returned,
                                  Throwable thrown) {
+            onMethodExit(typeName, methodName, self, args, returned, thrown, false);
+        }
+
+        public void onMethodExit(String typeName,
+                                 String methodName,
+                                 Object self,
+                                 Object[] args,
+                                 Object returned,
+                                 Throwable thrown,
+                                 boolean softFailSuppressed) {
             String methodId = methodId(typeName, methodName);
             Deque<String> stack = stackByThread.get();
             Deque<FrameState> frameStack = frameByThread.get();
