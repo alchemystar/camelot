@@ -184,6 +184,24 @@ public class RuntimeSandboxSimulator {
             System.out.println("ErrorStack:");
             System.out.println(report.errorStack);
         }
+        forceProcessExit(0, options.debugRuntime);
+    }
+
+    private static void forceProcessExit(int exitCode, boolean debugRuntime) {
+        Thread killer = new Thread(() -> {
+            try {
+                Thread.sleep(1500L);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            if (debugRuntime) {
+                System.out.println("[RUNTIME_DEBUG] FORCE_HALT exitCode=" + exitCode);
+            }
+            Runtime.getRuntime().halt(exitCode);
+        }, "runtime-sandbox-force-halt");
+        killer.setDaemon(true);
+        killer.start();
+        System.exit(exitCode);
     }
 
     private static ProjectAwareClassLoader buildClassLoader(CliOptions options,
