@@ -7,7 +7,6 @@ import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.DynamicType;
-import net.bytebuddy.implementation.bytecode.assign.Assigner;
 import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 import net.bytebuddy.utility.JavaModule;
@@ -67,6 +66,7 @@ import static net.bytebuddy.matcher.ElementMatchers.isAbstract;
 import static net.bytebuddy.matcher.ElementMatchers.isConstructor;
 import static net.bytebuddy.matcher.ElementMatchers.isMethod;
 import static net.bytebuddy.matcher.ElementMatchers.isNative;
+import static net.bytebuddy.matcher.ElementMatchers.isStatic;
 import static net.bytebuddy.matcher.ElementMatchers.isSynthetic;
 import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
 import static net.bytebuddy.matcher.ElementMatchers.named;
@@ -493,6 +493,7 @@ public class RuntimeSandboxSimulator {
                                         isMethod()
                                                 .and(not(isAbstract()))
                                                 .and(not(isNative()))
+                                                .and(not(isStatic()))
                                                 .and(not(isSynthetic()))
                                                 .and(not(named("toString")))
                                                 .and(not(named("hashCode")))
@@ -1547,7 +1548,7 @@ public class RuntimeSandboxSimulator {
         @Advice.OnMethodEnter(suppress = Throwable.class)
         public static String onEnter(@Advice.Origin("#t") String typeName,
                                      @Advice.Origin("#m") String methodName,
-                                     @Advice.This(optional = true) Object self,
+                                     @Advice.This Object self,
                                      @Advice.AllArguments Object[] args) {
             ADVICE_HITS.incrementAndGet();
             if (isAdviceReentryGuarded()) {
@@ -1588,11 +1589,9 @@ public class RuntimeSandboxSimulator {
         public static void onExit(@Advice.Enter String methodId,
                                   @Advice.Origin("#t") String typeName,
                                   @Advice.Origin("#m") String methodName,
-                                  @Advice.Origin Method originMethod,
-                                  @Advice.This(optional = true) Object self,
+                                  @Advice.This Object self,
                                   @Advice.AllArguments Object[] args,
-                                  @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC, optional = true) Object returned,
-                                  @Advice.Thrown(readOnly = false, typing = Assigner.Typing.DYNAMIC) Throwable thrown) {
+                                  @Advice.Thrown(readOnly = false) Throwable thrown) {
             if (methodId == null || isAdviceReentryGuarded()) {
                 return;
             }
@@ -1608,26 +1607,23 @@ public class RuntimeSandboxSimulator {
                     && softFailController.shouldSuppress(typeName, methodName, thrown)) {
                 softFailController.recordSuppressed(methodId, thrown);
                 softFailSuppressed = true;
-                if (originMethod != null && !Void.TYPE.equals(originMethod.getReturnType())) {
-                    returned = SoftFailController.defaultReturnValue(originMethod.getReturnType());
-                }
                 thrown = null;
             }
             if (collector == null || methodId == null) {
                 if (typeCollector != null) {
-                    typeCollector.onMethodExit(typeName, methodName, self, args, returned, observedThrown);
+                    typeCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown);
                 }
                 if (executionCollector != null) {
-                    executionCollector.onMethodExit(typeName, methodName, self, args, returned, observedThrown, softFailSuppressed);
+                    executionCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown, softFailSuppressed);
                 }
                 return;
             }
             collector.onExit(methodId);
             if (typeCollector != null) {
-                typeCollector.onMethodExit(typeName, methodName, self, args, returned, observedThrown);
+                typeCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown);
             }
             if (executionCollector != null) {
-                executionCollector.onMethodExit(typeName, methodName, self, args, returned, observedThrown, softFailSuppressed);
+                executionCollector.onMethodExit(typeName, methodName, self, args, null, observedThrown, softFailSuppressed);
             }
             } finally {
                 exitAdviceReentryGuard();
@@ -1695,6 +1691,15 @@ public class RuntimeSandboxSimulator {
                     captureContainerTypes(arg, argState, "arg-pipeline");
                 }
             }
+        }
+
+        public void onMethodExit(String typeName,
+                                 String methodName,
+                                 Object self,
+                                 Object[] args,
+                                 Object returned,
+                                 Throwable thrown) {
+            onMethodExit(typeName, methodName, self, args, returned, thrown, false);
         }
 
         public void onMethodExit(String typeName,
