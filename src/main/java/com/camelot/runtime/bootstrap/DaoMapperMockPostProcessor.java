@@ -25,12 +25,27 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private static final String MYBATIS_MAPPER_FACTORY = "org.mybatis.spring.mapper.MapperFactoryBean";
 
     private final List<String> packagePrefixes;
-    private final Set<String> targetSuffixes;
+    private final Set<String> daoMapperSuffixes;
+    private final Set<String> forceMockSuffixes;
+    private final Set<String> forceMockTypeNames;
+    private final List<String> forceMockTypePrefixes;
+    private final Set<String> forceMockBeanNames;
     private final Map<String, String> mockedBeanTypes = new LinkedHashMap<String, String>();
 
-    DaoMapperMockPostProcessor(List<String> packagePrefixes) {
+    DaoMapperMockPostProcessor(List<String> packagePrefixes,
+                               List<String> forceMockTypePrefixes,
+                               Set<String> forceMockBeanNames) {
         this.packagePrefixes = normalizePackages(packagePrefixes);
-        this.targetSuffixes = new LinkedHashSet<String>(Arrays.asList("Dao", "Mapper"));
+        this.daoMapperSuffixes = new LinkedHashSet<String>(Arrays.asList("Dao", "Mapper"));
+        this.forceMockSuffixes = new LinkedHashSet<String>(Arrays.asList("DataSource"));
+        this.forceMockTypeNames = new LinkedHashSet<String>(Arrays.asList(
+                "javax.sql.DataSource",
+                "jakarta.sql.DataSource"
+        ));
+        this.forceMockTypePrefixes = normalizePackages(forceMockTypePrefixes);
+        this.forceMockBeanNames = forceMockBeanNames == null
+                ? Collections.<String>emptySet()
+                : new LinkedHashSet<String>(forceMockBeanNames);
     }
 
     @Override
@@ -76,6 +91,15 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     }
 
     private boolean shouldMock(String beanName, MockTarget target) {
+        if (beanName != null && forceMockBeanNames.contains(beanName)) {
+            return true;
+        }
+        if (hasAnyPrefix(target.typeName, forceMockTypePrefixes)) {
+            return true;
+        }
+        if (isForceMockType(beanName, target)) {
+            return true;
+        }
         if (!isBusinessPackage(target.typeName)) {
             return false;
         }
@@ -85,10 +109,10 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (target.mybatisMapperFactory) {
             return true;
         }
-        if (hasTargetSuffix(target.typeName)) {
+        if (hasAnySuffix(target.typeName, daoMapperSuffixes)) {
             return true;
         }
-        return hasTargetSuffix(beanName);
+        return hasAnySuffix(beanName, daoMapperSuffixes);
     }
 
     private boolean isBusinessPackage(String className) {
@@ -111,13 +135,43 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 || className.startsWith("com.camelot.runtime.");
     }
 
-    private boolean hasTargetSuffix(String value) {
+    private boolean isForceMockType(String beanName, MockTarget target) {
+        if (beanName != null && "datasource".equalsIgnoreCase(beanName.trim())) {
+            return true;
+        }
+        if (forceMockTypeNames.contains(target.typeName)) {
+            return true;
+        }
+        if (hasAnySuffix(target.typeName, forceMockSuffixes)) {
+            return true;
+        }
+        return hasAnySuffix(beanName, forceMockSuffixes);
+    }
+
+    private boolean hasAnySuffix(String value, Set<String> suffixes) {
         String clean = value == null ? "" : value.trim();
         if (clean.isEmpty()) {
             return false;
         }
-        for (String suffix : targetSuffixes) {
+        for (String suffix : suffixes) {
             if (clean.endsWith(suffix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasAnyPrefix(String value, List<String> prefixes) {
+        String clean = value == null ? "" : value.trim();
+        if (clean.isEmpty() || prefixes == null || prefixes.isEmpty()) {
+            return false;
+        }
+        for (String prefix : prefixes) {
+            if (prefix == null || prefix.trim().isEmpty()) {
+                continue;
+            }
+            String normalized = prefix.trim();
+            if (clean.equals(normalized) || clean.startsWith(normalized + ".")) {
                 return true;
             }
         }
@@ -143,6 +197,14 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         String factoryTypeName = asTypeName(factoryType);
         if (factoryTypeName != null) {
             return new MockTarget(factoryTypeName, false);
+        }
+        try {
+            Class<?> resolved = definition.getResolvableType().resolve();
+            if (resolved != null) {
+                return new MockTarget(resolved.getName(), false);
+            }
+        } catch (Throwable ignored) {
+            // Best effort only.
         }
         return null;
     }

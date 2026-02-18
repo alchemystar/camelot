@@ -23,6 +23,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class SpringBootNativeLauncher {
 
@@ -32,6 +34,12 @@ public final class SpringBootNativeLauncher {
             "org.springframework.boot.autoconfigure.SpringBootApplication",
             "org.mybatis.spring.annotation.MapperScan"
     ));
+    private static final List<Pattern> FAILED_BEAN_PATTERNS = Arrays.asList(
+            Pattern.compile("Error creating bean with name '([^']+)'"),
+            Pattern.compile("bean named '([^']+)'"),
+            Pattern.compile("No qualifying bean named '([^']+)'")
+    );
+    private static final int DEFAULT_MAX_INIT_SKIP_RETRIES = 12;
 
     public StartResult start(StartRequest request) {
         validate(request);
@@ -47,17 +55,48 @@ public final class SpringBootNativeLauncher {
                     ? Collections.singletonList("test")
                     : request.getActiveProfiles();
             Map<String, String> launchProperties = mergeLaunchProperties(request.getExtraProperties());
-            RunOutcome outcome;
-            try {
-                outcome = runApplication(startupClass, classLoader, activeProfiles, launchProperties, packagePrefixes, request);
-            } catch (IllegalStateException firstError) {
-                if (!isMissingServletEnvironmentClass(firstError)) {
-                    throw firstError;
+            List<String> forceMockClassPrefixes = new ArrayList<String>(request.getForceMockClassPrefixes());
+            LinkedHashSet<String> forceMockBeanNames = new LinkedHashSet<String>();
+            boolean servletFallbackApplied = false;
+            RunOutcome outcome = null;
+            IllegalStateException lastError = null;
+            for (int attempt = 0; attempt < DEFAULT_MAX_INIT_SKIP_RETRIES; attempt++) {
+                try {
+                    outcome = runApplication(
+                            startupClass,
+                            classLoader,
+                            activeProfiles,
+                            launchProperties,
+                            packagePrefixes,
+                            forceMockClassPrefixes,
+                            forceMockBeanNames,
+                            request
+                    );
+                    lastError = null;
+                    break;
+                } catch (IllegalStateException runError) {
+                    lastError = runError;
+                    if (!servletFallbackApplied && isMissingServletEnvironmentClass(runError)) {
+                        LinkedHashMap<String, String> fallbackProperties = new LinkedHashMap<String, String>(launchProperties);
+                        fallbackProperties.put("spring.main.web-application-type", "none");
+                        launchProperties = fallbackProperties;
+                        servletFallbackApplied = true;
+                        continue;
+                    }
+                    String failedBeanName = extractFailedBeanName(runError);
+                    if (failedBeanName == null || failedBeanName.trim().isEmpty()) {
+                        break;
+                    }
+                    if (!forceMockBeanNames.add(failedBeanName.trim())) {
+                        break;
+                    }
                 }
-                LinkedHashMap<String, String> fallbackProperties = new LinkedHashMap<String, String>(launchProperties);
-                fallbackProperties.put("spring.main.web-application-type", "none");
-                launchProperties = fallbackProperties;
-                outcome = runApplication(startupClass, classLoader, activeProfiles, launchProperties, packagePrefixes, request);
+            }
+            if (lastError != null) {
+                throw lastError;
+            }
+            if (outcome == null) {
+                throw new IllegalStateException("Spring context start failed without explicit error details");
             }
             Object context = outcome.contextObject;
             if (context == null) {
@@ -80,9 +119,16 @@ public final class SpringBootNativeLauncher {
                                              List<String> activeProfiles,
                                              Map<String, String> launchProperties,
                                              List<String> packagePrefixes,
+                                             List<String> forceMockClassPrefixes,
+                                             Set<String> forceMockBeanNames,
                                              StartRequest request) {
         List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
-        InitializerHandle initializerHandle = createMockingInitializerHandle(classLoader, packagePrefixes);
+        InitializerHandle initializerHandle = createMockingInitializerHandle(
+                classLoader,
+                packagePrefixes,
+                forceMockClassPrefixes,
+                forceMockBeanNames
+        );
         Object builder = createBuilderInstance(startupClass, classLoader);
         builder = invokeBuilder(builder, "profiles", new Class[]{String[].class}, new Object[]{activeProfiles.toArray(new String[0])});
         builder = invokeBuilder(
@@ -99,6 +145,50 @@ public final class SpringBootNativeLauncher {
                 new Object[]{request.getApplicationArgs().toArray(new String[0])}
         );
         return new RunOutcome(contextObject, initializerHandle.snapshotMockedBeanTypes());
+    }
+
+    private static String extractFailedBeanName(Throwable error) {
+        Throwable cursor = error;
+        while (cursor != null) {
+            String beanNameFromType = extractBeanNameFromExceptionType(cursor);
+            if (!isBlank(beanNameFromType)) {
+                return beanNameFromType;
+            }
+            String message = cursor.getMessage();
+            if (!isBlank(message)) {
+                for (Pattern pattern : FAILED_BEAN_PATTERNS) {
+                    Matcher matcher = pattern.matcher(message);
+                    if (matcher.find()) {
+                        String candidate = matcher.group(1);
+                        if (!isBlank(candidate)) {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+            cursor = cursor.getCause();
+        }
+        return null;
+    }
+
+    private static String extractBeanNameFromExceptionType(Throwable error) {
+        if (error == null) {
+            return null;
+        }
+        if (!"org.springframework.beans.factory.BeanCreationException".equals(error.getClass().getName())) {
+            return null;
+        }
+        try {
+            Method method = error.getClass().getMethod("getBeanName");
+            Object result = method.invoke(error);
+            return result == null ? null : String.valueOf(result);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isBlank(String text) {
+        return text == null || text.trim().isEmpty();
     }
 
     private static boolean isMissingServletEnvironmentClass(Throwable error) {
@@ -220,7 +310,9 @@ public final class SpringBootNativeLauncher {
     }
 
     private static InitializerHandle createMockingInitializerHandle(final ClassLoader classLoader,
-                                                                    final List<String> packagePrefixes) {
+                                                                    final List<String> packagePrefixes,
+                                                                    final List<String> forceMockClassPrefixes,
+                                                                    final Set<String> forceMockBeanNames) {
         try {
             final Class<?> initializerType = Class.forName(
                     "org.springframework.context.ApplicationContextInitializer",
@@ -237,7 +329,7 @@ public final class SpringBootNativeLauncher {
                     true,
                     classLoader
             );
-            final Constructor<?> constructor = postProcessorClass.getDeclaredConstructor(List.class);
+            final Constructor<?> constructor = postProcessorClass.getDeclaredConstructor(List.class, List.class, Set.class);
             constructor.setAccessible(true);
             final AtomicReference<Object> postProcessorRef = new AtomicReference<Object>();
 
@@ -247,7 +339,11 @@ public final class SpringBootNativeLauncher {
                     String name = method.getName();
                     if ("initialize".equals(name) && args != null && args.length == 1 && args[0] != null) {
                         Object context = args[0];
-                        Object postProcessor = constructor.newInstance(new ArrayList<String>(packagePrefixes));
+                        Object postProcessor = constructor.newInstance(
+                                new ArrayList<String>(packagePrefixes),
+                                new ArrayList<String>(forceMockClassPrefixes),
+                                new LinkedHashSet<String>(forceMockBeanNames)
+                        );
                         postProcessorRef.set(postProcessor);
                         Method addPostProcessor = context.getClass().getMethod(
                                 "addBeanFactoryPostProcessor",
@@ -546,6 +642,7 @@ public final class SpringBootNativeLauncher {
         private String projectDir;
         private List<String> activeProfiles = Collections.singletonList("test");
         private List<String> mockPackagePrefixes = Collections.emptyList();
+        private List<String> forceMockClassPrefixes = Collections.emptyList();
         private List<String> applicationArgs = Collections.emptyList();
         private Map<String, String> extraProperties = Collections.emptyMap();
 
@@ -583,6 +680,16 @@ public final class SpringBootNativeLauncher {
 
         public void setMockPackagePrefixes(List<String> mockPackagePrefixes) {
             this.mockPackagePrefixes = mockPackagePrefixes == null ? Collections.<String>emptyList() : mockPackagePrefixes;
+        }
+
+        public List<String> getForceMockClassPrefixes() {
+            return forceMockClassPrefixes;
+        }
+
+        public void setForceMockClassPrefixes(List<String> forceMockClassPrefixes) {
+            this.forceMockClassPrefixes = forceMockClassPrefixes == null
+                    ? Collections.<String>emptyList()
+                    : forceMockClassPrefixes;
         }
 
         public List<String> getApplicationArgs() {

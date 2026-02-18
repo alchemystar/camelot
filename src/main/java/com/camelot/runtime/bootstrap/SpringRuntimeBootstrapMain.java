@@ -67,6 +67,7 @@ public final class SpringRuntimeBootstrapMain {
         private String projectDir;
         private final Set<String> profiles = new LinkedHashSet<String>();
         private final Set<String> scanPackages = new LinkedHashSet<String>();
+        private final Set<String> forceMockClassPrefixes = new LinkedHashSet<String>();
         private final List<String> appArgs = new ArrayList<String>();
         private final Map<String, String> extraProperties = new LinkedHashMap<String, String>();
         private boolean keepRunning;
@@ -96,6 +97,10 @@ public final class SpringRuntimeBootstrapMain {
                 }
                 if (arg.startsWith("--scan-package=")) {
                     addCommaSeparated(options.scanPackages, arg.substring("--scan-package=".length()));
+                    continue;
+                }
+                if (arg.startsWith("--force-mock-class-prefix=")) {
+                    addCommaSeparated(options.forceMockClassPrefixes, arg.substring("--force-mock-class-prefix=".length()));
                     continue;
                 }
                 if (arg.startsWith("--arg=")) {
@@ -134,6 +139,7 @@ public final class SpringRuntimeBootstrapMain {
             request.setProjectDir(projectDir);
             request.setActiveProfiles(new ArrayList<String>(profiles));
             request.setMockPackagePrefixes(new ArrayList<String>(scanPackages));
+            request.setForceMockClassPrefixes(new ArrayList<String>(forceMockClassPrefixes));
             request.setApplicationArgs(new ArrayList<String>(appArgs));
             request.setExtraProperties(new LinkedHashMap<String, String>(extraProperties));
             return request;
