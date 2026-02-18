@@ -55,8 +55,6 @@ public final class SpringBootNativeLauncher {
             Pattern.compile("Could not resolve matching constructor on bean class \\[([^\\]]+)\\]"),
             Pattern.compile("Lookup method resolution failed; nested exception is java\\.lang\\.IllegalStateException: Failed to introspect Class \\[([^\\]]+)\\]")
     );
-    private static final int DEFAULT_MAX_INIT_SKIP_RETRIES = 12;
-
     public StartResult start(StartRequest request) {
         validate(request);
 
@@ -78,7 +76,9 @@ public final class SpringBootNativeLauncher {
             boolean suppressSpringApplicationCallbacks = false;
             RunOutcome outcome = null;
             IllegalStateException lastError = null;
-            for (int attempt = 0; attempt < DEFAULT_MAX_INIT_SKIP_RETRIES; attempt++) {
+            int attempt = 0;
+            while (true) {
+                attempt++;
                 try {
                     outcome = runApplication(
                             startupClass,
@@ -95,6 +95,7 @@ public final class SpringBootNativeLauncher {
                     break;
                 } catch (IllegalStateException runError) {
                     lastError = runError;
+                    LOG.warn("Spring startup attempt {} failed, apply mock fallback and retry.", Integer.valueOf(attempt));
                     if (!servletFallbackApplied && isMissingServletEnvironmentClass(runError)) {
                         LinkedHashMap<String, String> fallbackProperties = new LinkedHashMap<String, String>(launchProperties);
                         fallbackProperties.put("spring.main.web-application-type", "none");
