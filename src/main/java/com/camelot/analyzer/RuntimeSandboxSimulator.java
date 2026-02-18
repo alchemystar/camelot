@@ -2571,9 +2571,24 @@ public class RuntimeSandboxSimulator {
                 if (name.endsWith("AutoConfiguration")) {
                     return true;
                 }
-                if (hasAnnotation(beanClass.getAnnotations(), "Configuration")
-                        || hasAnnotation(beanClass.getAnnotations(), "ComponentScan")) {
+                if (hasAnnotationSimple(beanClass.getAnnotations(), "Configuration")
+                        || hasAnnotationSimple(beanClass.getAnnotations(), "ComponentScan")) {
                     return true;
+                }
+                return false;
+            }
+
+            private boolean hasAnnotationSimple(Annotation[] annotations, String simpleName) {
+                if (annotations == null || annotations.length == 0 || isBlank(simpleName)) {
+                    return false;
+                }
+                for (Annotation annotation : annotations) {
+                    if (annotation == null) {
+                        continue;
+                    }
+                    if (simpleName.equals(annotation.annotationType().getSimpleName())) {
+                        return true;
+                    }
                 }
                 return false;
             }
