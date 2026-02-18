@@ -56,12 +56,15 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
     @Override
     public void postProcessBeanDefinitionRegistry(BeanDefinitionRegistry registry) {
+        emitDiagnostic("Enter postProcessBeanDefinitionRegistry: registryType=" + registry.getClass().getName());
         LOG.info("Enter postProcessBeanDefinitionRegistry: registryType={}", registry.getClass().getName());
         // Replace in postProcessBeanFactory so component-scan and mapper-scan definitions are already registered.
     }
 
     @Override
     public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+        emitDiagnostic("Enter postProcessBeanFactory: beanFactoryType=" + beanFactory.getClass().getName()
+                + " beanDefinitionCount=" + beanFactory.getBeanDefinitionCount());
         LOG.info("Enter postProcessBeanFactory: beanFactoryType={} beanDefinitionCount={}",
                 beanFactory.getClass().getName(),
                 beanFactory.getBeanDefinitionCount());
@@ -115,6 +118,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (!evaluation.hasMatch()) {
             return false;
         }
+        emitDiagnostic("Force-prefix matched bean '" + beanName + "' prefix='" + evaluation.matchedPrefix
+                + "' matchedType='" + evaluation.matchedTypeName + "' candidates=" + evaluation.candidateTypes);
         LOG.info(
                 "Force-prefix matched bean '{}' prefix='{}' matchedType='{}' candidates={}",
                 beanName,
@@ -164,7 +169,12 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         registry.removeBeanDefinition(beanName);
         registry.registerBeanDefinition(beanName, replacement);
         mockedBeanTypes.put(beanName, target.typeName);
+        emitDiagnostic("Mock bean '" + beanName + "' as '" + target.typeName + "' reason=" + reason);
         LOG.info("Mock bean '{}' as '{}' reason={}", beanName, target.typeName, reason);
+    }
+
+    private void emitDiagnostic(String text) {
+        System.err.println("[camelot-mock] " + text);
     }
 
     @Override
