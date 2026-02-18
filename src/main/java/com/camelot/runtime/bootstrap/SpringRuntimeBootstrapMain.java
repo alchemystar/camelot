@@ -1,7 +1,5 @@
 package com.camelot.runtime.bootstrap;
 
-import org.springframework.context.ConfigurableApplicationContext;
-
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -53,12 +51,12 @@ public final class SpringRuntimeBootstrapMain {
         }
     }
 
-    private static void safeClose(ConfigurableApplicationContext context) {
+    private static void safeClose(Object context) {
         if (context == null) {
             return;
         }
         try {
-            context.close();
+            context.getClass().getMethod("close").invoke(context);
         } catch (Exception ignored) {
             // Ignore close failures for one-shot runtime bootstrap.
         }

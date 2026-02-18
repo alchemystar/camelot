@@ -53,3 +53,7 @@ mvn -q -Dmaven.repo.local=.m2repo exec:java \
 - `--keep-running`：启动后不主动关闭上下文
 - `--scan-package=com.xxx`：手工指定 mock 扫描包（不传时会从启动类注解中自动解析）
 - `--project-dir=/path/to/project`：指定待启动工程目录（从该目录加载 `target/classes`、`target/dependency/*.jar`）
+
+兼容说明：
+
+- 如果启动时遇到 `ApplicationServletEnvironment`（或拼写为 `ApplicaitonServletEnvironment`）相关 `ClassNotFoundException`，启动器会自动降级到 `spring.main.web-application-type=none` 再重试一次。

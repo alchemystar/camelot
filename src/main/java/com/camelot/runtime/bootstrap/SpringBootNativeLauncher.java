@@ -1,12 +1,10 @@
 package com.camelot.runtime.bootstrap;
 
-import org.springframework.context.ApplicationContextInitializer;
-import org.springframework.context.ConfigurableApplicationContext;
-import org.springframework.context.support.GenericApplicationContext;
-
 import java.io.IOException;
 import java.lang.annotation.Annotation;
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -24,6 +22,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class SpringBootNativeLauncher {
 
@@ -43,45 +42,78 @@ public final class SpringBootNativeLauncher {
         try {
             Class<?> startupClass = loadClass(request.getStartupClassName(), classLoader);
             List<String> packagePrefixes = resolveMockScopePackages(request, startupClass);
-            DaoMapperMockPostProcessor mockPostProcessor = new DaoMapperMockPostProcessor(packagePrefixes);
 
             List<String> activeProfiles = request.getActiveProfiles().isEmpty()
                     ? Collections.singletonList("test")
                     : request.getActiveProfiles();
             Map<String, String> launchProperties = mergeLaunchProperties(request.getExtraProperties());
-            List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
-
-            Object builder = createBuilderInstance(startupClass, classLoader);
-            builder = invokeBuilder(builder, "profiles", new Class[]{String[].class}, new Object[]{activeProfiles.toArray(new String[0])});
-            builder = invokeBuilder(
-                    builder,
-                    "initializers",
-                    new Class[]{ApplicationContextInitializer[].class},
-                    new Object[]{new ApplicationContextInitializer[]{new MockingInitializer(mockPostProcessor)}}
-            );
-            builder = invokeBuilder(builder, "properties", new Class[]{String[].class}, new Object[]{propertyArgs.toArray(new String[0])});
-
-            Object contextObject = invokeBuilder(
-                    builder,
-                    "run",
-                    new Class[]{String[].class},
-                    new Object[]{request.getApplicationArgs().toArray(new String[0])}
-            );
-            if (!(contextObject instanceof ConfigurableApplicationContext)) {
-                throw new IllegalStateException("Spring context start failed: run(...) did not return ConfigurableApplicationContext");
+            RunOutcome outcome;
+            try {
+                outcome = runApplication(startupClass, classLoader, activeProfiles, launchProperties, packagePrefixes, request);
+            } catch (IllegalStateException firstError) {
+                if (!isMissingServletEnvironmentClass(firstError)) {
+                    throw firstError;
+                }
+                LinkedHashMap<String, String> fallbackProperties = new LinkedHashMap<String, String>(launchProperties);
+                fallbackProperties.put("spring.main.web-application-type", "none");
+                launchProperties = fallbackProperties;
+                outcome = runApplication(startupClass, classLoader, activeProfiles, launchProperties, packagePrefixes, request);
             }
-
-            ConfigurableApplicationContext context = (ConfigurableApplicationContext) contextObject;
+            Object context = outcome.contextObject;
+            if (context == null) {
+                throw new IllegalStateException("Spring context start failed: run(...) returned null");
+            }
             return new StartResult(
                     context,
                     startupClass.getName(),
                     new ArrayList<String>(activeProfiles),
-                    mockPostProcessor.snapshotMockedBeanTypes(),
+                    outcome.mockedBeanTypes,
                     launchProperties
             );
         } finally {
             Thread.currentThread().setContextClassLoader(originalClassLoader);
         }
+    }
+
+    private static RunOutcome runApplication(Class<?> startupClass,
+                                             ClassLoader classLoader,
+                                             List<String> activeProfiles,
+                                             Map<String, String> launchProperties,
+                                             List<String> packagePrefixes,
+                                             StartRequest request) {
+        List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
+        InitializerHandle initializerHandle = createMockingInitializerHandle(classLoader, packagePrefixes);
+        Object builder = createBuilderInstance(startupClass, classLoader);
+        builder = invokeBuilder(builder, "profiles", new Class[]{String[].class}, new Object[]{activeProfiles.toArray(new String[0])});
+        builder = invokeBuilder(
+                builder,
+                "initializers",
+                new Class[]{initializerHandle.initializerArrayType},
+                new Object[]{initializerHandle.initializerArray}
+        );
+        builder = invokeBuilder(builder, "properties", new Class[]{String[].class}, new Object[]{propertyArgs.toArray(new String[0])});
+        Object contextObject = invokeBuilder(
+                builder,
+                "run",
+                new Class[]{String[].class},
+                new Object[]{request.getApplicationArgs().toArray(new String[0])}
+        );
+        return new RunOutcome(contextObject, initializerHandle.snapshotMockedBeanTypes());
+    }
+
+    private static boolean isMissingServletEnvironmentClass(Throwable error) {
+        Throwable cursor = error;
+        while (cursor != null) {
+            String message = cursor.getMessage();
+            if (message != null) {
+                if (message.contains("ApplicationServletEnvironment")
+                        || message.contains("ApplicaitonServletEnvironment")) {
+                    return true;
+                }
+            }
+            cursor = cursor.getCause();
+        }
+        return false;
     }
 
     private static void validate(StartRequest request) {
@@ -116,7 +148,11 @@ public final class SpringBootNativeLauncher {
                             ". Expect target/classes or target/dependency/*.jar"
             );
         }
-        return new URLClassLoader(urls.toArray(new URL[0]), fallbackClassLoader);
+        addToolClassesIfPresent(urls);
+        return new ChildFirstUrlClassLoader(
+                urls.toArray(new URL[0]),
+                minimalParentClassLoader()
+        );
     }
 
     private static List<URL> collectProjectClasspathUrls(Path projectDir) {
@@ -154,6 +190,99 @@ public final class SpringBootNativeLauncher {
             }
         } catch (IOException io) {
             throw new IllegalStateException("Failed to scan classpath jars under: " + jarDir, io);
+        }
+    }
+
+    private static void addToolClassesIfPresent(List<URL> urls) {
+        try {
+            if (SpringBootNativeLauncher.class.getProtectionDomain() == null
+                    || SpringBootNativeLauncher.class.getProtectionDomain().getCodeSource() == null
+                    || SpringBootNativeLauncher.class.getProtectionDomain().getCodeSource().getLocation() == null) {
+                return;
+            }
+            urls.add(SpringBootNativeLauncher.class.getProtectionDomain().getCodeSource().getLocation());
+        } catch (Exception ignored) {
+            // Ignore missing tool classes path and rely on current class loader fallback.
+        }
+    }
+
+    private static ClassLoader minimalParentClassLoader() {
+        try {
+            Method method = ClassLoader.class.getMethod("getPlatformClassLoader");
+            Object loader = method.invoke(null);
+            if (loader instanceof ClassLoader) {
+                return (ClassLoader) loader;
+            }
+        } catch (Exception ignored) {
+            // Java 8 has no platform class loader API.
+        }
+        return null;
+    }
+
+    private static InitializerHandle createMockingInitializerHandle(final ClassLoader classLoader,
+                                                                    final List<String> packagePrefixes) {
+        try {
+            final Class<?> initializerType = Class.forName(
+                    "org.springframework.context.ApplicationContextInitializer",
+                    true,
+                    classLoader
+            );
+            final Class<?> beanFactoryPostProcessorType = Class.forName(
+                    "org.springframework.beans.factory.config.BeanFactoryPostProcessor",
+                    true,
+                    classLoader
+            );
+            final Class<?> postProcessorClass = Class.forName(
+                    "com.camelot.runtime.bootstrap.DaoMapperMockPostProcessor",
+                    true,
+                    classLoader
+            );
+            final Constructor<?> constructor = postProcessorClass.getDeclaredConstructor(List.class);
+            constructor.setAccessible(true);
+            final AtomicReference<Object> postProcessorRef = new AtomicReference<Object>();
+
+            InvocationHandler handler = new InvocationHandler() {
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                    String name = method.getName();
+                    if ("initialize".equals(name) && args != null && args.length == 1 && args[0] != null) {
+                        Object context = args[0];
+                        Object postProcessor = constructor.newInstance(new ArrayList<String>(packagePrefixes));
+                        postProcessorRef.set(postProcessor);
+                        Method addPostProcessor = context.getClass().getMethod(
+                                "addBeanFactoryPostProcessor",
+                                beanFactoryPostProcessorType
+                        );
+                        addPostProcessor.invoke(context, postProcessor);
+                        return null;
+                    }
+                    if ("toString".equals(name) && method.getParameterTypes().length == 0) {
+                        return "MockingInitializerProxy";
+                    }
+                    if ("hashCode".equals(name) && method.getParameterTypes().length == 0) {
+                        return Integer.valueOf(System.identityHashCode(proxy));
+                    }
+                    if ("equals".equals(name) && method.getParameterTypes().length == 1) {
+                        return Boolean.valueOf(proxy == args[0]);
+                    }
+                    return null;
+                }
+            };
+
+            Object initializerProxy = java.lang.reflect.Proxy.newProxyInstance(
+                    classLoader,
+                    new Class[]{initializerType},
+                    handler
+            );
+            Object initializerArray = Array.newInstance(initializerType, 1);
+            Array.set(initializerArray, 0, initializerProxy);
+            return new InitializerHandle(
+                    initializerArray,
+                    initializerArray.getClass(),
+                    postProcessorRef
+            );
+        } catch (Exception error) {
+            throw new IllegalStateException("Failed to create cross-classloader mocking initializer", error);
         }
     }
 
@@ -326,16 +455,86 @@ public final class SpringBootNativeLauncher {
         }
     }
 
-    private static final class MockingInitializer implements ApplicationContextInitializer<GenericApplicationContext> {
-        private final DaoMapperMockPostProcessor postProcessor;
+    private static final class InitializerHandle {
+        private final Object initializerArray;
+        private final Class<?> initializerArrayType;
+        private final AtomicReference<Object> postProcessorRef;
 
-        private MockingInitializer(DaoMapperMockPostProcessor postProcessor) {
-            this.postProcessor = postProcessor;
+        private InitializerHandle(Object initializerArray,
+                                  Class<?> initializerArrayType,
+                                  AtomicReference<Object> postProcessorRef) {
+            this.initializerArray = initializerArray;
+            this.initializerArrayType = initializerArrayType;
+            this.postProcessorRef = postProcessorRef;
+        }
+
+        private Map<String, String> snapshotMockedBeanTypes() {
+            Object postProcessor = postProcessorRef.get();
+            if (postProcessor == null) {
+                return Collections.emptyMap();
+            }
+            try {
+                Method snapshotMethod = postProcessor.getClass().getDeclaredMethod("snapshotMockedBeanTypes");
+                snapshotMethod.setAccessible(true);
+                Object result = snapshotMethod.invoke(postProcessor);
+                if (!(result instanceof Map)) {
+                    return Collections.emptyMap();
+                }
+                Map<?, ?> source = (Map<?, ?>) result;
+                LinkedHashMap<String, String> converted = new LinkedHashMap<String, String>();
+                for (Map.Entry<?, ?> entry : source.entrySet()) {
+                    converted.put(String.valueOf(entry.getKey()), String.valueOf(entry.getValue()));
+                }
+                return converted;
+            } catch (Exception ignored) {
+                return Collections.emptyMap();
+            }
+        }
+    }
+
+    private static final class RunOutcome {
+        private final Object contextObject;
+        private final Map<String, String> mockedBeanTypes;
+
+        private RunOutcome(Object contextObject, Map<String, String> mockedBeanTypes) {
+            this.contextObject = contextObject;
+            this.mockedBeanTypes = mockedBeanTypes;
+        }
+    }
+
+    private static final class ChildFirstUrlClassLoader extends URLClassLoader {
+
+        private ChildFirstUrlClassLoader(URL[] urls, ClassLoader parent) {
+            super(urls, parent);
         }
 
         @Override
-        public void initialize(GenericApplicationContext context) {
-            context.addBeanFactoryPostProcessor(postProcessor);
+        protected synchronized Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            Class<?> loaded = findLoadedClass(name);
+            if (loaded == null) {
+                if (isParentFirstClass(name)) {
+                    loaded = super.loadClass(name, false);
+                } else {
+                    try {
+                        loaded = findClass(name);
+                    } catch (ClassNotFoundException notInChild) {
+                        loaded = super.loadClass(name, false);
+                    }
+                }
+            }
+            if (resolve) {
+                resolveClass(loaded);
+            }
+            return loaded;
+        }
+
+        private boolean isParentFirstClass(String name) {
+            return name.startsWith("java.")
+                    || name.startsWith("javax.")
+                    || name.startsWith("jakarta.")
+                    || name.startsWith("sun.")
+                    || name.startsWith("com.sun.")
+                    || name.startsWith("jdk.");
         }
     }
 
@@ -401,13 +600,13 @@ public final class SpringBootNativeLauncher {
     }
 
     public static final class StartResult {
-        private final ConfigurableApplicationContext context;
+        private final Object context;
         private final String startupClassName;
         private final List<String> activeProfiles;
         private final Map<String, String> mockedBeanTypes;
         private final Map<String, String> launchProperties;
 
-        StartResult(ConfigurableApplicationContext context,
+        StartResult(Object context,
                     String startupClassName,
                     List<String> activeProfiles,
                     Map<String, String> mockedBeanTypes,
@@ -419,7 +618,7 @@ public final class SpringBootNativeLauncher {
             this.launchProperties = launchProperties;
         }
 
-        public ConfigurableApplicationContext getContext() {
+        public Object getContext() {
             return context;
         }
 
