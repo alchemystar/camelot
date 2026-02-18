@@ -66,6 +66,7 @@ public final class SpringRuntimeBootstrapMain {
 
     static final class CliOptions {
         private String startupClassName;
+        private String projectDir;
         private final Set<String> profiles = new LinkedHashSet<String>();
         private final Set<String> scanPackages = new LinkedHashSet<String>();
         private final List<String> appArgs = new ArrayList<String>();
@@ -84,6 +85,10 @@ public final class SpringRuntimeBootstrapMain {
                 }
                 if (arg.startsWith("--startup-class=")) {
                     options.startupClassName = arg.substring("--startup-class=".length()).trim();
+                    continue;
+                }
+                if (arg.startsWith("--project-dir=")) {
+                    options.projectDir = arg.substring("--project-dir=".length()).trim();
                     continue;
                 }
                 if (arg.startsWith("--profile=")) {
@@ -128,6 +133,7 @@ public final class SpringRuntimeBootstrapMain {
         SpringBootNativeLauncher.StartRequest toRequest() {
             SpringBootNativeLauncher.StartRequest request = new SpringBootNativeLauncher.StartRequest();
             request.setStartupClassName(startupClassName);
+            request.setProjectDir(projectDir);
             request.setActiveProfiles(new ArrayList<String>(profiles));
             request.setMockPackagePrefixes(new ArrayList<String>(scanPackages));
             request.setApplicationArgs(new ArrayList<String>(appArgs));

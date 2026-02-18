@@ -4,9 +4,17 @@ import org.springframework.context.ApplicationContextInitializer;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.support.GenericApplicationContext;
 
+import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -29,45 +37,51 @@ public final class SpringBootNativeLauncher {
     public StartResult start(StartRequest request) {
         validate(request);
 
-        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
-        Class<?> startupClass = loadClass(request.getStartupClassName(), classLoader);
-        List<String> packagePrefixes = resolveMockScopePackages(request, startupClass);
-        DaoMapperMockPostProcessor mockPostProcessor = new DaoMapperMockPostProcessor(packagePrefixes);
+        ClassLoader originalClassLoader = Thread.currentThread().getContextClassLoader();
+        ClassLoader classLoader = resolveExecutionClassLoader(request, originalClassLoader);
+        Thread.currentThread().setContextClassLoader(classLoader);
+        try {
+            Class<?> startupClass = loadClass(request.getStartupClassName(), classLoader);
+            List<String> packagePrefixes = resolveMockScopePackages(request, startupClass);
+            DaoMapperMockPostProcessor mockPostProcessor = new DaoMapperMockPostProcessor(packagePrefixes);
 
-        List<String> activeProfiles = request.getActiveProfiles().isEmpty()
-                ? Collections.singletonList("test")
-                : request.getActiveProfiles();
-        Map<String, String> launchProperties = mergeLaunchProperties(request.getExtraProperties());
-        List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
+            List<String> activeProfiles = request.getActiveProfiles().isEmpty()
+                    ? Collections.singletonList("test")
+                    : request.getActiveProfiles();
+            Map<String, String> launchProperties = mergeLaunchProperties(request.getExtraProperties());
+            List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
 
-        Object builder = createBuilderInstance(startupClass, classLoader);
-        builder = invokeBuilder(builder, "profiles", new Class[]{String[].class}, new Object[]{activeProfiles.toArray(new String[0])});
-        builder = invokeBuilder(
-                builder,
-                "initializers",
-                new Class[]{ApplicationContextInitializer[].class},
-                new Object[]{new ApplicationContextInitializer[]{new MockingInitializer(mockPostProcessor)}}
-        );
-        builder = invokeBuilder(builder, "properties", new Class[]{String[].class}, new Object[]{propertyArgs.toArray(new String[0])});
+            Object builder = createBuilderInstance(startupClass, classLoader);
+            builder = invokeBuilder(builder, "profiles", new Class[]{String[].class}, new Object[]{activeProfiles.toArray(new String[0])});
+            builder = invokeBuilder(
+                    builder,
+                    "initializers",
+                    new Class[]{ApplicationContextInitializer[].class},
+                    new Object[]{new ApplicationContextInitializer[]{new MockingInitializer(mockPostProcessor)}}
+            );
+            builder = invokeBuilder(builder, "properties", new Class[]{String[].class}, new Object[]{propertyArgs.toArray(new String[0])});
 
-        Object contextObject = invokeBuilder(
-                builder,
-                "run",
-                new Class[]{String[].class},
-                new Object[]{request.getApplicationArgs().toArray(new String[0])}
-        );
-        if (!(contextObject instanceof ConfigurableApplicationContext)) {
-            throw new IllegalStateException("Spring context start failed: run(...) did not return ConfigurableApplicationContext");
+            Object contextObject = invokeBuilder(
+                    builder,
+                    "run",
+                    new Class[]{String[].class},
+                    new Object[]{request.getApplicationArgs().toArray(new String[0])}
+            );
+            if (!(contextObject instanceof ConfigurableApplicationContext)) {
+                throw new IllegalStateException("Spring context start failed: run(...) did not return ConfigurableApplicationContext");
+            }
+
+            ConfigurableApplicationContext context = (ConfigurableApplicationContext) contextObject;
+            return new StartResult(
+                    context,
+                    startupClass.getName(),
+                    new ArrayList<String>(activeProfiles),
+                    mockPostProcessor.snapshotMockedBeanTypes(),
+                    launchProperties
+            );
+        } finally {
+            Thread.currentThread().setContextClassLoader(originalClassLoader);
         }
-
-        ConfigurableApplicationContext context = (ConfigurableApplicationContext) contextObject;
-        return new StartResult(
-                context,
-                startupClass.getName(),
-                new ArrayList<String>(activeProfiles),
-                mockPostProcessor.snapshotMockedBeanTypes(),
-                launchProperties
-        );
     }
 
     private static void validate(StartRequest request) {
@@ -84,6 +98,62 @@ public final class SpringBootNativeLauncher {
             return Class.forName(className, true, classLoader);
         } catch (ClassNotFoundException notFound) {
             throw new IllegalArgumentException("Cannot load startup class: " + className, notFound);
+        }
+    }
+
+    private static ClassLoader resolveExecutionClassLoader(StartRequest request, ClassLoader fallbackClassLoader) {
+        if (request.getProjectDir() == null || request.getProjectDir().trim().isEmpty()) {
+            return fallbackClassLoader;
+        }
+        Path projectDir = Paths.get(request.getProjectDir()).toAbsolutePath().normalize();
+        if (!Files.isDirectory(projectDir)) {
+            throw new IllegalArgumentException("project-dir does not exist: " + projectDir);
+        }
+        List<URL> urls = collectProjectClasspathUrls(projectDir);
+        if (urls.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "No classpath entries discovered under project-dir: " + projectDir +
+                            ". Expect target/classes or target/dependency/*.jar"
+            );
+        }
+        return new URLClassLoader(urls.toArray(new URL[0]), fallbackClassLoader);
+    }
+
+    private static List<URL> collectProjectClasspathUrls(Path projectDir) {
+        LinkedHashSet<URL> urls = new LinkedHashSet<URL>();
+        addDirectoryIfPresent(urls, projectDir.resolve("target/classes"));
+        addDirectoryIfPresent(urls, projectDir.resolve("target/test-classes"));
+        addJarDirectoryIfPresent(urls, projectDir.resolve("target/dependency"));
+        addJarDirectoryIfPresent(urls, projectDir.resolve("target/lib"));
+        addJarDirectoryIfPresent(urls, projectDir.resolve("libs"));
+        return new ArrayList<URL>(urls);
+    }
+
+    private static void addDirectoryIfPresent(Set<URL> urls, Path path) {
+        if (!Files.isDirectory(path)) {
+            return;
+        }
+        try {
+            urls.add(path.toUri().toURL());
+        } catch (MalformedURLException malformed) {
+            throw new IllegalStateException("Invalid classpath directory: " + path, malformed);
+        }
+    }
+
+    private static void addJarDirectoryIfPresent(Set<URL> urls, Path jarDir) {
+        if (!Files.isDirectory(jarDir)) {
+            return;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(jarDir, "*.jar")) {
+            for (Path path : stream) {
+                try {
+                    urls.add(path.toUri().toURL());
+                } catch (MalformedURLException malformed) {
+                    throw new IllegalStateException("Invalid classpath jar: " + path, malformed);
+                }
+            }
+        } catch (IOException io) {
+            throw new IllegalStateException("Failed to scan classpath jars under: " + jarDir, io);
         }
     }
 
@@ -271,6 +341,7 @@ public final class SpringBootNativeLauncher {
 
     public static final class StartRequest {
         private String startupClassName;
+        private String projectDir;
         private List<String> activeProfiles = Collections.singletonList("test");
         private List<String> mockPackagePrefixes = Collections.emptyList();
         private List<String> applicationArgs = Collections.emptyList();
@@ -282,6 +353,14 @@ public final class SpringBootNativeLauncher {
 
         public void setStartupClassName(String startupClassName) {
             this.startupClassName = startupClassName;
+        }
+
+        public String getProjectDir() {
+            return projectDir;
+        }
+
+        public void setProjectDir(String projectDir) {
+            this.projectDir = projectDir;
         }
 
         public List<String> getActiveProfiles() {
