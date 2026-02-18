@@ -184,6 +184,7 @@ public final class SpringBootNativeLauncher {
                 new Class[]{initializerHandle.initializerArrayType},
                 new Object[]{initializerHandle.initializerArray}
         );
+        suppressSpringApplicationListeners(builder);
         if (suppressSpringApplicationCallbacks) {
             suppressSpringApplicationCallbacks(builder);
         }
@@ -472,6 +473,21 @@ public final class SpringBootNativeLauncher {
             // Java 8 has no platform class loader API.
         }
         return null;
+    }
+
+    private static void suppressSpringApplicationListeners(Object builder) {
+        try {
+            Method applicationMethod = builder.getClass().getMethod("application");
+            Object springApplication = applicationMethod.invoke(builder);
+            if (springApplication == null) {
+                return;
+            }
+            Method setListeners = springApplication.getClass().getMethod("setListeners", Collection.class);
+            setListeners.invoke(springApplication, Collections.emptyList());
+            LOG.info("Suppressed SpringApplication listeners upfront.");
+        } catch (Exception error) {
+            LOG.warn("Failed suppressing SpringApplication listeners upfront.", error);
+        }
     }
 
     private static void suppressSpringApplicationCallbacks(Object builder) {
