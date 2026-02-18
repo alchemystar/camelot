@@ -1,6 +1,8 @@
 package com.camelot.runtime.bootstrap;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
@@ -25,6 +27,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.IdentityHashMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -115,9 +118,15 @@ public final class SpringBootNativeLauncher {
                     }
                     if (!broadPrefixFallbackApplied && appendIfAbsent(forceMockClassPrefixes, packagePrefixes)) {
                         broadPrefixFallbackApplied = true;
-                        LOG.warn("Unable to extract precise failing bean/type; broaden force-mock to scan packages {} and retry.", packagePrefixes);
+                        LOG.warn(
+                                "Unable to extract precise failing bean/type; broaden force-mock to scan packages {} and retry. diagnostics:\n{}",
+                                packagePrefixes,
+                                buildFailureDiagnostics(runError)
+                        );
                         continue;
                     }
+                    LOG.error("Spring startup failed and no further fallback can be applied. diagnostics:\n{}",
+                            buildFailureDiagnostics(runError));
                     break;
                 }
             }
@@ -262,6 +271,54 @@ public final class SpringBootNativeLauncher {
             changed = addIfAbsent(target, candidate) || changed;
         }
         return changed;
+    }
+
+    private static String buildFailureDiagnostics(Throwable error) {
+        if (error == null) {
+            return "no throwable available";
+        }
+        StringBuilder builder = new StringBuilder();
+        builder.append("exception-chain:");
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<Throwable, Boolean>());
+        Throwable cursor = error;
+        int depth = 0;
+        while (cursor != null && seen.add(cursor)) {
+            builder.append('\n')
+                    .append("  [")
+                    .append(depth)
+                    .append("] ")
+                    .append(cursor.getClass().getName());
+            String message = cursor.getMessage();
+            if (!isBlank(message)) {
+                builder.append(": ").append(message);
+            }
+            cursor = cursor.getCause();
+            depth++;
+        }
+        Throwable root = findRootCause(error);
+        if (root != null) {
+            builder.append('\n').append("root-cause-stacktrace:").append('\n');
+            StringWriter stringWriter = new StringWriter();
+            PrintWriter printWriter = new PrintWriter(stringWriter);
+            root.printStackTrace(printWriter);
+            printWriter.flush();
+            builder.append(stringWriter.toString());
+        }
+        return builder.toString();
+    }
+
+    private static Throwable findRootCause(Throwable error) {
+        if (error == null) {
+            return null;
+        }
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<Throwable, Boolean>());
+        Throwable cursor = error;
+        Throwable root = error;
+        while (cursor != null && seen.add(cursor)) {
+            root = cursor;
+            cursor = cursor.getCause();
+        }
+        return root;
     }
 
     private static boolean isMissingServletEnvironmentClass(Throwable error) {
