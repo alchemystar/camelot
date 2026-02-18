@@ -106,7 +106,12 @@ public final class SpringBootNativeLauncher {
     private static void collectScanPackagesFromAnnotations(Class<?> source,
                                                            Set<String> output,
                                                            Set<Class<?>> visitedAnnotations) {
-        Annotation[] annotations = source.getAnnotations();
+        Annotation[] annotations;
+        try {
+            annotations = source.getAnnotations();
+        } catch (TypeNotPresentException missingType) {
+            return;
+        }
         for (Annotation annotation : annotations) {
             Class<? extends Annotation> annotationType = annotation.annotationType();
             collectPackagesFromSingleAnnotation(annotation, output);
@@ -120,7 +125,12 @@ public final class SpringBootNativeLauncher {
     private static void collectScanPackagesFromAnnotationType(Class<? extends Annotation> annotationType,
                                                               Set<String> output,
                                                               Set<Class<?>> visitedAnnotations) {
-        Annotation[] annotations = annotationType.getAnnotations();
+        Annotation[] annotations;
+        try {
+            annotations = annotationType.getAnnotations();
+        } catch (TypeNotPresentException missingType) {
+            return;
+        }
         for (Annotation meta : annotations) {
             Class<? extends Annotation> metaType = meta.annotationType();
             collectPackagesFromSingleAnnotation(meta, output);

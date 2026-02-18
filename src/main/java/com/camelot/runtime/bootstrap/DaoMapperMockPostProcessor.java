@@ -35,9 +35,18 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
     @Override
     public void postProcessBeanDefinitionRegistry(BeanDefinitionRegistry registry) {
-        List<String> beanNames = new ArrayList<String>(Arrays.asList(registry.getBeanDefinitionNames()));
+        // Replace in postProcessBeanFactory so component-scan and mapper-scan definitions are already registered.
+    }
+
+    @Override
+    public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+        if (!(beanFactory instanceof BeanDefinitionRegistry)) {
+            return;
+        }
+        BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
+        List<String> beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
         for (String beanName : beanNames) {
-            BeanDefinition definition = registry.getBeanDefinition(beanName);
+            BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
             MockTarget target = resolveTarget(definition);
             if (target == null) {
                 continue;
@@ -58,13 +67,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     }
 
     @Override
-    public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
-        // No-op, all replacements are done at bean definition level.
-    }
-
-    @Override
     public int getOrder() {
-        return Ordered.HIGHEST_PRECEDENCE;
+        return Ordered.LOWEST_PRECEDENCE;
     }
 
     Map<String, String> snapshotMockedBeanTypes() {
