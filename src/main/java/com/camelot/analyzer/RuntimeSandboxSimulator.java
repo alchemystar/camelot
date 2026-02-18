@@ -19,10 +19,16 @@ import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.CannotLoadBeanClassException;
 import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
+import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.beans.factory.config.AutowireCapableBeanFactory;
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.beans.factory.config.InstantiationAwareBeanPostProcessor;
 import org.springframework.beans.factory.xml.XmlBeanDefinitionReader;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.support.PropertySourcesPlaceholderConfigurer;
+import org.springframework.cglib.proxy.Enhancer;
+import org.springframework.cglib.proxy.MethodInterceptor;
+import org.springframework.cglib.proxy.MethodProxy;
 import org.springframework.core.env.PropertiesPropertySource;
 import org.springframework.core.io.FileSystemResource;
 
@@ -67,6 +73,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.sql.DataSource;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -159,6 +166,7 @@ public class RuntimeSandboxSimulator {
         report.generatedAt = Instant.now().toString();
         report.entryClass = options.entryClass;
         report.entryMethod = options.entryMethod;
+        report.startupClass = options.startupClass;
         report.tracePrefixes = new ArrayList<String>(options.tracePrefixes);
         report.classesRoots = toStringList(options.classesRoots);
         report.classpathEntries = toStringList(options.classpathEntries);
@@ -182,12 +190,15 @@ public class RuntimeSandboxSimulator {
             beanProvider = beanFactory;
 
             if (options.useSpringContext) {
-                springRuntime = SpringContextRuntime.tryStart(options, classLoader);
+                springRuntime = SpringContextRuntime.tryStart(options, classLoader, projectClassIndex);
                 if (springRuntime != null) {
                     beanProvider = springRuntime;
                     report.springContextActive = true;
                     report.springBeanDefinitionCount = springRuntime.getBeanDefinitionCount();
                     report.springBeanDefinitions = springRuntime.snapshotBeanDefinitions(200);
+                    if (!isBlank(springRuntime.getStartupClassName())) {
+                        report.startupClass = springRuntime.getStartupClassName();
+                    }
                 } else {
                     report.springContextActive = false;
                 }
@@ -380,6 +391,7 @@ public class RuntimeSandboxSimulator {
                                                ProjectClassIndex projectClassIndex) {
         System.out.println("[RUNTIME_DEBUG] projectDir=" + options.projectDir);
         System.out.println("[RUNTIME_DEBUG] entryClass=" + options.entryClass + " entryMethod=" + options.entryMethod);
+        System.out.println("[RUNTIME_DEBUG] startupClass=" + options.startupClass);
         System.out.println("[RUNTIME_DEBUG] useSpringContext=" + options.useSpringContext);
         System.out.println("[RUNTIME_DEBUG] classesRoots=" + options.classesRoots.size() + " classpathEntries=" + options.classpathEntries.size());
         System.out.println("[RUNTIME_DEBUG] projectClassDiscovered=" + projectClassIndex.classNames.size());
@@ -1972,19 +1984,48 @@ public class RuntimeSandboxSimulator {
     private static class SpringContextRuntime implements BeanProvider {
         private final AnnotationConfigApplicationContext context;
         private final boolean debugRuntime;
+        private final String startupClassName;
+        private final ExternalDependencyGuard dependencyGuard;
 
-        private SpringContextRuntime(AnnotationConfigApplicationContext context, boolean debugRuntime) {
+        private SpringContextRuntime(AnnotationConfigApplicationContext context,
+                                     boolean debugRuntime,
+                                     String startupClassName,
+                                     ExternalDependencyGuard dependencyGuard) {
             this.context = context;
             this.debugRuntime = debugRuntime;
+            this.startupClassName = startupClassName == null ? "" : startupClassName;
+            this.dependencyGuard = dependencyGuard;
         }
 
-        private static SpringContextRuntime tryStart(CliOptions options, ClassLoader classLoader) {
+        public String getStartupClassName() {
+            return startupClassName;
+        }
+
+        private static SpringContextRuntime tryStart(CliOptions options,
+                                                     ClassLoader classLoader,
+                                                     ProjectClassIndex projectClassIndex) {
             AnnotationConfigApplicationContext context = null;
             try {
                 context = new AnnotationConfigApplicationContext();
                 context.setClassLoader(classLoader);
                 context.getDefaultListableBeanFactory().setAllowBeanDefinitionOverriding(true);
                 context.getDefaultListableBeanFactory().setAllowCircularReferences(true);
+                context.getDefaultListableBeanFactory().setAllowRawInjectionDespiteWrapping(true);
+
+                Set<String> projectClassNames = projectClassIndex == null
+                        ? Collections.<String>emptySet()
+                        : new LinkedHashSet<String>(projectClassIndex.classNames);
+                ExternalDependencyGuard dependencyGuard = new ExternalDependencyGuard(projectClassNames, options.debugRuntime);
+                context.getBeanFactory().addBeanPostProcessor(dependencyGuard);
+                context.addBeanFactoryPostProcessor(lazyInitBeanFactoryPostProcessor(options.debugRuntime));
+
+                Class<?> startupClass = resolveStartupClass(options, classLoader, projectClassNames);
+                if (startupClass != null) {
+                    context.register(startupClass);
+                    if (options.debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STARTUP_CLASS class=" + startupClass.getName());
+                    }
+                }
 
                 LinkedHashSet<String> scanPackagesSet = new LinkedHashSet<String>();
                 if (options.tracePrefixes != null) {
@@ -1998,11 +2039,15 @@ public class RuntimeSandboxSimulator {
                 if (!isBlank(entryPackage)) {
                     scanPackagesSet.add(entryPackage);
                 }
-                if (!scanPackagesSet.isEmpty()) {
+                String startupPackage = startupClass == null ? "" : packageNameOf(startupClass.getName());
+                if (!isBlank(startupPackage)) {
+                    scanPackagesSet.add(startupPackage);
+                }
+                if (startupClass == null && !scanPackagesSet.isEmpty()) {
                     String[] scanPackages = scanPackagesSet.toArray(new String[0]);
                     context.scan(scanPackages);
                     if (options.debugRuntime) {
-                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_SCAN packages=" + Arrays.toString(scanPackages));
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_SCAN_FALLBACK packages=" + Arrays.toString(scanPackages));
                     }
                 }
 
@@ -2062,8 +2107,14 @@ public class RuntimeSandboxSimulator {
                 }
                 if (options.debugRuntime) {
                     System.out.println("[RUNTIME_DEBUG] SPRING_CTX_READY beanDefs=" + context.getBeanDefinitionCount());
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STUB_SUMMARY " + dependencyGuard.summary());
                 }
-                return new SpringContextRuntime(context, options.debugRuntime);
+                return new SpringContextRuntime(
+                        context,
+                        options.debugRuntime,
+                        startupClass == null ? "" : startupClass.getName(),
+                        dependencyGuard
+                );
             } catch (Throwable error) {
                 if (options.debugRuntime) {
                     System.out.println("[RUNTIME_DEBUG] SPRING_CTX_START_FAIL error="
@@ -2078,6 +2129,124 @@ public class RuntimeSandboxSimulator {
                     }
                 }
                 return null;
+            }
+        }
+
+        private static BeanFactoryPostProcessor lazyInitBeanFactoryPostProcessor(final boolean debugRuntime) {
+            return new BeanFactoryPostProcessor() {
+                @Override
+                public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+                    if (beanFactory == null) {
+                        return;
+                    }
+                    String[] names = beanFactory.getBeanDefinitionNames();
+                    int lazyCount = 0;
+                    for (String name : names) {
+                        if (isBlank(name)) {
+                            continue;
+                        }
+                        try {
+                            org.springframework.beans.factory.config.BeanDefinition definition = beanFactory.getBeanDefinition(name);
+                            if (definition == null) {
+                                continue;
+                            }
+                            if (!definition.isLazyInit()) {
+                                definition.setLazyInit(true);
+                                lazyCount++;
+                            }
+                        } catch (Throwable ignored) {
+                            // best effort
+                        }
+                    }
+                    if (debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_LAZY_INIT_SET count=" + lazyCount);
+                    }
+                }
+            };
+        }
+
+        private static Class<?> resolveStartupClass(CliOptions options,
+                                                    ClassLoader classLoader,
+                                                    Set<String> projectClassNames) {
+            if (options == null) {
+                return null;
+            }
+            String raw = options.startupClass;
+            String preferred = isBlank(raw) ? "StartApp" : raw.trim();
+            List<String> candidates = new ArrayList<String>();
+            if (preferred.contains(".")) {
+                candidates.add(preferred);
+            } else if (projectClassNames != null && !projectClassNames.isEmpty()) {
+                String suffix = "." + preferred;
+                for (String className : projectClassNames) {
+                    if (className == null) {
+                        continue;
+                    }
+                    if (className.equals(preferred) || className.endsWith(suffix)) {
+                        candidates.add(className);
+                    }
+                }
+                if (candidates.isEmpty() && "StartApp".equals(preferred)) {
+                    for (String className : projectClassNames) {
+                        if (className == null) {
+                            continue;
+                        }
+                        if (className.endsWith(".StartApplication")) {
+                            candidates.add(className);
+                        }
+                    }
+                }
+                Collections.sort(candidates);
+            } else {
+                candidates.add(preferred);
+            }
+            if (candidates.isEmpty()) {
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STARTUP_CLASS_MISS target=" + preferred);
+                }
+                return null;
+            }
+            Class<?> fallback = null;
+            for (String candidate : candidates) {
+                Class<?> loaded = loadClassQuietly(candidate, classLoader, options.debugRuntime);
+                if (loaded == null) {
+                    continue;
+                }
+                if (fallback == null) {
+                    fallback = loaded;
+                }
+                if (hasMainMethod(loaded)) {
+                    return loaded;
+                }
+            }
+            return fallback;
+        }
+
+        private static Class<?> loadClassQuietly(String className, ClassLoader classLoader, boolean debugRuntime) {
+            if (isBlank(className)) {
+                return null;
+            }
+            try {
+                return Class.forName(className.trim(), false, classLoader);
+            } catch (Throwable error) {
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STARTUP_CLASS_SKIP class="
+                            + className + " error=" + error.getClass().getName());
+                }
+                return null;
+            }
+        }
+
+        private static boolean hasMainMethod(Class<?> type) {
+            if (type == null) {
+                return false;
+            }
+            try {
+                Method main = type.getDeclaredMethod("main", String[].class);
+                int mod = main.getModifiers();
+                return Modifier.isPublic(mod) && Modifier.isStatic(mod) && Void.TYPE.equals(main.getReturnType());
+            } catch (Throwable ignored) {
+                return false;
             }
         }
 
@@ -2320,6 +2489,300 @@ public class RuntimeSandboxSimulator {
         @Override
         public String providerName() {
             return "SpringContextRuntime";
+        }
+
+        private static class ExternalDependencyGuard implements InstantiationAwareBeanPostProcessor {
+            private final Set<String> projectClassNames;
+            private final boolean debugRuntime;
+            private final Map<String, String> stubbedBeans = new LinkedHashMap<String, String>();
+            private final Map<String, AtomicInteger> reasonCount = new LinkedHashMap<String, AtomicInteger>();
+
+            private ExternalDependencyGuard(Set<String> projectClassNames, boolean debugRuntime) {
+                this.projectClassNames = projectClassNames == null
+                        ? Collections.<String>emptySet()
+                        : new LinkedHashSet<String>(projectClassNames);
+                this.debugRuntime = debugRuntime;
+            }
+
+            @Override
+            public Object postProcessBeforeInstantiation(Class<?> beanClass, String beanName) throws BeansException {
+                if (beanClass == null) {
+                    return null;
+                }
+                String reason = stubReason(beanClass, beanName);
+                if (isBlank(reason)) {
+                    return null;
+                }
+                Object stub = createNoopStub(beanClass, beanName, reason);
+                if (stub == null) {
+                    return null;
+                }
+                String key = (isBlank(beanName) ? beanClass.getName() : beanName + ":" + beanClass.getName());
+                stubbedBeans.put(key, reason);
+                reasonCount.computeIfAbsent(reason, k -> new AtomicInteger(0)).incrementAndGet();
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STUB_BEAN bean=" + beanName
+                            + " class=" + beanClass.getName() + " reason=" + reason
+                            + " stubType=" + stub.getClass().getName());
+                }
+                return stub;
+            }
+
+            private String stubReason(Class<?> beanClass, String beanName) {
+                if (beanClass == null) {
+                    return "";
+                }
+                String className = beanClass.getName();
+                String beanLower = isBlank(beanName) ? "" : beanName.toLowerCase(Locale.ROOT);
+                String classLower = className.toLowerCase(Locale.ROOT);
+                if (DataSource.class.isAssignableFrom(beanClass) || classLower.contains("datasource") || beanLower.contains("datasource")) {
+                    return "DATASOURCE";
+                }
+                if (beanLower.startsWith("org.springframework")) {
+                    return "";
+                }
+                if (isInfrastructureType(beanClass)) {
+                    return "";
+                }
+                boolean isProjectClass = projectClassNames.contains(className);
+                if (looksLikeDaoMapper(classLower, beanLower)) {
+                    return "DAO_MAPPER";
+                }
+                if (looksLikeExternalClient(classLower, beanLower)) {
+                    return "RPC_HTTP_CLIENT";
+                }
+                if (!isProjectClass && classLower.contains("client")) {
+                    return "EXTERNAL_CLIENT";
+                }
+                return "";
+            }
+
+            private boolean isInfrastructureType(Class<?> beanClass) {
+                if (beanClass == null) {
+                    return true;
+                }
+                String name = beanClass.getName();
+                if (name.startsWith("org.springframework.")) {
+                    return true;
+                }
+                if (name.startsWith("java.") || name.startsWith("javax.")) {
+                    return true;
+                }
+                if (name.endsWith("AutoConfiguration")) {
+                    return true;
+                }
+                if (hasAnnotation(beanClass.getAnnotations(), "Configuration")
+                        || hasAnnotation(beanClass.getAnnotations(), "ComponentScan")) {
+                    return true;
+                }
+                return false;
+            }
+
+            private boolean looksLikeDaoMapper(String classLower, String beanLower) {
+                if (isBlank(classLower) && isBlank(beanLower)) {
+                    return false;
+                }
+                if (classLower.contains(".dao.") || classLower.endsWith("dao") || classLower.endsWith("daoimpl")) {
+                    return true;
+                }
+                if (classLower.contains(".mapper.") || classLower.endsWith("mapper")) {
+                    return true;
+                }
+                if (beanLower.endsWith("dao") || beanLower.endsWith("mapper")) {
+                    return true;
+                }
+                if (classLower.contains(".repository.") || classLower.endsWith("repository")
+                        || beanLower.endsWith("repository")) {
+                    return true;
+                }
+                return false;
+            }
+
+            private boolean looksLikeExternalClient(String classLower, String beanLower) {
+                if (classLower.contains("httpclient")
+                        || classLower.contains("thriftclient")
+                        || classLower.contains("resttemplate")
+                        || classLower.contains("webclient")
+                        || classLower.contains("feign")
+                        || classLower.contains("rpcclient")
+                        || classLower.contains("rpc.")) {
+                    return true;
+                }
+                if (beanLower.contains("httpclient")
+                        || beanLower.contains("thriftclient")
+                        || beanLower.contains("resttemplate")
+                        || beanLower.contains("webclient")
+                        || beanLower.contains("feign")
+                        || beanLower.contains("rpc")
+                        || beanLower.endsWith("client")) {
+                    return true;
+                }
+                return false;
+            }
+
+            private Object createNoopStub(Class<?> beanClass, String beanName, String reason) {
+                if (beanClass == null) {
+                    return null;
+                }
+                if (beanClass.isInterface()) {
+                    return createInterfaceNoop(beanClass, beanName, reason);
+                }
+                if (Modifier.isFinal(beanClass.getModifiers())) {
+                    return createFinalClassFallback(beanClass, beanName, reason);
+                }
+                Object cglibStub = createCglibNoop(beanClass, beanName, reason);
+                if (cglibStub != null) {
+                    return cglibStub;
+                }
+                return createFinalClassFallback(beanClass, beanName, reason);
+            }
+
+            private Object createInterfaceNoop(final Class<?> iface, final String beanName, final String reason) {
+                InvocationHandler handler = new InvocationHandler() {
+                    @Override
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        if (method == null) {
+                            return null;
+                        }
+                        if (method.getDeclaringClass() == Object.class) {
+                            return handleObjectMethod(proxy, method, args, iface, beanName, reason);
+                        }
+                        Class<?> returnType = method.getReturnType();
+                        if (returnType != null && returnType.isAssignableFrom(iface)) {
+                            return proxy;
+                        }
+                        return defaultValue(returnType);
+                    }
+                };
+                try {
+                    ClassLoader loader = iface.getClassLoader();
+                    if (loader == null) {
+                        loader = RuntimeSandboxSimulator.class.getClassLoader();
+                    }
+                    return Proxy.newProxyInstance(loader, new Class<?>[]{iface}, handler);
+                } catch (Throwable error) {
+                    if (debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STUB_PROXY_FAIL class="
+                                + iface.getName() + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    }
+                    return null;
+                }
+            }
+
+            private Object createCglibNoop(final Class<?> beanClass, final String beanName, final String reason) {
+                try {
+                    Enhancer enhancer = new Enhancer();
+                    enhancer.setClassLoader(beanClass.getClassLoader());
+                    enhancer.setSuperclass(beanClass);
+                    enhancer.setUseFactory(false);
+                    enhancer.setCallback(new MethodInterceptor() {
+                        @Override
+                        public Object intercept(Object obj, Method method, Object[] args, MethodProxy methodProxy) {
+                            if (method == null) {
+                                return null;
+                            }
+                            if (method.getDeclaringClass() == Object.class) {
+                                return handleObjectMethod(obj, method, args, beanClass, beanName, reason);
+                            }
+                            Class<?> returnType = method.getReturnType();
+                            if (returnType != null && returnType.isAssignableFrom(beanClass)) {
+                                return obj;
+                            }
+                            return defaultValue(returnType);
+                        }
+                    });
+                    Constructor<?> ctor = selectConstructor(beanClass);
+                    if (ctor == null) {
+                        return enhancer.create();
+                    }
+                    Class<?>[] paramTypes = ctor.getParameterTypes();
+                    Object[] args = new Object[paramTypes.length];
+                    for (int i = 0; i < paramTypes.length; i++) {
+                        args[i] = defaultValue(paramTypes[i]);
+                    }
+                    return enhancer.create(paramTypes, args);
+                } catch (Throwable error) {
+                    if (debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STUB_CGLIB_FAIL class="
+                                + beanClass.getName() + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    }
+                    return null;
+                }
+            }
+
+            private Constructor<?> selectConstructor(Class<?> beanClass) {
+                if (beanClass == null) {
+                    return null;
+                }
+                Constructor<?>[] constructors = beanClass.getDeclaredConstructors();
+                if (constructors == null || constructors.length == 0) {
+                    return null;
+                }
+                Constructor<?> best = constructors[0];
+                for (Constructor<?> ctor : constructors) {
+                    if (ctor == null) {
+                        continue;
+                    }
+                    if (ctor.getParameterCount() < best.getParameterCount()) {
+                        best = ctor;
+                    }
+                    if (ctor.getParameterCount() == 0) {
+                        best = ctor;
+                        break;
+                    }
+                }
+                return best;
+            }
+
+            private Object createFinalClassFallback(Class<?> beanClass, String beanName, String reason) {
+                try {
+                    Constructor<?> noArg = beanClass.getDeclaredConstructor();
+                    noArg.setAccessible(true);
+                    return noArg.newInstance();
+                } catch (Throwable first) {
+                    if (debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STUB_FINAL_FALLBACK_FAIL bean="
+                                + beanName + " class=" + beanClass.getName() + " reason=" + reason
+                                + " error=" + first.getClass().getName() + ": " + first.getMessage());
+                    }
+                    return null;
+                }
+            }
+
+            private Object handleObjectMethod(Object self,
+                                              Method method,
+                                              Object[] args,
+                                              Class<?> beanClass,
+                                              String beanName,
+                                              String reason) {
+                String name = method.getName();
+                if ("toString".equals(name)) {
+                    return "CamelotNoopStub[" + beanClass.getName() + "|" + beanName + "|" + reason + "]";
+                }
+                if ("hashCode".equals(name)) {
+                    return Integer.valueOf(System.identityHashCode(self));
+                }
+                if ("equals".equals(name)) {
+                    Object other = (args != null && args.length > 0) ? args[0] : null;
+                    return Boolean.valueOf(self == other);
+                }
+                return null;
+            }
+
+            private String summary() {
+                if (stubbedBeans.isEmpty()) {
+                    return "stubbed=0";
+                }
+                List<String> parts = new ArrayList<String>();
+                parts.add("stubbed=" + stubbedBeans.size());
+                List<String> reasons = new ArrayList<String>(reasonCount.keySet());
+                Collections.sort(reasons);
+                for (String reason : reasons) {
+                    AtomicInteger count = reasonCount.get(reason);
+                    parts.add(reason + "=" + (count == null ? 0 : count.get()));
+                }
+                return String.join(",", parts);
+            }
         }
     }
 
@@ -3632,6 +4095,7 @@ public class RuntimeSandboxSimulator {
         public String generatedAt;
         public String entryClass;
         public String entryMethod;
+        public String startupClass;
         public String rootMethodId;
         public List<String> classesRoots;
         public List<String> classpathEntries;
@@ -3948,6 +4412,10 @@ public class RuntimeSandboxSimulator {
         private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\$\\{([^}]+)}");
         private static final Set<String> COMPONENT_ANNOTATION_NAMES = new LinkedHashSet<String>(
                 Arrays.asList("Component", "Service", "Repository", "Controller", "RestController", "Configuration")
+        );
+        private static final Set<String> EXTERNAL_DEPENDENCY_TOKENS = new LinkedHashSet<String>(
+                Arrays.asList("datasource", "dao", "mapper", "repository", "httpclient",
+                        "thriftclient", "resttemplate", "webclient", "feign", "rpc", "client")
         );
 
         public SandboxBeanFactory(ClassLoader classLoader,
@@ -4461,6 +4929,20 @@ public class RuntimeSandboxSimulator {
                 return singletonByConcreteClass.get(targetClass);
             }
             try {
+                String stubReason = sandboxStubReason(targetClass, requestedType);
+                if (!isBlank(stubReason)) {
+                    Object stub = createSandboxNoopStub(targetClass, requestedType, stubReason);
+                    if (stub != null) {
+                        singletonByConcreteClass.put(targetClass, stub);
+                        debugBean("BEAN_CREATE_STUB class=%s requested=%s reason=%s stubReason=%s stubType=%s",
+                                targetClass.getName(),
+                                requestedType == null ? "null" : requestedType.getName(),
+                                reason,
+                                stubReason,
+                                stub.getClass().getName());
+                        return stub;
+                    }
+                }
                 debugBean("BEAN_CREATE class=%s requested=%s reason=%s",
                         targetClass.getName(),
                         requestedType == null ? "null" : requestedType.getName(),
@@ -4491,10 +4973,150 @@ public class RuntimeSandboxSimulator {
             }
         }
 
+        private String sandboxStubReason(Class<?> targetClass, Class<?> requestedType) {
+            if (targetClass == null) {
+                return "";
+            }
+            String className = targetClass.getName().toLowerCase(Locale.ROOT);
+            String requestedName = requestedType == null ? "" : requestedType.getName().toLowerCase(Locale.ROOT);
+            if (DataSource.class.isAssignableFrom(targetClass)
+                    || className.contains("datasource")
+                    || requestedName.contains("datasource")) {
+                return "DATASOURCE";
+            }
+            if (className.contains(".dao.") || className.endsWith("dao")
+                    || className.contains(".mapper.") || className.endsWith("mapper")
+                    || className.contains(".repository.") || className.endsWith("repository")
+                    || requestedName.contains(".dao.") || requestedName.endsWith("dao")
+                    || requestedName.contains(".mapper.") || requestedName.endsWith("mapper")
+                    || requestedName.contains(".repository.") || requestedName.endsWith("repository")) {
+                return "DAO_MAPPER";
+            }
+            for (String token : EXTERNAL_DEPENDENCY_TOKENS) {
+                if (isBlank(token)) {
+                    continue;
+                }
+                if (className.contains(token) || requestedName.contains(token)) {
+                    if ("client".equals(token) && !className.endsWith("client") && !requestedName.endsWith("client")) {
+                        continue;
+                    }
+                    if ("dao".equals(token) || "mapper".equals(token) || "repository".equals(token)) {
+                        return "DAO_MAPPER";
+                    }
+                    if ("datasource".equals(token)) {
+                        return "DATASOURCE";
+                    }
+                    return "EXTERNAL_CLIENT";
+                }
+            }
+            return "";
+        }
+
+        private Object createSandboxNoopStub(Class<?> targetClass, Class<?> requestedType, String reason) {
+            Class<?> effectiveType = requestedType != null ? requestedType : targetClass;
+            if (effectiveType == null) {
+                return null;
+            }
+            if (effectiveType.isInterface()) {
+                return createInterfaceMock(effectiveType);
+            }
+            if (targetClass.isInterface()) {
+                return createInterfaceMock(targetClass);
+            }
+            if (!Modifier.isFinal(targetClass.getModifiers())) {
+                try {
+                    Enhancer enhancer = new Enhancer();
+                    enhancer.setClassLoader(targetClass.getClassLoader());
+                    enhancer.setSuperclass(targetClass);
+                    enhancer.setUseFactory(false);
+                    enhancer.setCallback(new MethodInterceptor() {
+                        @Override
+                        public Object intercept(Object obj, Method method, Object[] args, MethodProxy methodProxy) {
+                            if (method == null) {
+                                return null;
+                            }
+                            if (method.getDeclaringClass() == Object.class) {
+                                String name = method.getName();
+                                if ("toString".equals(name)) {
+                                    return "CamelotSandboxNoopStub[" + targetClass.getName() + "|" + reason + "]";
+                                }
+                                if ("hashCode".equals(name)) {
+                                    return Integer.valueOf(System.identityHashCode(obj));
+                                }
+                                if ("equals".equals(name)) {
+                                    Object other = (args != null && args.length > 0) ? args[0] : null;
+                                    return Boolean.valueOf(obj == other);
+                                }
+                                return null;
+                            }
+                            Class<?> returnType = method.getReturnType();
+                            if (returnType != null && returnType.isAssignableFrom(targetClass)) {
+                                return obj;
+                            }
+                            return defaultValue(returnType);
+                        }
+                    });
+                    Constructor<?>[] constructors = targetClass.getDeclaredConstructors();
+                    if (constructors == null || constructors.length == 0) {
+                        return enhancer.create();
+                    }
+                    Constructor<?> selected = constructors[0];
+                    for (Constructor<?> constructor : constructors) {
+                        if (constructor != null && constructor.getParameterCount() < selected.getParameterCount()) {
+                            selected = constructor;
+                        }
+                        if (constructor != null && constructor.getParameterCount() == 0) {
+                            selected = constructor;
+                            break;
+                        }
+                    }
+                    Class<?>[] parameterTypes = selected.getParameterTypes();
+                    Object[] args = new Object[parameterTypes.length];
+                    for (int i = 0; i < parameterTypes.length; i++) {
+                        args[i] = defaultValue(parameterTypes[i]);
+                    }
+                    return enhancer.create(parameterTypes, args);
+                } catch (Throwable error) {
+                    debugBean("BEAN_CREATE_STUB_CGLIB_FAIL class=%s reason=%s error=%s: %s",
+                            targetClass.getName(),
+                            reason,
+                            error.getClass().getName(),
+                            error.getMessage());
+                }
+            }
+            try {
+                Constructor<?> noArg = targetClass.getDeclaredConstructor();
+                noArg.setAccessible(true);
+                return noArg.newInstance();
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+
         private Object createInterfaceMock(Class<?> iface) {
             InvocationHandler handler = new InvocationHandler() {
                 @Override
                 public Object invoke(Object proxy, Method method, Object[] args) {
+                    if (method == null) {
+                        return null;
+                    }
+                    if (method.getDeclaringClass() == Object.class) {
+                        String name = method.getName();
+                        if ("toString".equals(name)) {
+                            return "CamelotSandboxInterfaceMock[" + iface.getName() + "]";
+                        }
+                        if ("hashCode".equals(name)) {
+                            return Integer.valueOf(System.identityHashCode(proxy));
+                        }
+                        if ("equals".equals(name)) {
+                            Object other = (args != null && args.length > 0) ? args[0] : null;
+                            return Boolean.valueOf(proxy == other);
+                        }
+                    }
+                    Class<?> returnType = method.getReturnType();
+                    if (returnType != null && returnType.isAssignableFrom(iface)) {
+                        return proxy;
+                    }
                     return defaultValue(method.getReturnType());
                 }
             };
@@ -5575,6 +6197,7 @@ public class RuntimeSandboxSimulator {
         public final List<Path> classpathEntries;
         public final String entryClass;
         public final String entryMethod;
+        public final String startupClass;
         public final List<String> arguments;
         public final List<String> tracePrefixes;
         public final Path outputDir;
@@ -5593,6 +6216,7 @@ public class RuntimeSandboxSimulator {
                           List<Path> classpathEntries,
                           String entryClass,
                           String entryMethod,
+                          String startupClass,
                           List<String> arguments,
                           List<String> tracePrefixes,
                           Path outputDir,
@@ -5610,6 +6234,7 @@ public class RuntimeSandboxSimulator {
             this.classpathEntries = classpathEntries;
             this.entryClass = entryClass;
             this.entryMethod = entryMethod;
+            this.startupClass = startupClass;
             this.arguments = arguments;
             this.tracePrefixes = tracePrefixes;
             this.outputDir = outputDir;
@@ -5634,6 +6259,7 @@ public class RuntimeSandboxSimulator {
             List<Path> classpathEntries = new ArrayList<Path>();
             String entryClass = null;
             String entryMethod = null;
+            String startupClass = "StartApp";
             List<String> arguments = new ArrayList<String>();
             List<String> tracePrefixes = new ArrayList<String>();
             Path outputDir = Paths.get(".").toAbsolutePath().normalize().resolve("build/reports/runtime-sandbox");
@@ -5660,6 +6286,8 @@ public class RuntimeSandboxSimulator {
                     entryClass = args[++i];
                 } else if ("--entry-method".equals(arg) && i + 1 < args.length) {
                     entryMethod = args[++i];
+                } else if ("--startup-class".equals(arg) && i + 1 < args.length) {
+                    startupClass = args[++i];
                 } else if ("--arg".equals(arg) && i + 1 < args.length) {
                     arguments.add(args[++i]);
                 } else if ("--trace-prefix".equals(arg) && i + 1 < args.length) {
@@ -5730,6 +6358,7 @@ public class RuntimeSandboxSimulator {
                     normalizePaths(classpathEntries),
                     entryClass,
                     entryMethod,
+                    startupClass,
                     arguments,
                     normalizeTokens(tracePrefixes),
                     outputDir,

@@ -99,10 +99,12 @@ mvn -q exec:java -Dexec.args="--project /path/to/your-spring-project --external-
 
 - 第 1 个参数：目标工程目录（会自动探测 `target/classes` 与常见 jar 依赖）
 - 第 2 个参数：`entry-method`，建议写成 `全限定类名#方法名/参数个数`
-- 其他参数可选追加（例如 `--arg`、`--out`、`--trace-prefix`、`--debug-runtime`、`--use-spring-context`）
+- 其他参数可选追加（例如 `--arg`、`--out`、`--trace-prefix`、`--debug-runtime`、`--startup-class`）
 - 需要“校验失败也继续往下跑”时可加 `--soft-fail`（受控吞异常并给调用方默认返回值，继续后续链路）
 - 不传 `--arg` 时会按方法签名自动生成入参；也可对单个参数传 `--arg __auto__` 或 `--arg @auto`
-- `--use-spring-context`：优先使用真实 Spring `ApplicationContext` 装配 Bean（失败自动回退到内置 SandboxBeanFactory）
+- 默认会启用 Spring 上下文，并优先按 `StartApp` 启动类完成装配（可用 `--startup-class` 指定；若失败自动回退到内置 SandboxBeanFactory）
+- `--no-spring-context`：关闭 Spring 上下文，强制只走内置 SandboxBeanFactory
+- 受控执行会对 `DataSource/DAO/Mapper/httpClient/thriftClient` 等外部依赖 bean 注入空对象 stub，避免真实外部副作用
 - 若目标工程有 `pom.xml`，脚本会自动解析其 runtime 依赖并通过 `--classpath` 传给模拟器
 - 若报 `ClassNotFoundException`，加 `--debug-runtime` 可打印类加载器 URL、扫描类数量、候选类名建议等排查日志
 - 运行结束会额外输出 `runtime-types.txt`，并在 `runtime-trace.json` 中附加：
