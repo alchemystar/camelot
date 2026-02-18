@@ -56,12 +56,18 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
     @Override
     public void postProcessBeanDefinitionRegistry(BeanDefinitionRegistry registry) {
+        LOG.info("Enter postProcessBeanDefinitionRegistry: registryType={}", registry.getClass().getName());
         // Replace in postProcessBeanFactory so component-scan and mapper-scan definitions are already registered.
     }
 
     @Override
     public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+        LOG.info("Enter postProcessBeanFactory: beanFactoryType={} beanDefinitionCount={}",
+                beanFactory.getClass().getName(),
+                beanFactory.getBeanDefinitionCount());
         if (!(beanFactory instanceof BeanDefinitionRegistry)) {
+            LOG.warn("Skip mocking because beanFactory is not BeanDefinitionRegistry: {}",
+                    beanFactory.getClass().getName());
             return;
         }
         BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
