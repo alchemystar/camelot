@@ -10,6 +10,8 @@ import org.springframework.beans.factory.support.BeanDefinitionRegistryPostProce
 import org.springframework.beans.factory.support.RootBeanDefinition;
 import org.springframework.core.Ordered;
 import org.springframework.core.PriorityOrdered;
+import org.springframework.core.ResolvableType;
+import org.springframework.core.type.MethodMetadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,7 +66,21 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
         BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
         List<String> beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
+        Set<String> mockedBeanNames = new LinkedHashSet<String>();
+
+        // Pass 1: explicit whitelist pre-filter. Any hit is mocked immediately.
         for (String beanName : beanNames) {
+            BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
+            if (tryMockByForcePrefix(beanFactory, registry, beanName, definition)) {
+                mockedBeanNames.add(beanName);
+            }
+        }
+
+        // Pass 2: normal DAO/Mapper/DataSource and failed-bean-name forced rules.
+        for (String beanName : beanNames) {
+            if (mockedBeanNames.contains(beanName)) {
+                continue;
+            }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
             boolean forcedByBeanName = beanName != null && forceMockBeanNames.contains(beanName);
             MockTarget target = resolveTarget(beanFactory, beanName, definition);
@@ -78,17 +94,52 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             if (reason == null) {
                 continue;
             }
-            RootBeanDefinition replacement = new RootBeanDefinition(NoOpBeanMockFactoryBean.class);
-            replacement.getPropertyValues().add("targetTypeName", target.typeName);
-            replacement.setPrimary(definition.isPrimary());
-            replacement.setLazyInit(true);
-            replacement.setRole(definition.getRole());
-            replacement.setScope(definition.getScope() == null ? BeanDefinition.SCOPE_SINGLETON : definition.getScope());
-            registry.removeBeanDefinition(beanName);
-            registry.registerBeanDefinition(beanName, replacement);
-            mockedBeanTypes.put(beanName, target.typeName);
-            LOG.info("Mock bean '{}' as '{}' reason={}", beanName, target.typeName, reason);
+            replaceWithNoOpMock(registry, beanName, definition, target, reason);
         }
+    }
+
+    private boolean tryMockByForcePrefix(ConfigurableListableBeanFactory beanFactory,
+                                         BeanDefinitionRegistry registry,
+                                         String beanName,
+                                         BeanDefinition definition) {
+        if (forceMockTypePrefixes.isEmpty()) {
+            return false;
+        }
+        PrefixMatch prefixMatch = resolvePrefixMatch(beanFactory, beanName, definition);
+        if (prefixMatch == null) {
+            return false;
+        }
+        MockTarget target = resolveTarget(beanFactory, beanName, definition);
+        if (target == null) {
+            target = new MockTarget(prefixMatch.typeName, false);
+        }
+        replaceWithNoOpMock(
+                registry,
+                beanName,
+                definition,
+                target,
+                "force-mock-class-prefix(" + prefixMatch.prefix + ")"
+        );
+        return true;
+    }
+
+    private void replaceWithNoOpMock(BeanDefinitionRegistry registry,
+                                     String beanName,
+                                     BeanDefinition originalDefinition,
+                                     MockTarget target,
+                                     String reason) {
+        RootBeanDefinition replacement = new RootBeanDefinition(NoOpBeanMockFactoryBean.class);
+        replacement.getPropertyValues().add("targetTypeName", target.typeName);
+        replacement.setPrimary(originalDefinition.isPrimary());
+        replacement.setLazyInit(true);
+        replacement.setRole(originalDefinition.getRole());
+        replacement.setScope(originalDefinition.getScope() == null
+                ? BeanDefinition.SCOPE_SINGLETON
+                : originalDefinition.getScope());
+        registry.removeBeanDefinition(beanName);
+        registry.registerBeanDefinition(beanName, replacement);
+        mockedBeanTypes.put(beanName, target.typeName);
+        LOG.info("Mock bean '{}' as '{}' reason={}", beanName, target.typeName, reason);
     }
 
     @Override
@@ -172,8 +223,17 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return false;
     }
 
-    private boolean hasAnyPrefix(String value, List<String> prefixes) {
-        return findMatchingPrefix(value, prefixes) != null;
+    private PrefixMatch resolvePrefixMatch(ConfigurableListableBeanFactory beanFactory,
+                                           String beanName,
+                                           BeanDefinition definition) {
+        List<String> candidates = collectCandidateTypeNames(beanFactory, beanName, definition);
+        for (String candidate : candidates) {
+            String matchedPrefix = findMatchingPrefix(candidate, forceMockTypePrefixes);
+            if (matchedPrefix != null) {
+                return new PrefixMatch(candidate, matchedPrefix);
+            }
+        }
+        return null;
     }
 
     private String findMatchingPrefix(String value, List<String> prefixes) {
@@ -223,37 +283,66 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 return new MockTarget(mapperType, true);
             }
         }
-        if (beanClassName != null && !beanClassName.trim().isEmpty()) {
-            return new MockTarget(beanClassName.trim(), false);
+        for (String candidate : collectCandidateTypeNames(beanFactory, beanName, definition)) {
+            return new MockTarget(candidate, false);
         }
+        return null;
+    }
+
+    private List<String> collectCandidateTypeNames(ConfigurableListableBeanFactory beanFactory,
+                                                   String beanName,
+                                                   BeanDefinition definition) {
+        LinkedHashSet<String> candidates = new LinkedHashSet<String>();
+
         String mapperType = resolveMapperInterfaceType(definition);
-        if (mapperType != null) {
-            return new MockTarget(mapperType, true);
-        }
+        addCandidate(candidates, mapperType);
+
         try {
             Class<?> beanType = beanFactory.getType(beanName, false);
             if (beanType != null) {
-                return new MockTarget(beanType.getName(), false);
+                addCandidate(candidates, beanType.getName());
             }
         } catch (Throwable ignored) {
             // Best effort only.
         }
-        Object factoryType = definition.getAttribute("factoryBeanObjectType");
-        String factoryTypeName = asTypeName(factoryType);
-        if (factoryTypeName != null) {
-            return new MockTarget(factoryTypeName, false);
+
+        addCandidate(candidates, asTypeName(definition.getAttribute("factoryBeanObjectType")));
+        addCandidate(candidates, asTypeName(definition.getAttribute("targetType")));
+        addCandidate(candidates, resolveResolvableTypeName(definition.getResolvableType()));
+        addCandidate(candidates, resolveMethodMetadataReturnType(definition));
+        addCandidate(candidates, resolveFactoryMethodType(beanFactory, definition));
+        addCandidate(candidates, clean(definition.getBeanClassName()));
+
+        return new ArrayList<String>(candidates);
+    }
+
+    private void addCandidate(Set<String> candidates, String value) {
+        String clean = clean(value);
+        if (clean == null) {
+            return;
         }
-        try {
-            Class<?> resolved = definition.getResolvableType().resolve();
-            if (resolved != null) {
-                return new MockTarget(resolved.getName(), false);
-            }
-        } catch (Throwable ignored) {
-            // Best effort only.
+        candidates.add(clean);
+    }
+
+    private String resolveResolvableTypeName(ResolvableType resolvableType) {
+        if (resolvableType == null || ResolvableType.NONE.equals(resolvableType)) {
+            return null;
         }
-        String factoryMethodType = resolveFactoryMethodType(beanFactory, definition);
-        if (factoryMethodType != null) {
-            return new MockTarget(factoryMethodType, false);
+        Class<?> resolved = resolvableType.resolve();
+        if (resolved != null) {
+            return resolved.getName();
+        }
+        return extractRawTypeName(resolvableType.toString());
+    }
+
+    private String resolveMethodMetadataReturnType(BeanDefinition definition) {
+        Object source = definition.getSource();
+        if (source instanceof MethodMetadata) {
+            return clean(((MethodMetadata) source).getReturnTypeName());
+        }
+        Object metadata = definition.getAttribute("factoryMethodMetadata");
+        if (metadata instanceof MethodMetadata) {
+            return clean(((MethodMetadata) metadata).getReturnTypeName());
         }
         return null;
     }
@@ -361,15 +450,45 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (source instanceof Class) {
             return ((Class<?>) source).getName();
         }
+        if (source instanceof ResolvableType) {
+            return resolveResolvableTypeName((ResolvableType) source);
+        }
+        if (source instanceof MethodMetadata) {
+            return clean(((MethodMetadata) source).getReturnTypeName());
+        }
         if (source instanceof BeanDefinitionHolder) {
             BeanDefinitionHolder holder = (BeanDefinitionHolder) source;
             return holder.getBeanDefinition().getBeanClassName();
         }
         if (source instanceof String) {
             String text = ((String) source).trim();
-            return text.isEmpty() ? null : text;
+            if (text.isEmpty()) {
+                return null;
+            }
+            if (text.startsWith("class ")) {
+                text = text.substring("class ".length()).trim();
+            }
+            return extractRawTypeName(text);
         }
         return null;
+    }
+
+    private String extractRawTypeName(String text) {
+        String clean = clean(text);
+        if (clean == null) {
+            return null;
+        }
+        int genericStart = clean.indexOf('<');
+        if (genericStart > 0) {
+            clean = clean.substring(0, genericStart).trim();
+        }
+        if (clean.endsWith("[]")) {
+            return clean;
+        }
+        if (clean.indexOf(' ') >= 0) {
+            return null;
+        }
+        return clean;
     }
 
     private String clean(String value) {
@@ -404,6 +523,16 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         private MockTarget(String typeName, boolean mybatisMapperFactory) {
             this.typeName = typeName;
             this.mybatisMapperFactory = mybatisMapperFactory;
+        }
+    }
+
+    private static final class PrefixMatch {
+        private final String typeName;
+        private final String prefix;
+
+        private PrefixMatch(String typeName, String prefix) {
+            this.typeName = typeName;
+            this.prefix = prefix;
         }
     }
 }
