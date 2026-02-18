@@ -105,21 +105,40 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (forceMockTypePrefixes.isEmpty()) {
             return false;
         }
-        PrefixMatch prefixMatch = resolvePrefixMatch(beanFactory, beanName, definition);
-        if (prefixMatch == null) {
+        ForcePrefixEvaluation evaluation = evaluateForcePrefix(beanFactory, beanName, definition);
+        if (!evaluation.hasMatch()) {
             return false;
         }
+        LOG.info(
+                "Force-prefix matched bean '{}' prefix='{}' matchedType='{}' candidates={}",
+                beanName,
+                evaluation.matchedPrefix,
+                evaluation.matchedTypeName,
+                evaluation.candidateTypes
+        );
+
         MockTarget target = resolveTarget(beanFactory, beanName, definition);
         if (target == null) {
-            target = new MockTarget(prefixMatch.typeName, false);
+            target = new MockTarget(evaluation.matchedTypeName, false);
         }
-        replaceWithNoOpMock(
-                registry,
-                beanName,
-                definition,
-                target,
-                "force-mock-class-prefix(" + prefixMatch.prefix + ")"
-        );
+        try {
+            replaceWithNoOpMock(
+                    registry,
+                    beanName,
+                    definition,
+                    target,
+                    "force-mock-class-prefix(" + evaluation.matchedPrefix + ")"
+            );
+        } catch (RuntimeException error) {
+            LOG.error(
+                    "Force-prefix matched bean '{}' but mock replacement failed. prefix='{}' matchedType='{}'",
+                    beanName,
+                    evaluation.matchedPrefix,
+                    evaluation.matchedTypeName,
+                    error
+            );
+            throw error;
+        }
         return true;
     }
 
@@ -223,17 +242,17 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return false;
     }
 
-    private PrefixMatch resolvePrefixMatch(ConfigurableListableBeanFactory beanFactory,
-                                           String beanName,
-                                           BeanDefinition definition) {
+    private ForcePrefixEvaluation evaluateForcePrefix(ConfigurableListableBeanFactory beanFactory,
+                                                      String beanName,
+                                                      BeanDefinition definition) {
         List<String> candidates = collectCandidateTypeNames(beanFactory, beanName, definition);
         for (String candidate : candidates) {
             String matchedPrefix = findMatchingPrefix(candidate, forceMockTypePrefixes);
             if (matchedPrefix != null) {
-                return new PrefixMatch(candidate, matchedPrefix);
+                return ForcePrefixEvaluation.matched(candidate, matchedPrefix, candidates);
             }
         }
-        return null;
+        return ForcePrefixEvaluation.unmatched(candidates);
     }
 
     private String findMatchingPrefix(String value, List<String> prefixes) {
@@ -526,13 +545,33 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
     }
 
-    private static final class PrefixMatch {
-        private final String typeName;
-        private final String prefix;
+    private static final class ForcePrefixEvaluation {
+        private final String matchedTypeName;
+        private final String matchedPrefix;
+        private final List<String> candidateTypes;
 
-        private PrefixMatch(String typeName, String prefix) {
-            this.typeName = typeName;
-            this.prefix = prefix;
+        private ForcePrefixEvaluation(String matchedTypeName,
+                                      String matchedPrefix,
+                                      List<String> candidateTypes) {
+            this.matchedTypeName = matchedTypeName;
+            this.matchedPrefix = matchedPrefix;
+            this.candidateTypes = candidateTypes == null
+                    ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(candidateTypes));
+        }
+
+        private boolean hasMatch() {
+            return matchedTypeName != null && matchedPrefix != null;
+        }
+
+        private static ForcePrefixEvaluation matched(String matchedTypeName,
+                                                     String matchedPrefix,
+                                                     List<String> candidateTypes) {
+            return new ForcePrefixEvaluation(matchedTypeName, matchedPrefix, candidateTypes);
+        }
+
+        private static ForcePrefixEvaluation unmatched(List<String> candidateTypes) {
+            return new ForcePrefixEvaluation(null, null, candidateTypes);
         }
     }
 }
