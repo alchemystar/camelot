@@ -10,6 +10,8 @@ import org.springframework.beans.factory.support.BeanDefinitionRegistryPostProce
 import org.springframework.beans.factory.support.RootBeanDefinition;
 import org.springframework.core.Ordered;
 import org.springframework.core.PriorityOrdered;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -23,6 +25,7 @@ import java.util.Set;
 
 final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProcessor, PriorityOrdered {
 
+    private static final Logger LOG = LoggerFactory.getLogger(DaoMapperMockPostProcessor.class);
     private static final String MYBATIS_MAPPER_FACTORY = "org.mybatis.spring.mapper.MapperFactoryBean";
 
     private final List<String> packagePrefixes;
@@ -71,7 +74,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             if (target == null) {
                 continue;
             }
-            if (!forcedByBeanName && !shouldMock(beanName, target)) {
+            String reason = forcedByBeanName ? "forced-by-failed-bean-name" : findMockReason(beanName, target);
+            if (reason == null) {
                 continue;
             }
             RootBeanDefinition replacement = new RootBeanDefinition(NoOpBeanMockFactoryBean.class);
@@ -83,6 +87,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             registry.removeBeanDefinition(beanName);
             registry.registerBeanDefinition(beanName, replacement);
             mockedBeanTypes.put(beanName, target.typeName);
+            LOG.info("Mock bean '{}' as '{}' reason={}", beanName, target.typeName, reason);
         }
     }
 
@@ -95,29 +100,30 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return Collections.unmodifiableMap(new LinkedHashMap<String, String>(mockedBeanTypes));
     }
 
-    private boolean shouldMock(String beanName, MockTarget target) {
-        if (beanName != null && forceMockBeanNames.contains(beanName)) {
-            return true;
-        }
-        if (hasAnyPrefix(target.typeName, forceMockTypePrefixes)) {
-            return true;
+    private String findMockReason(String beanName, MockTarget target) {
+        String matchedPrefix = findMatchingPrefix(target.typeName, forceMockTypePrefixes);
+        if (matchedPrefix != null) {
+            return "force-mock-class-prefix(" + matchedPrefix + ")";
         }
         if (isForceMockType(beanName, target)) {
-            return true;
+            return "force-mock-external-type";
         }
         if (!isBusinessPackage(target.typeName)) {
-            return false;
+            return null;
         }
         if (isFrameworkType(target.typeName)) {
-            return false;
+            return null;
         }
         if (target.mybatisMapperFactory) {
-            return true;
+            return "mybatis-mapper-factory";
         }
         if (hasAnySuffix(target.typeName, daoMapperSuffixes)) {
-            return true;
+            return "dao-mapper-type-suffix";
         }
-        return hasAnySuffix(beanName, daoMapperSuffixes);
+        if (hasAnySuffix(beanName, daoMapperSuffixes)) {
+            return "dao-mapper-beanname-suffix";
+        }
+        return null;
     }
 
     private boolean isBusinessPackage(String className) {
@@ -167,9 +173,13 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     }
 
     private boolean hasAnyPrefix(String value, List<String> prefixes) {
+        return findMatchingPrefix(value, prefixes) != null;
+    }
+
+    private String findMatchingPrefix(String value, List<String> prefixes) {
         String clean = value == null ? "" : value.trim();
         if (clean.isEmpty() || prefixes == null || prefixes.isEmpty()) {
-            return false;
+            return null;
         }
         for (String prefix : prefixes) {
             if (prefix == null || prefix.trim().isEmpty()) {
@@ -177,10 +187,10 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
             String normalized = prefix.trim();
             if (matchesPrefix(clean, normalized)) {
-                return true;
+                return normalized;
             }
         }
-        return false;
+        return null;
     }
 
     private boolean matchesPrefix(String clean, String normalizedPrefix) {

@@ -26,8 +26,12 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 public final class SpringBootNativeLauncher {
 
+    private static final Logger LOG = LoggerFactory.getLogger(SpringBootNativeLauncher.class);
     private static final String SPRING_BOOT_BUILDER_CLASS = "org.springframework.boot.builder.SpringApplicationBuilder";
     private static final Set<String> SCAN_ANNOTATION_NAMES = new HashSet<String>(Arrays.asList(
             "org.springframework.context.annotation.ComponentScan",
@@ -40,6 +44,12 @@ public final class SpringBootNativeLauncher {
             Pattern.compile("bean named '([^']+)'"),
             Pattern.compile("bean named \"([^\"]+)\""),
             Pattern.compile("No qualifying bean named '([^']+)'")
+    );
+    private static final List<Pattern> FAILED_TYPE_PATTERNS = Arrays.asList(
+            Pattern.compile("Failed to instantiate \\[([^\\]]+)\\]"),
+            Pattern.compile("Failed to introspect Class \\[([^\\]]+)\\]"),
+            Pattern.compile("Could not resolve matching constructor on bean class \\[([^\\]]+)\\]"),
+            Pattern.compile("Lookup method resolution failed; nested exception is java\\.lang\\.IllegalStateException: Failed to introspect Class \\[([^\\]]+)\\]")
     );
     private static final int DEFAULT_MAX_INIT_SKIP_RETRIES = 12;
 
@@ -60,6 +70,7 @@ public final class SpringBootNativeLauncher {
             List<String> forceMockClassPrefixes = new ArrayList<String>(request.getForceMockClassPrefixes());
             LinkedHashSet<String> forceMockBeanNames = new LinkedHashSet<String>();
             boolean servletFallbackApplied = false;
+            boolean broadPrefixFallbackApplied = false;
             RunOutcome outcome = null;
             IllegalStateException lastError = null;
             for (int attempt = 0; attempt < DEFAULT_MAX_INIT_SKIP_RETRIES; attempt++) {
@@ -83,15 +94,31 @@ public final class SpringBootNativeLauncher {
                         fallbackProperties.put("spring.main.web-application-type", "none");
                         launchProperties = fallbackProperties;
                         servletFallbackApplied = true;
+                        LOG.warn("Detected missing servlet environment class, fallback to non-web mode and retry.");
                         continue;
                     }
                     String failedBeanName = extractFailedBeanName(runError);
-                    if (failedBeanName == null || failedBeanName.trim().isEmpty()) {
-                        break;
+                    if (!isBlank(failedBeanName)) {
+                        String normalizedBeanName = failedBeanName.trim();
+                        if (forceMockBeanNames.add(normalizedBeanName)) {
+                            LOG.warn("Spring startup failed on bean '{}', force-mock and retry.", normalizedBeanName);
+                            continue;
+                        }
                     }
-                    if (!forceMockBeanNames.add(failedBeanName.trim())) {
-                        break;
+                    String failedTypeName = extractFailedTypeName(runError);
+                    if (!isBlank(failedTypeName)) {
+                        String normalizedType = failedTypeName.trim();
+                        if (addIfAbsent(forceMockClassPrefixes, normalizedType)) {
+                            LOG.warn("Spring startup failed on type '{}', add to force-mock prefix list and retry.", normalizedType);
+                            continue;
+                        }
                     }
+                    if (!broadPrefixFallbackApplied && appendIfAbsent(forceMockClassPrefixes, packagePrefixes)) {
+                        broadPrefixFallbackApplied = true;
+                        LOG.warn("Unable to extract precise failing bean/type; broaden force-mock to scan packages {} and retry.", packagePrefixes);
+                        continue;
+                    }
+                    break;
                 }
             }
             if (lastError != null) {
@@ -190,6 +217,51 @@ public final class SpringBootNativeLauncher {
 
     private static boolean isBlank(String text) {
         return text == null || text.trim().isEmpty();
+    }
+
+    private static String extractFailedTypeName(Throwable error) {
+        Throwable cursor = error;
+        while (cursor != null) {
+            String message = cursor.getMessage();
+            if (!isBlank(message)) {
+                for (Pattern pattern : FAILED_TYPE_PATTERNS) {
+                    Matcher matcher = pattern.matcher(message);
+                    if (matcher.find()) {
+                        String candidate = matcher.group(1);
+                        if (!isBlank(candidate)) {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+            cursor = cursor.getCause();
+        }
+        return null;
+    }
+
+    private static boolean addIfAbsent(List<String> target, String candidate) {
+        if (target == null || isBlank(candidate)) {
+            return false;
+        }
+        String normalized = candidate.trim();
+        for (String existing : target) {
+            if (normalized.equals(existing)) {
+                return false;
+            }
+        }
+        target.add(normalized);
+        return true;
+    }
+
+    private static boolean appendIfAbsent(List<String> target, List<String> candidates) {
+        if (target == null || candidates == null || candidates.isEmpty()) {
+            return false;
+        }
+        boolean changed = false;
+        for (String candidate : candidates) {
+            changed = addIfAbsent(target, candidate) || changed;
+        }
+        return changed;
     }
 
     private static boolean isMissingServletEnvironmentClass(Throwable error) {
