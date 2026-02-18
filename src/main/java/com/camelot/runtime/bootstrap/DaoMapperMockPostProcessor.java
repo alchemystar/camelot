@@ -10,7 +10,6 @@ import org.springframework.beans.factory.support.BeanDefinitionRegistryPostProce
 import org.springframework.beans.factory.support.RootBeanDefinition;
 import org.springframework.core.Ordered;
 import org.springframework.core.PriorityOrdered;
-import org.springframework.core.ResolvableType;
 import org.springframework.core.type.MethodMetadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -330,7 +329,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
         addCandidate(candidates, asTypeName(definition.getAttribute("factoryBeanObjectType")));
         addCandidate(candidates, asTypeName(definition.getAttribute("targetType")));
-        addCandidate(candidates, resolveResolvableTypeName(definition.getResolvableType()));
+        addCandidate(candidates, resolveResolvableTypeNameFromDefinition(definition));
         addCandidate(candidates, resolveMethodMetadataReturnType(definition));
         addCandidate(candidates, resolveFactoryMethodType(definition));
         addCandidate(candidates, clean(definition.getBeanClassName()));
@@ -346,15 +345,52 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         candidates.add(clean);
     }
 
-    private String resolveResolvableTypeName(ResolvableType resolvableType) {
-        if (resolvableType == null || ResolvableType.NONE.equals(resolvableType)) {
+    private String resolveResolvableTypeNameFromDefinition(BeanDefinition definition) {
+        if (definition == null) {
             return null;
         }
-        Class<?> resolved = resolvableType.resolve();
+        try {
+            Method method = definition.getClass().getMethod("getResolvableType");
+            Object resolvableType = method.invoke(definition);
+            return resolveResolvableTypeName(resolvableType);
+        } catch (Throwable ignored) {
+            // Compatible with older Spring BeanDefinition APIs.
+            return null;
+        }
+    }
+
+    private String resolveResolvableTypeName(Object resolvableType) {
+        if (!isResolvableTypeInstance(resolvableType)) {
+            return null;
+        }
+        Class<?> resolvableTypeClass = resolvableType.getClass();
+        try {
+            Object noneValue = resolvableTypeClass.getField("NONE").get(null);
+            if (resolvableType == noneValue) {
+                return null;
+            }
+        } catch (Throwable ignored) {
+            // continue
+        }
+        Class<?> resolved = null;
+        try {
+            Method resolveMethod = resolvableTypeClass.getMethod("resolve");
+            Object resolvedType = resolveMethod.invoke(resolvableType);
+            if (resolvedType instanceof Class) {
+                resolved = (Class<?>) resolvedType;
+            }
+        } catch (Throwable ignored) {
+            // continue
+        }
         if (resolved != null) {
             return resolved.getName();
         }
-        return extractRawTypeName(resolvableType.toString());
+        return extractRawTypeName(String.valueOf(resolvableType));
+    }
+
+    private boolean isResolvableTypeInstance(Object source) {
+        return source != null
+                && "org.springframework.core.ResolvableType".equals(source.getClass().getName());
     }
 
     private String resolveMethodMetadataReturnType(BeanDefinition definition) {
@@ -459,8 +495,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (source instanceof Class) {
             return ((Class<?>) source).getName();
         }
-        if (source instanceof ResolvableType) {
-            return resolveResolvableTypeName((ResolvableType) source);
+        if (isResolvableTypeInstance(source)) {
+            return resolveResolvableTypeName(source);
         }
         if (source instanceof MethodMetadata) {
             return clean(((MethodMetadata) source).getReturnTypeName());
