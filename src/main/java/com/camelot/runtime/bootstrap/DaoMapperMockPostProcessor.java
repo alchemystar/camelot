@@ -80,7 +80,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         // Pass 1: explicit whitelist pre-filter. Any hit is mocked immediately.
         for (String beanName : beanNames) {
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
-            if (tryMockByForcePrefix(beanFactory, registry, beanName, definition)) {
+            if (tryMockByForcePrefix(registry, beanName, definition)) {
                 mockedBeanNames.add(beanName);
             }
         }
@@ -92,7 +92,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
             boolean forcedByBeanName = beanName != null && forceMockBeanNames.contains(beanName);
-            MockTarget target = resolveTarget(beanFactory, beanName, definition);
+            MockTarget target = resolveTarget(beanName, definition);
             if (target == null && forcedByBeanName) {
                 target = new MockTarget(Object.class.getName(), false);
             }
@@ -107,14 +107,13 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
     }
 
-    private boolean tryMockByForcePrefix(ConfigurableListableBeanFactory beanFactory,
-                                         BeanDefinitionRegistry registry,
+    private boolean tryMockByForcePrefix(BeanDefinitionRegistry registry,
                                          String beanName,
                                          BeanDefinition definition) {
         if (forceMockTypePrefixes.isEmpty()) {
             return false;
         }
-        ForcePrefixEvaluation evaluation = evaluateForcePrefix(beanFactory, beanName, definition);
+        ForcePrefixEvaluation evaluation = evaluateForcePrefix(beanName, definition);
         if (!evaluation.hasMatch()) {
             return false;
         }
@@ -128,7 +127,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 evaluation.candidateTypes
         );
 
-        MockTarget target = resolveTarget(beanFactory, beanName, definition);
+        MockTarget target = resolveTarget(beanName, definition);
         if (target == null) {
             target = new MockTarget(evaluation.matchedTypeName, false);
         }
@@ -258,10 +257,9 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return false;
     }
 
-    private ForcePrefixEvaluation evaluateForcePrefix(ConfigurableListableBeanFactory beanFactory,
-                                                      String beanName,
+    private ForcePrefixEvaluation evaluateForcePrefix(String beanName,
                                                       BeanDefinition definition) {
-        List<String> candidates = collectCandidateTypeNames(beanFactory, beanName, definition);
+        List<String> candidates = collectCandidateTypeNames(beanName, definition);
         for (String candidate : candidates) {
             String matchedPrefix = findMatchingPrefix(candidate, forceMockTypePrefixes);
             if (matchedPrefix != null) {
@@ -308,8 +306,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return boundary == '.' || boundary == '$';
     }
 
-    private MockTarget resolveTarget(ConfigurableListableBeanFactory beanFactory,
-                                     String beanName,
+    private MockTarget resolveTarget(String beanName,
                                      BeanDefinition definition) {
         String beanClassName = definition.getBeanClassName();
         if (MYBATIS_MAPPER_FACTORY.equals(beanClassName)) {
@@ -318,34 +315,24 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 return new MockTarget(mapperType, true);
             }
         }
-        for (String candidate : collectCandidateTypeNames(beanFactory, beanName, definition)) {
+        for (String candidate : collectCandidateTypeNames(beanName, definition)) {
             return new MockTarget(candidate, false);
         }
         return null;
     }
 
-    private List<String> collectCandidateTypeNames(ConfigurableListableBeanFactory beanFactory,
-                                                   String beanName,
+    private List<String> collectCandidateTypeNames(String beanName,
                                                    BeanDefinition definition) {
         LinkedHashSet<String> candidates = new LinkedHashSet<String>();
 
         String mapperType = resolveMapperInterfaceType(definition);
         addCandidate(candidates, mapperType);
 
-        try {
-            Class<?> beanType = beanFactory.getType(beanName, false);
-            if (beanType != null) {
-                addCandidate(candidates, beanType.getName());
-            }
-        } catch (Throwable ignored) {
-            // Best effort only.
-        }
-
         addCandidate(candidates, asTypeName(definition.getAttribute("factoryBeanObjectType")));
         addCandidate(candidates, asTypeName(definition.getAttribute("targetType")));
         addCandidate(candidates, resolveResolvableTypeName(definition.getResolvableType()));
         addCandidate(candidates, resolveMethodMetadataReturnType(definition));
-        addCandidate(candidates, resolveFactoryMethodType(beanFactory, definition));
+        addCandidate(candidates, resolveFactoryMethodType(definition));
         addCandidate(candidates, clean(definition.getBeanClassName()));
 
         return new ArrayList<String>(candidates);
@@ -382,12 +369,12 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return null;
     }
 
-    private String resolveFactoryMethodType(ConfigurableListableBeanFactory beanFactory, BeanDefinition definition) {
+    private String resolveFactoryMethodType(BeanDefinition definition) {
         String factoryMethodName = clean(definition.getFactoryMethodName());
         if (factoryMethodName == null) {
             return null;
         }
-        String factoryClassName = resolveFactoryClassName(beanFactory, definition);
+        String factoryClassName = resolveFactoryClassName(definition);
         if (factoryClassName == null) {
             return null;
         }
@@ -424,31 +411,18 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return null;
     }
 
-    private String resolveFactoryClassName(ConfigurableListableBeanFactory beanFactory, BeanDefinition definition) {
+    private String resolveFactoryClassName(BeanDefinition definition) {
         String direct = clean(definition.getBeanClassName());
         if (direct != null) {
             return direct;
         }
-        String factoryBeanName = clean(definition.getFactoryBeanName());
-        if (factoryBeanName == null) {
-            return null;
+        Object source = definition.getSource();
+        if (source instanceof MethodMetadata) {
+            return clean(((MethodMetadata) source).getDeclaringClassName());
         }
-        try {
-            Class<?> factoryBeanType = beanFactory.getType(factoryBeanName, false);
-            if (factoryBeanType != null) {
-                return factoryBeanType.getName();
-            }
-        } catch (Throwable ignored) {
-            // Best effort only.
-        }
-        if (beanFactory.containsBeanDefinition(factoryBeanName)) {
-            BeanDefinition factoryBeanDefinition = beanFactory.getBeanDefinition(factoryBeanName);
-            String className = clean(factoryBeanDefinition.getBeanClassName());
-            if (className != null) {
-                return className;
-            }
-            String attributeType = asTypeName(factoryBeanDefinition.getAttribute("factoryBeanObjectType"));
-            return clean(attributeType);
+        Object metadata = definition.getAttribute("factoryMethodMetadata");
+        if (metadata instanceof MethodMetadata) {
+            return clean(((MethodMetadata) metadata).getDeclaringClassName());
         }
         return null;
     }
