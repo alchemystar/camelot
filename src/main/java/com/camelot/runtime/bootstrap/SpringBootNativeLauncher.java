@@ -532,6 +532,9 @@ public final class SpringBootNativeLauncher {
             return name.startsWith("java.")
                     || name.startsWith("javax.")
                     || name.startsWith("jakarta.")
+                    || name.startsWith("org.xml.")
+                    || name.startsWith("org.w3c.")
+                    || name.startsWith("org.xml.sax.")
                     || name.startsWith("sun.")
                     || name.startsWith("com.sun.")
                     || name.startsWith("jdk.");
