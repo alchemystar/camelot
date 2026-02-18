@@ -84,6 +84,10 @@ public class RuntimeSandboxSimulator {
     private static volatile boolean SPRING_PROXY_METHODS_INITIALIZED = false;
     private static final Map<String, String> PROXY_RUNTIME_TYPE_CACHE =
             new ConcurrentHashMap<String, String>();
+    private static final Set<String> INTERFACE_FALLBACK_LOG_KEYS =
+            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private static final Map<String, AtomicInteger> INTERFACE_FALLBACK_REASON_COUNTS =
+            new ConcurrentHashMap<String, AtomicInteger>();
     private static volatile boolean AGENT_INSTALLED = false;
     private static volatile InstrumentationStats LAST_INSTRUMENTATION_STATS;
     public static final AtomicInteger ADVICE_HITS = new AtomicInteger(0);
@@ -126,6 +130,8 @@ public class RuntimeSandboxSimulator {
         ACTIVE_SOFT_FAIL_CONTROLLER = softFailController;
         ACTIVE_UNIQUE_IMPL_BY_TYPE = Collections.emptyMap();
         PROXY_RUNTIME_TYPE_CACHE.clear();
+        INTERFACE_FALLBACK_LOG_KEYS.clear();
+        INTERFACE_FALLBACK_REASON_COUNTS.clear();
         ADVICE_DIAG_ENABLED = options.debugRuntime;
         ADVICE_DIAG_LINES.set(0);
         ADVICE_DIAG_SUPPRESSED.set(0);
@@ -272,6 +278,10 @@ public class RuntimeSandboxSimulator {
         System.out.println("GuardSkip:  " + ADVICE_ENTER_GUARDED.get());
         System.out.println("EnterOk:    " + ADVICE_ENTER_ACCEPTED.get());
         System.out.println("DbgSupp:    " + ADVICE_DIAG_SUPPRESSED.get());
+        String fallbackSummary = buildInterfaceFallbackSummary();
+        if (!isBlank(fallbackSummary)) {
+            System.out.println("IfaceFbk:   " + fallbackSummary);
+        }
         if (LAST_INSTRUMENTATION_STATS != null) {
             System.out.println("Discovered: " + LAST_INSTRUMENTATION_STATS.discovered.get());
             System.out.println("Transformed:" + LAST_INSTRUMENTATION_STATS.transformed.get());
@@ -532,6 +542,7 @@ public class RuntimeSandboxSimulator {
                                                 .and(not(isNative()))
                                                 .and(not(isStatic()))
                                                 .and(not(isSynthetic()))
+                                                .and(not(nameStartsWith("CGLIB$")))
                                                 .and(not(named("toString")))
                                                 .and(not(named("hashCode")))
                                                 .and(not(named("equals")))
@@ -621,15 +632,18 @@ public class RuntimeSandboxSimulator {
             fallback = "unknown";
         }
         if (self == null) {
+            debugInterfaceFallbackReason(fallback, null, "SELF_NULL");
             return fallback;
         }
         Class<?> runtimeClass;
         try {
             runtimeClass = self.getClass();
         } catch (Throwable ignored) {
+            debugInterfaceFallbackReason(fallback, null, "GET_CLASS_ERROR");
             return fallback;
         }
         if (runtimeClass == null) {
+            debugInterfaceFallbackReason(fallback, null, "RUNTIME_CLASS_NULL");
             return fallback;
         }
         String runtimeName = runtimeClass.getName();
@@ -652,9 +666,15 @@ public class RuntimeSandboxSimulator {
                 debugAdviceLine("ADVICE_TYPE_RESOLVE_PROXY ifaceMapped=" + mappedFromInterfaces + " proxy=" + runtimeClass.getName());
                 return mappedFromInterfaces;
             }
+            debugInterfaceFallbackReason(
+                    fallback,
+                    runtimeClass,
+                    "JDK_PROXY_TARGET_UNRESOLVED(spring+handler+mapping)"
+            );
             return fallback;
         }
         if (runtimeName == null || runtimeName.trim().isEmpty()) {
+            debugInterfaceFallbackReason(fallback, runtimeClass, "RUNTIME_NAME_BLANK");
             return fallback;
         }
         if (runtimeName.contains("$$") || runtimeName.contains("$ByteBuddy$")) {
@@ -665,8 +685,61 @@ public class RuntimeSandboxSimulator {
                     return superName;
                 }
             }
+            debugInterfaceFallbackReason(fallback, runtimeClass, "SUBCLASS_PROXY_SUPERCLASS_UNAVAILABLE");
         }
         return runtimeName;
+    }
+
+    private static void debugInterfaceFallbackReason(String declaredTypeName,
+                                                     Class<?> runtimeClass,
+                                                     String reason) {
+        if (isBlank(declaredTypeName) || isBlank(reason)) {
+            return;
+        }
+        if (!isDeclaredInterfaceType(declaredTypeName, runtimeClass)) {
+            return;
+        }
+        AtomicInteger counter = INTERFACE_FALLBACK_REASON_COUNTS.computeIfAbsent(
+                reason,
+                k -> new AtomicInteger(0)
+        );
+        counter.incrementAndGet();
+        String runtimeName = runtimeClass == null ? "null" : runtimeClass.getName();
+        String key = declaredTypeName + "|" + runtimeName + "|" + reason;
+        if (INTERFACE_FALLBACK_LOG_KEYS.add(key)) {
+            debugAdviceLine("INTERFACE_FALLBACK declaredInterface=" + declaredTypeName
+                    + " runtimeClass=" + runtimeName
+                    + " reason=" + reason);
+        }
+    }
+
+    private static boolean isDeclaredInterfaceType(String declaredTypeName, Class<?> runtimeClass) {
+        if (isBlank(declaredTypeName)) {
+            return false;
+        }
+        Class<?> declared = tryLoadClass(declaredTypeName, runtimeClass == null ? null : runtimeClass.getClassLoader());
+        if (declared == null) {
+            declared = tryLoadClass(declaredTypeName, Thread.currentThread().getContextClassLoader());
+        }
+        if (declared == null) {
+            declared = tryLoadClass(declaredTypeName, RuntimeSandboxSimulator.class.getClassLoader());
+        }
+        return declared != null && declared.isInterface();
+    }
+
+    private static String buildInterfaceFallbackSummary() {
+        if (INTERFACE_FALLBACK_REASON_COUNTS.isEmpty()) {
+            return "";
+        }
+        List<String> reasons = new ArrayList<String>(INTERFACE_FALLBACK_REASON_COUNTS.keySet());
+        Collections.sort(reasons);
+        List<String> items = new ArrayList<String>();
+        for (String reason : reasons) {
+            AtomicInteger count = INTERFACE_FALLBACK_REASON_COUNTS.get(reason);
+            int value = count == null ? 0 : count.get();
+            items.add(reason + "=" + value);
+        }
+        return String.join(", ", items);
     }
 
     private static String resolveJdkProxyHandlerTargetTypeName(Object self,
@@ -891,8 +964,14 @@ public class RuntimeSandboxSimulator {
         if (targetClass == null || Object.class.equals(targetClass)) {
             return null;
         }
-        String targetName = targetClass.getName();
+        Class<?> normalizedTargetClass = normalizePotentialProxyClass(targetClass);
+        Class<?> effectiveTargetClass = normalizedTargetClass == null ? targetClass : normalizedTargetClass;
+        String targetName = effectiveTargetClass.getName();
         if (isBlank(targetName)) {
+            return null;
+        }
+        if (runtimeName.equals(targetName) && (runtimeName.contains("$$") || runtimeName.contains("$ByteBuddy$"))) {
+            // Spring helper returned proxy class itself, not actual target.
             return null;
         }
         PROXY_RUNTIME_TYPE_CACHE.put(cacheKey, targetName);
