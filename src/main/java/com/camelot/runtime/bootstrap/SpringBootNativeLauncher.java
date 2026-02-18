@@ -420,7 +420,10 @@ public final class SpringBootNativeLauncher {
                     || SpringBootNativeLauncher.class.getProtectionDomain().getCodeSource().getLocation() == null) {
                 return;
             }
-            urls.add(SpringBootNativeLauncher.class.getProtectionDomain().getCodeSource().getLocation());
+            URL toolLocation = SpringBootNativeLauncher.class.getProtectionDomain().getCodeSource().getLocation();
+            urls.remove(toolLocation);
+            // Keep analyzer classes first to avoid being shadowed by same-package classes from target project jars.
+            urls.add(0, toolLocation);
         } catch (Exception ignored) {
             // Ignore missing tool classes path and rely on current class loader fallback.
         }
@@ -464,6 +467,15 @@ public final class SpringBootNativeLauncher {
                     "com.camelot.runtime.bootstrap.DaoMapperMockPostProcessor",
                     true,
                     classLoader
+            );
+            LOG.info(
+                    "Resolved DaoMapperMockPostProcessor classLoader={} codeSource={}",
+                    postProcessorClass.getClassLoader(),
+                    postProcessorClass.getProtectionDomain() == null
+                            || postProcessorClass.getProtectionDomain().getCodeSource() == null
+                            || postProcessorClass.getProtectionDomain().getCodeSource().getLocation() == null
+                            ? "unknown"
+                            : postProcessorClass.getProtectionDomain().getCodeSource().getLocation()
             );
             final Constructor<?> constructor = postProcessorClass.getDeclaredConstructor(List.class, List.class, Set.class);
             constructor.setAccessible(true);
