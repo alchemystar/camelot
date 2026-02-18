@@ -12,16 +12,23 @@ import net.bytebuddy.matcher.ElementMatchers;
 import net.bytebuddy.utility.JavaModule;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
+import org.w3c.dom.NamedNodeMap;
+import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.CannotLoadBeanClassException;
+import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
+import org.springframework.beans.factory.config.AutowireCapableBeanFactory;
 import org.springframework.beans.factory.xml.XmlBeanDefinitionReader;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.support.PropertySourcesPlaceholderConfigurer;
+import org.springframework.core.env.PropertiesPropertySource;
 import org.springframework.core.io.FileSystemResource;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.annotation.Annotation;
@@ -53,10 +60,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -1976,11 +1986,43 @@ public class RuntimeSandboxSimulator {
                 context.getDefaultListableBeanFactory().setAllowBeanDefinitionOverriding(true);
                 context.getDefaultListableBeanFactory().setAllowCircularReferences(true);
 
-                if (options.tracePrefixes != null && !options.tracePrefixes.isEmpty()) {
-                    String[] scanPackages = options.tracePrefixes.toArray(new String[0]);
+                LinkedHashSet<String> scanPackagesSet = new LinkedHashSet<String>();
+                if (options.tracePrefixes != null) {
+                    for (String prefix : options.tracePrefixes) {
+                        if (!isBlank(prefix)) {
+                            scanPackagesSet.add(prefix.trim());
+                        }
+                    }
+                }
+                String entryPackage = packageNameOf(options.entryClass);
+                if (!isBlank(entryPackage)) {
+                    scanPackagesSet.add(entryPackage);
+                }
+                if (!scanPackagesSet.isEmpty()) {
+                    String[] scanPackages = scanPackagesSet.toArray(new String[0]);
                     context.scan(scanPackages);
                     if (options.debugRuntime) {
                         System.out.println("[RUNTIME_DEBUG] SPRING_CTX_SCAN packages=" + Arrays.toString(scanPackages));
+                    }
+                }
+
+                Map<String, String> projectProperties = loadProjectProperties(
+                        options.projectDir,
+                        options.debugRuntime,
+                        "SPRING_CTX_PROPERTIES"
+                );
+                if (!projectProperties.isEmpty()) {
+                    Properties props = toProperties(projectProperties);
+                    context.getEnvironment().getPropertySources().addLast(
+                            new PropertiesPropertySource("camelotRuntimeProjectProperties", props)
+                    );
+                    PropertySourcesPlaceholderConfigurer placeholderConfigurer = new PropertySourcesPlaceholderConfigurer();
+                    placeholderConfigurer.setIgnoreResourceNotFound(true);
+                    placeholderConfigurer.setIgnoreUnresolvablePlaceholders(true);
+                    placeholderConfigurer.setProperties(props);
+                    context.addBeanFactoryPostProcessor(placeholderConfigurer);
+                    if (options.debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_PROPERTIES count=" + projectProperties.size());
                     }
                 }
 
@@ -2123,15 +2165,84 @@ public class RuntimeSandboxSimulator {
             }
             try {
                 return context.getBean(type);
+            } catch (NoUniqueBeanDefinitionException ambiguous) {
+                Object selected = selectBeanFromCandidates(type);
+                if (selected != null) {
+                    return selected;
+                }
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_GET_AMBIGUOUS type=" + type.getName()
+                            + " error=" + ambiguous.getClass().getName() + ": " + ambiguous.getMessage());
+                }
+                return createBeanBySpringAutowire(type, "AMBIGUOUS");
             } catch (NoSuchBeanDefinitionException missing) {
                 if (debugRuntime) {
                     System.out.println("[RUNTIME_DEBUG] SPRING_CTX_GET_MISS type=" + type.getName());
                 }
-                return null;
+                return createBeanBySpringAutowire(type, "MISS");
             } catch (BeansException error) {
                 if (debugRuntime) {
                     System.out.println("[RUNTIME_DEBUG] SPRING_CTX_GET_FAIL type=" + type.getName()
                             + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
+                return createBeanBySpringAutowire(type, "FAIL");
+            }
+        }
+
+        private Object selectBeanFromCandidates(Class<?> type) {
+            if (type == null || context == null) {
+                return null;
+            }
+            try {
+                Map<String, ?> candidates = context.getBeansOfType(type);
+                if (candidates == null || candidates.isEmpty()) {
+                    return null;
+                }
+                if (candidates.size() == 1) {
+                    return candidates.values().iterator().next();
+                }
+                String preferredName = decapitalize(type.getSimpleName());
+                if (!isBlank(preferredName) && candidates.containsKey(preferredName)) {
+                    return candidates.get(preferredName);
+                }
+                List<String> names = new ArrayList<String>(candidates.keySet());
+                Collections.sort(names);
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_GET_AMBIGUOUS_SELECT type="
+                            + type.getName() + " candidates=" + names + " selected=" + names.get(0));
+                }
+                return candidates.get(names.get(0));
+            } catch (Throwable error) {
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_GET_AMBIGUOUS_FAIL type=" + type.getName()
+                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
+                return null;
+            }
+        }
+
+        private Object createBeanBySpringAutowire(Class<?> type, String reason) {
+            if (type == null || context == null) {
+                return null;
+            }
+            if (type.isInterface() || Modifier.isAbstract(type.getModifiers())) {
+                return null;
+            }
+            try {
+                AutowireCapableBeanFactory factory = context.getAutowireCapableBeanFactory();
+                Object created = factory.createBean(type, AutowireCapableBeanFactory.AUTOWIRE_BY_TYPE, true);
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_CREATE_BEAN type=" + type.getName()
+                            + " reason=" + reason
+                            + " created=" + (created == null ? "null" : created.getClass().getName()));
+                }
+                return created;
+            } catch (Throwable error) {
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_CREATE_BEAN_FAIL type=" + type.getName()
+                            + " reason=" + reason
+                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    printErrorChain(error);
                 }
                 return null;
             }
@@ -3823,12 +3934,18 @@ public class RuntimeSandboxSimulator {
         private final Map<String, List<Class<?>>> beanClassesByName = new LinkedHashMap<String, List<Class<?>>>();
         private final Map<Class<?>, Set<String>> beanNamesByClass = new LinkedHashMap<Class<?>, Set<String>>();
         private final Map<String, Set<String>> beanNameSources = new LinkedHashMap<String, Set<String>>();
+        private final Map<String, Map<String, XmlPropertyAssignment>> xmlPropertiesByBeanName =
+                new LinkedHashMap<String, Map<String, XmlPropertyAssignment>>();
+        private final Map<Class<?>, Map<String, XmlPropertyAssignment>> xmlPropertiesByClass =
+                new LinkedHashMap<Class<?>, Map<String, XmlPropertyAssignment>>();
+        private final Map<String, String> projectProperties = new LinkedHashMap<String, String>();
         private final Set<Class<?>> primaryBeanClasses = new LinkedHashSet<Class<?>>();
         private final Map<String, String> xmlAliasToName = new LinkedHashMap<String, String>();
         private int classLoadFailLogs = 0;
         private int beanDebugLines = 0;
         private static final int MAX_CLASS_LOAD_FAIL_LOGS = 60;
         private static final int MAX_BEAN_DEBUG_LINES = 800;
+        private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\$\\{([^}]+)}");
         private static final Set<String> COMPONENT_ANNOTATION_NAMES = new LinkedHashSet<String>(
                 Arrays.asList("Component", "Service", "Repository", "Controller", "RestController", "Configuration")
         );
@@ -4044,12 +4161,33 @@ public class RuntimeSandboxSimulator {
                     if (Modifier.isStatic(field.getModifiers()) || Modifier.isFinal(field.getModifiers())) {
                         continue;
                     }
-                    if (isSimpleType(field.getType())) {
-                        continue;
-                    }
                     field.setAccessible(true);
                     Object currentValue = field.get(instance);
                     if (currentValue != null) {
+                        continue;
+                    }
+                    String valueExpression = resolveValueExpression(field);
+                    if (!isBlank(valueExpression)) {
+                        Object valueInjected = resolveLiteralToType(valueExpression, field.getType(), "ANNOTATION_VALUE");
+                        if (valueInjected != null || !field.getType().isPrimitive()) {
+                            field.set(instance, valueInjected);
+                            debugBean(
+                                    "BEAN_INJECT_VALUE_OK owner=%s field=%s valueExpr=%s valueType=%s",
+                                    type.getName(),
+                                    field.getName(),
+                                    valueExpression,
+                                    valueInjected == null ? "null" : valueInjected.getClass().getName()
+                            );
+                            continue;
+                        }
+                        debugBean(
+                                "BEAN_INJECT_VALUE_SKIP owner=%s field=%s valueExpr=%s reason=resolve-null-primitive",
+                                type.getName(),
+                                field.getName(),
+                                valueExpression
+                        );
+                    }
+                    if (isSimpleType(field.getType())) {
                         continue;
                     }
                     InjectionHint hint = resolveInjectionHint(field);
@@ -4329,6 +4467,7 @@ public class RuntimeSandboxSimulator {
                         reason);
                 Object instance = instantiate(targetClass);
                 singletonByConcreteClass.put(targetClass, instance);
+                applyXmlPropertyAssignments(instance, targetClass);
                 injectFields(instance, targetClass);
                 beanCreateFailures.remove(targetClass);
                 debugBean("BEAN_CREATE_DONE class=%s requested=%s reason=%s",
@@ -4391,6 +4530,7 @@ public class RuntimeSandboxSimulator {
         }
 
         private void initializeSpringBeanMetadata() {
+            projectProperties.putAll(loadProjectProperties(options.projectDir, options.debugRuntime, "SANDBOX_PROPERTIES"));
             for (String className : discoveredClassNames) {
                 Class<?> candidate = loadClassByName(className);
                 if (candidate == null) {
@@ -4402,7 +4542,9 @@ public class RuntimeSandboxSimulator {
             loadXmlBeanMetadata();
             if (options.debugRuntime) {
                 System.out.println("[RUNTIME_DEBUG] SPRING_BEAN_METADATA names="
-                        + beanClassesByName.size() + " primary=" + primaryBeanClasses.size());
+                        + beanClassesByName.size()
+                        + " primary=" + primaryBeanClasses.size()
+                        + " xmlProperties=" + xmlPropertiesByBeanName.size());
             }
             logBeanRegistrySnapshot();
         }
@@ -4519,15 +4661,26 @@ public class RuntimeSandboxSimulator {
                     if (beanClass == null) {
                         continue;
                     }
+                    List<String> beanNames = new ArrayList<String>();
                     String id = normalizeBeanName(beanElement.getAttribute("id"));
                     if (!isBlank(id)) {
                         registerBeanName(id, beanClass, "XML:" + xmlFile.toAbsolutePath());
+                        beanNames.add(id);
                     }
                     String names = beanElement.getAttribute("name");
                     if (!isBlank(names)) {
                         for (String token : names.split("[,;\\s]+")) {
-                            registerBeanName(token, beanClass, "XML:" + xmlFile.toAbsolutePath());
+                            String normalized = normalizeBeanName(token);
+                            if (isBlank(normalized)) {
+                                continue;
+                            }
+                            registerBeanName(normalized, beanClass, "XML:" + xmlFile.toAbsolutePath());
+                            beanNames.add(normalized);
                         }
+                    }
+                    Map<String, XmlPropertyAssignment> assignments = parseXmlPropertyAssignments(beanElement, xmlFile);
+                    if (!assignments.isEmpty()) {
+                        registerXmlPropertyAssignments(beanClass, beanNames, assignments, xmlFile);
                     }
                 }
 
@@ -4548,6 +4701,153 @@ public class RuntimeSandboxSimulator {
                 if (options.debugRuntime) {
                     System.out.println("[RUNTIME_DEBUG] SPRING_XML_PARSE_SKIP file=" + xmlFile
                             + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                }
+            }
+        }
+
+        private Map<String, XmlPropertyAssignment> parseXmlPropertyAssignments(Element beanElement, Path xmlFile) {
+            Map<String, XmlPropertyAssignment> result = new LinkedHashMap<String, XmlPropertyAssignment>();
+            if (beanElement == null) {
+                return result;
+            }
+
+            NamedNodeMap attrs = beanElement.getAttributes();
+            if (attrs != null) {
+                for (int i = 0; i < attrs.getLength(); i++) {
+                    Node node = attrs.item(i);
+                    if (node == null) {
+                        continue;
+                    }
+                    String attrName = node.getNodeName();
+                    if (isBlank(attrName) || !attrName.startsWith("p:")) {
+                        continue;
+                    }
+                    String propertyToken = attrName.substring(2);
+                    boolean ref = propertyToken.endsWith("-ref");
+                    String propertyName = ref
+                            ? propertyToken.substring(0, propertyToken.length() - 4)
+                            : propertyToken;
+                    propertyName = normalizeBeanName(propertyName);
+                    if (isBlank(propertyName)) {
+                        continue;
+                    }
+                    String text = node.getNodeValue();
+                    if (isBlank(text)) {
+                        continue;
+                    }
+                    XmlPropertyAssignment assignment;
+                    if (ref) {
+                        assignment = XmlPropertyAssignment.byRef(propertyName, text.trim(), xmlFile.toAbsolutePath().toString());
+                    } else {
+                        assignment = XmlPropertyAssignment.byValue(propertyName, text, xmlFile.toAbsolutePath().toString());
+                    }
+                    result.put(propertyName, assignment);
+                }
+            }
+
+            NodeList childNodes = beanElement.getChildNodes();
+            for (int i = 0; i < childNodes.getLength(); i++) {
+                Node node = childNodes.item(i);
+                if (!(node instanceof Element)) {
+                    continue;
+                }
+                Element child = (Element) node;
+                String tagName = child.getTagName();
+                if (!"property".equals(tagName) && !tagName.endsWith(":property")) {
+                    continue;
+                }
+                String propertyName = normalizeBeanName(child.getAttribute("name"));
+                if (isBlank(propertyName)) {
+                    continue;
+                }
+                String ref = normalizeBeanName(child.getAttribute("ref"));
+                String value = child.getAttribute("value");
+
+                if (isBlank(ref)) {
+                    Element refElement = firstDirectChildByTag(child, "ref");
+                    if (refElement != null) {
+                        ref = normalizeBeanName(refElement.getAttribute("bean"));
+                        if (isBlank(ref)) {
+                            ref = normalizeBeanName(refElement.getAttribute("local"));
+                        }
+                        if (isBlank(ref)) {
+                            ref = normalizeBeanName(refElement.getAttribute("parent"));
+                        }
+                        if (isBlank(ref)) {
+                            ref = normalizeBeanName(refElement.getAttribute("name"));
+                        }
+                        if (isBlank(ref)) {
+                            ref = normalizeBeanName(refElement.getTextContent());
+                        }
+                    }
+                }
+                if (isBlank(value)) {
+                    Element valueElement = firstDirectChildByTag(child, "value");
+                    if (valueElement != null) {
+                        value = valueElement.getTextContent();
+                    }
+                }
+                if (isBlank(ref) && isBlank(value)) {
+                    continue;
+                }
+                XmlPropertyAssignment assignment;
+                if (!isBlank(ref)) {
+                    assignment = XmlPropertyAssignment.byRef(propertyName, ref, xmlFile.toAbsolutePath().toString());
+                } else {
+                    assignment = XmlPropertyAssignment.byValue(propertyName, value, xmlFile.toAbsolutePath().toString());
+                }
+                result.put(propertyName, assignment);
+            }
+            return result;
+        }
+
+        private Element firstDirectChildByTag(Element parent, String targetTag) {
+            if (parent == null || isBlank(targetTag)) {
+                return null;
+            }
+            NodeList childNodes = parent.getChildNodes();
+            for (int i = 0; i < childNodes.getLength(); i++) {
+                Node node = childNodes.item(i);
+                if (!(node instanceof Element)) {
+                    continue;
+                }
+                Element child = (Element) node;
+                String tagName = child.getTagName();
+                if (targetTag.equals(tagName) || tagName.endsWith(":" + targetTag)) {
+                    return child;
+                }
+            }
+            return null;
+        }
+
+        private void registerXmlPropertyAssignments(Class<?> beanClass,
+                                                    List<String> beanNames,
+                                                    Map<String, XmlPropertyAssignment> assignments,
+                                                    Path xmlFile) {
+            if (beanClass == null || assignments == null || assignments.isEmpty()) {
+                return;
+            }
+            Map<String, XmlPropertyAssignment> byClass =
+                    xmlPropertiesByClass.computeIfAbsent(beanClass, k -> new LinkedHashMap<String, XmlPropertyAssignment>());
+            for (Map.Entry<String, XmlPropertyAssignment> entry : assignments.entrySet()) {
+                byClass.put(entry.getKey(), entry.getValue());
+            }
+            if (beanNames != null) {
+                for (String beanNameRaw : beanNames) {
+                    String beanName = normalizeBeanName(beanNameRaw);
+                    if (isBlank(beanName)) {
+                        continue;
+                    }
+                    Map<String, XmlPropertyAssignment> byName =
+                            xmlPropertiesByBeanName.computeIfAbsent(beanName, k -> new LinkedHashMap<String, XmlPropertyAssignment>());
+                    for (Map.Entry<String, XmlPropertyAssignment> entry : assignments.entrySet()) {
+                        byName.put(entry.getKey(), entry.getValue());
+                    }
+                    debugBean("BEAN_XML_PROPERTY_REGISTER bean=%s class=%s count=%d source=%s",
+                            beanName,
+                            beanClass.getName(),
+                            assignments.size(),
+                            xmlFile.toAbsolutePath());
                 }
             }
         }
@@ -4647,6 +4947,290 @@ public class RuntimeSandboxSimulator {
                 score += 25;
             }
             return score;
+        }
+
+        private void applyXmlPropertyAssignments(Object instance, Class<?> beanClass) {
+            if (instance == null || beanClass == null) {
+                return;
+            }
+            Map<String, XmlPropertyAssignment> merged = new LinkedHashMap<String, XmlPropertyAssignment>();
+            Map<String, XmlPropertyAssignment> classAssignments = xmlPropertiesByClass.get(beanClass);
+            if (classAssignments != null) {
+                merged.putAll(classAssignments);
+            }
+            Set<String> beanNames = beanNamesByClass.getOrDefault(beanClass, Collections.<String>emptySet());
+            for (String beanName : beanNames) {
+                if (isBlank(beanName)) {
+                    continue;
+                }
+                Map<String, XmlPropertyAssignment> byName = xmlPropertiesByBeanName.get(resolveAlias(beanName));
+                if (byName != null && !byName.isEmpty()) {
+                    merged.putAll(byName);
+                }
+            }
+            if (merged.isEmpty()) {
+                return;
+            }
+            for (XmlPropertyAssignment assignment : merged.values()) {
+                applySingleXmlProperty(instance, beanClass, assignment);
+            }
+        }
+
+        private void applySingleXmlProperty(Object instance, Class<?> beanClass, XmlPropertyAssignment assignment) {
+            if (instance == null || beanClass == null || assignment == null || isBlank(assignment.propertyName)) {
+                return;
+            }
+            Method setter = findSetter(beanClass, assignment.propertyName);
+            Field field = findField(beanClass, assignment.propertyName);
+            Class<?> targetType = null;
+            if (setter != null) {
+                targetType = setter.getParameterTypes()[0];
+            } else if (field != null) {
+                targetType = field.getType();
+            }
+            if (targetType == null) {
+                debugBean(
+                        "BEAN_XML_PROPERTY_SKIP class=%s property=%s reason=target-not-found source=%s",
+                        beanClass.getName(),
+                        assignment.propertyName,
+                        assignment.source
+                );
+                return;
+            }
+
+            Object value = null;
+            if (!isBlank(assignment.refBeanName)) {
+                InjectionHint hint = new InjectionHint(normalizeBeanName(assignment.refBeanName), "", true);
+                value = resolveDependency(targetType, assignment.propertyName, hint);
+                if (value == null) {
+                    debugBean(
+                            "BEAN_XML_PROPERTY_SKIP class=%s property=%s ref=%s reason=dependency-null source=%s",
+                            beanClass.getName(),
+                            assignment.propertyName,
+                            assignment.refBeanName,
+                            assignment.source
+                    );
+                    return;
+                }
+            } else {
+                value = resolveLiteralToType(assignment.valueLiteral, targetType, "XML_PROPERTY");
+                if (value == null && targetType.isPrimitive()) {
+                    debugBean(
+                            "BEAN_XML_PROPERTY_SKIP class=%s property=%s literal=%s reason=primitive-null source=%s",
+                            beanClass.getName(),
+                            assignment.propertyName,
+                            assignment.valueLiteral,
+                            assignment.source
+                    );
+                    return;
+                }
+            }
+
+            try {
+                if (setter != null) {
+                    setter.invoke(instance, value);
+                } else {
+                    field.setAccessible(true);
+                    field.set(instance, value);
+                }
+                debugBean(
+                        "BEAN_XML_PROPERTY_OK class=%s property=%s targetType=%s valueType=%s source=%s",
+                        beanClass.getName(),
+                        assignment.propertyName,
+                        targetType.getName(),
+                        value == null ? "null" : value.getClass().getName(),
+                        assignment.source
+                );
+            } catch (Throwable error) {
+                debugBeanThrowable(
+                        String.format(
+                                Locale.ROOT,
+                                "BEAN_XML_PROPERTY_FAIL class=%s property=%s source=%s",
+                                beanClass.getName(),
+                                assignment.propertyName,
+                                assignment.source
+                        ),
+                        error
+                );
+            }
+        }
+
+        private Method findSetter(Class<?> beanClass, String propertyName) {
+            if (beanClass == null || isBlank(propertyName)) {
+                return null;
+            }
+            String setterName = "set" + capitalize(propertyName);
+            for (Method method : beanClass.getMethods()) {
+                if (method == null) {
+                    continue;
+                }
+                if (!setterName.equals(method.getName()) || method.getParameterCount() != 1) {
+                    continue;
+                }
+                method.setAccessible(true);
+                return method;
+            }
+            return null;
+        }
+
+        private Field findField(Class<?> beanClass, String fieldName) {
+            if (beanClass == null || isBlank(fieldName)) {
+                return null;
+            }
+            Class<?> current = beanClass;
+            while (current != null && current != Object.class) {
+                try {
+                    Field field = current.getDeclaredField(fieldName);
+                    field.setAccessible(true);
+                    return field;
+                } catch (NoSuchFieldException ignored) {
+                    current = current.getSuperclass();
+                } catch (Throwable error) {
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        private String resolveValueExpression(Field field) {
+            if (field == null) {
+                return "";
+            }
+            Annotation valueAnnotation = findAnnotation(field.getAnnotations(), "Value");
+            if (valueAnnotation == null) {
+                return "";
+            }
+            String expression = readAnnotationString(valueAnnotation, "value");
+            return expression == null ? "" : expression.trim();
+        }
+
+        private Object resolveLiteralToType(String rawValue, Class<?> targetType, String source) {
+            if (targetType == null) {
+                return null;
+            }
+            String resolved = resolvePropertyPlaceholders(rawValue);
+            if (resolved == null) {
+                return null;
+            }
+            String trimmed = resolved.trim();
+            if (targetType == String.class) {
+                return trimmed;
+            }
+            if (Class.class.equals(targetType)) {
+                Class<?> loaded = loadClassByName(trimmed);
+                if (loaded != null) {
+                    return loaded;
+                }
+                return Object.class;
+            }
+            if (targetType.isEnum()) {
+                Object[] constants = targetType.getEnumConstants();
+                if (constants == null) {
+                    return null;
+                }
+                for (Object constant : constants) {
+                    if (constant != null && constant.toString().equals(trimmed)) {
+                        return constant;
+                    }
+                }
+                if (constants.length > 0) {
+                    return constants[0];
+                }
+                return null;
+            }
+            try {
+                return convertArg(targetType, trimmed);
+            } catch (Throwable error) {
+                debugBean(
+                        "BEAN_LITERAL_CONVERT_FAIL source=%s targetType=%s value=%s error=%s",
+                        source,
+                        targetType.getName(),
+                        rawValue,
+                        error.getClass().getSimpleName()
+                );
+                return null;
+            }
+        }
+
+        private String resolvePropertyPlaceholders(String rawValue) {
+            if (rawValue == null) {
+                return null;
+            }
+            String resolved = rawValue;
+            for (int round = 0; round < 8; round++) {
+                Matcher matcher = PLACEHOLDER_PATTERN.matcher(resolved);
+                StringBuffer sb = new StringBuffer();
+                boolean changed = false;
+                while (matcher.find()) {
+                    String token = matcher.group(1);
+                    String key = token;
+                    String fallback = "";
+                    int colon = token.indexOf(':');
+                    if (colon >= 0) {
+                        key = token.substring(0, colon);
+                        fallback = token.substring(colon + 1);
+                    }
+                    String property = lookupPropertyValue(key);
+                    if (property == null) {
+                        property = fallback;
+                    }
+                    matcher.appendReplacement(sb, Matcher.quoteReplacement(property == null ? "" : property));
+                    changed = true;
+                }
+                matcher.appendTail(sb);
+                if (!changed) {
+                    break;
+                }
+                String next = sb.toString();
+                if (next.equals(resolved)) {
+                    break;
+                }
+                resolved = next;
+            }
+            return resolved;
+        }
+
+        private String lookupPropertyValue(String key) {
+            if (isBlank(key)) {
+                return null;
+            }
+            String normalized = key.trim();
+            try {
+                String system = System.getProperty(normalized);
+                if (!isBlank(system)) {
+                    return system;
+                }
+            } catch (Throwable ignored) {
+                // ignore
+            }
+            try {
+                String env = System.getenv(normalized);
+                if (!isBlank(env)) {
+                    return env;
+                }
+                String envAlias = normalized.replace('.', '_').toUpperCase(Locale.ROOT);
+                env = System.getenv(envAlias);
+                if (!isBlank(env)) {
+                    return env;
+                }
+            } catch (Throwable ignored) {
+                // ignore
+            }
+            String projectValue = projectProperties.get(normalized);
+            if (!isBlank(projectValue)) {
+                return projectValue;
+            }
+            return null;
+        }
+
+        private String capitalize(String value) {
+            if (isBlank(value)) {
+                return value;
+            }
+            if (value.length() == 1) {
+                return value.toUpperCase(Locale.ROOT);
+            }
+            return Character.toUpperCase(value.charAt(0)) + value.substring(1);
         }
 
         private InjectionHint resolveInjectionHint(Field field) {
@@ -4933,6 +5517,28 @@ public class RuntimeSandboxSimulator {
             }
         }
 
+        private static class XmlPropertyAssignment {
+            public final String propertyName;
+            public final String valueLiteral;
+            public final String refBeanName;
+            public final String source;
+
+            private XmlPropertyAssignment(String propertyName, String valueLiteral, String refBeanName, String source) {
+                this.propertyName = normalizeBeanName(propertyName);
+                this.valueLiteral = valueLiteral;
+                this.refBeanName = normalizeBeanName(refBeanName);
+                this.source = source == null ? "" : source;
+            }
+
+            private static XmlPropertyAssignment byValue(String propertyName, String valueLiteral, String source) {
+                return new XmlPropertyAssignment(propertyName, valueLiteral, "", source);
+            }
+
+            private static XmlPropertyAssignment byRef(String propertyName, String refBeanName, String source) {
+                return new XmlPropertyAssignment(propertyName, "", refBeanName, source);
+            }
+        }
+
         private static List<String> scanClassNames(List<Path> classRoots,
                                                    boolean debugRuntime) throws IOException {
             LinkedHashSet<String> classes = new LinkedHashSet<String>();
@@ -5035,7 +5641,7 @@ public class RuntimeSandboxSimulator {
             int maxRuntimeEvents = 60000;
             int maxRuntimeObjects = 20000;
             boolean debugRuntime = false;
-            boolean useSpringContext = false;
+            boolean useSpringContext = true;
             boolean softFail = false;
             int softFailMaxSuppressions = 2000;
             List<String> softFailExceptionPrefixes = new ArrayList<String>();
@@ -5071,6 +5677,8 @@ public class RuntimeSandboxSimulator {
                     debugRuntime = true;
                 } else if ("--use-spring-context".equals(arg)) {
                     useSpringContext = true;
+                } else if ("--no-spring-context".equals(arg)) {
+                    useSpringContext = false;
                 } else if ("--soft-fail".equals(arg)) {
                     softFail = true;
                 } else if ("--soft-fail-max".equals(arg) && i + 1 < args.length) {
@@ -5253,6 +5861,89 @@ public class RuntimeSandboxSimulator {
             // best effort auto-discovery
         }
         return new ArrayList<Path>(entries);
+    }
+
+    private static Map<String, String> loadProjectProperties(Path projectDir,
+                                                             boolean debugRuntime,
+                                                             String logTag) {
+        LinkedHashMap<String, String> values = new LinkedHashMap<String, String>();
+        if (projectDir == null || !Files.isDirectory(projectDir)) {
+            return values;
+        }
+        try (Stream<Path> stream = Files.walk(projectDir, 10)) {
+            List<Path> propertyFiles = stream
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.toString().toLowerCase(Locale.ROOT).endsWith(".properties"))
+                    .filter(path -> !isIgnoredPropertyFile(path))
+                    .collect(Collectors.toList());
+            Collections.sort(propertyFiles);
+            for (Path propertyFile : propertyFiles) {
+                Properties props = new Properties();
+                try (InputStream input = Files.newInputStream(propertyFile)) {
+                    props.load(input);
+                } catch (Throwable error) {
+                    if (debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] " + logTag + "_SKIP file="
+                                + propertyFile.toAbsolutePath()
+                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    }
+                    continue;
+                }
+                for (String name : props.stringPropertyNames()) {
+                    if (isBlank(name)) {
+                        continue;
+                    }
+                    values.put(name.trim(), props.getProperty(name));
+                }
+                if (debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] " + logTag + "_LOAD file="
+                            + propertyFile.toAbsolutePath() + " count=" + props.size());
+                }
+            }
+        } catch (IOException error) {
+            if (debugRuntime) {
+                System.out.println("[RUNTIME_DEBUG] " + logTag + "_SCAN_FAIL error="
+                        + error.getClass().getName() + ": " + error.getMessage());
+            }
+        }
+        return values;
+    }
+
+    private static boolean isIgnoredPropertyFile(Path propertyFile) {
+        if (propertyFile == null) {
+            return true;
+        }
+        String normalized = propertyFile.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+        return normalized.contains("/.git/")
+                || normalized.contains("/.idea/")
+                || normalized.contains("/target/")
+                || normalized.contains("/build/")
+                || normalized.contains("/.m2repo/");
+    }
+
+    private static Properties toProperties(Map<String, String> map) {
+        Properties props = new Properties();
+        if (map == null || map.isEmpty()) {
+            return props;
+        }
+        for (Map.Entry<String, String> entry : map.entrySet()) {
+            if (entry.getKey() == null) {
+                continue;
+            }
+            props.setProperty(entry.getKey(), entry.getValue() == null ? "" : entry.getValue());
+        }
+        return props;
+    }
+
+    private static String packageNameOf(String className) {
+        if (isBlank(className)) {
+            return "";
+        }
+        int lastDot = className.lastIndexOf('.');
+        if (lastDot <= 0) {
+            return "";
+        }
+        return className.substring(0, lastDot);
     }
 
     private static List<String> normalizeTokens(List<String> raw) {
