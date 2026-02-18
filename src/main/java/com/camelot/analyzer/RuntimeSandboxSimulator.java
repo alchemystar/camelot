@@ -201,6 +201,7 @@ public class RuntimeSandboxSimulator {
                     }
                 } else {
                     report.springContextActive = false;
+                    invokeStartupMainFallback(options, classLoader, projectClassIndex);
                 }
             }
             ACTIVE_UNIQUE_IMPL_BY_TYPE = buildUniqueConcreteTypeIndex(beanFactory, springRuntime, options.debugRuntime);
@@ -1292,6 +1293,84 @@ public class RuntimeSandboxSimulator {
         return values;
     }
 
+    private static void invokeStartupMainFallback(CliOptions options,
+                                                  ClassLoader classLoader,
+                                                  ProjectClassIndex projectClassIndex) {
+        if (options == null || classLoader == null) {
+            return;
+        }
+        try {
+            Set<String> projectClassNames = projectClassIndex == null
+                    ? Collections.<String>emptySet()
+                    : new LinkedHashSet<String>(projectClassIndex.classNames);
+            Class<?> startupClass = SpringContextRuntime.resolveStartupClass(options, classLoader, projectClassNames);
+            if (startupClass == null) {
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] STARTUP_MAIN_SKIP reason=startup-class-not-found target="
+                            + options.startupClass);
+                }
+                return;
+            }
+            Method mainMethod;
+            try {
+                mainMethod = startupClass.getMethod("main", String[].class);
+            } catch (NoSuchMethodException missingMain) {
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] STARTUP_MAIN_SKIP class=" + startupClass.getName()
+                            + " reason=no-main-method");
+                }
+                return;
+            }
+            mainMethod.setAccessible(true);
+            final String[] startupArgs = new String[]{
+                    "--spring.main.web-application-type=none",
+                    "--spring.main.lazy-initialization=true",
+                    "--spring.main.banner-mode=off",
+                    "--spring.jmx.enabled=false"
+            };
+            Thread bootstrapThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        mainMethod.invoke(null, (Object) startupArgs);
+                    } catch (Throwable error) {
+                        Throwable root = error;
+                        if (error instanceof java.lang.reflect.InvocationTargetException
+                                && ((java.lang.reflect.InvocationTargetException) error).getTargetException() != null) {
+                            root = ((java.lang.reflect.InvocationTargetException) error).getTargetException();
+                        }
+                        if (options.debugRuntime) {
+                            System.out.println("[RUNTIME_DEBUG] STARTUP_MAIN_FAIL class=" + startupClass.getName()
+                                    + " error=" + root.getClass().getName() + ": " + root.getMessage());
+                            printErrorChain(root);
+                        }
+                    }
+                }
+            }, "camelot-startup-main");
+            bootstrapThread.setDaemon(true);
+            bootstrapThread.start();
+            try {
+                bootstrapThread.join(10000L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            if (options.debugRuntime) {
+                if (bootstrapThread.isAlive()) {
+                    System.out.println("[RUNTIME_DEBUG] STARTUP_MAIN_TIMEOUT class=" + startupClass.getName()
+                            + " timeoutMs=10000");
+                } else {
+                    System.out.println("[RUNTIME_DEBUG] STARTUP_MAIN_DONE class=" + startupClass.getName());
+                }
+            }
+        } catch (Throwable error) {
+            if (options.debugRuntime) {
+                System.out.println("[RUNTIME_DEBUG] STARTUP_MAIN_ERROR error="
+                        + error.getClass().getName() + ": " + error.getMessage());
+                printErrorChain(error);
+            }
+        }
+    }
+
     private static boolean isAutoArgToken(String raw) {
         if (raw == null) {
             return false;
@@ -2165,9 +2244,9 @@ public class RuntimeSandboxSimulator {
             };
         }
 
-        private static Class<?> resolveStartupClass(CliOptions options,
-                                                    ClassLoader classLoader,
-                                                    Set<String> projectClassNames) {
+        static Class<?> resolveStartupClass(CliOptions options,
+                                            ClassLoader classLoader,
+                                            Set<String> projectClassNames) {
             if (options == null) {
                 return null;
             }
@@ -4638,6 +4717,7 @@ public class RuntimeSandboxSimulator {
         }
 
         private void injectFields(Object instance, Class<?> type) throws Exception {
+            applyPropertyMapConvention(instance, type);
             Class<?> current = type;
             while (current != null && current != Object.class) {
                 for (Field field : current.getDeclaredFields()) {
@@ -4701,6 +4781,56 @@ public class RuntimeSandboxSimulator {
                     }
                 }
                 current = current.getSuperclass();
+            }
+        }
+
+        private void applyPropertyMapConvention(Object instance, Class<?> type) {
+            if (instance == null || type == null || projectProperties.isEmpty()) {
+                return;
+            }
+            try {
+                Field propertyMapField = findField(type, "propertyMap");
+                Map<String, String> runtimeMap = null;
+                if (propertyMapField != null && Map.class.isAssignableFrom(propertyMapField.getType())) {
+                    Object current = propertyMapField.get(instance);
+                    if (current instanceof Map) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, String> existingMap = (Map<String, String>) current;
+                        if (existingMap.isEmpty()) {
+                            existingMap.putAll(projectProperties);
+                        }
+                        runtimeMap = existingMap;
+                    } else if (current == null) {
+                        LinkedHashMap<String, String> created = new LinkedHashMap<String, String>(projectProperties);
+                        propertyMapField.set(instance, created);
+                        runtimeMap = created;
+                        debugBean("BEAN_PROPERTY_MAP_FIELD_INIT owner=%s field=propertyMap size=%d",
+                                type.getName(),
+                                created.size());
+                    }
+                }
+                Method setter = findSetter(type, "propertyMap");
+                if (setter != null) {
+                    Class<?>[] params = setter.getParameterTypes();
+                    if (params.length == 1 && Map.class.isAssignableFrom(params[0])) {
+                        Object currentValue = null;
+                        if (propertyMapField != null) {
+                            currentValue = propertyMapField.get(instance);
+                        }
+                        if (!(currentValue instanceof Map)) {
+                            if (runtimeMap == null) {
+                                runtimeMap = new LinkedHashMap<String, String>(projectProperties);
+                            }
+                            setter.invoke(instance, runtimeMap);
+                            debugBean("BEAN_PROPERTY_MAP_SETTER_INIT owner=%s method=%s size=%d",
+                                    type.getName(),
+                                    setter.getName(),
+                                    runtimeMap.size());
+                        }
+                    }
+                }
+            } catch (Throwable error) {
+                debugBeanThrowable("BEAN_PROPERTY_MAP_INIT_FAIL owner=" + type.getName(), error);
             }
         }
 
