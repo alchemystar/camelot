@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -74,6 +75,7 @@ public final class SpringBootNativeLauncher {
             LinkedHashSet<String> forceMockBeanNames = new LinkedHashSet<String>();
             boolean servletFallbackApplied = false;
             boolean broadPrefixFallbackApplied = false;
+            boolean suppressSpringApplicationCallbacks = false;
             RunOutcome outcome = null;
             IllegalStateException lastError = null;
             for (int attempt = 0; attempt < DEFAULT_MAX_INIT_SKIP_RETRIES; attempt++) {
@@ -86,6 +88,7 @@ public final class SpringBootNativeLauncher {
                             packagePrefixes,
                             forceMockClassPrefixes,
                             forceMockBeanNames,
+                            suppressSpringApplicationCallbacks,
                             request
                     );
                     lastError = null;
@@ -98,6 +101,11 @@ public final class SpringBootNativeLauncher {
                         launchProperties = fallbackProperties;
                         servletFallbackApplied = true;
                         LOG.warn("Detected missing servlet environment class, fallback to non-web mode and retry.");
+                        continue;
+                    }
+                    if (!suppressSpringApplicationCallbacks && isPrepareContextFailure(runError)) {
+                        suppressSpringApplicationCallbacks = true;
+                        LOG.warn("Detected failure during SpringApplication.prepareContext; suppress callbacks and retry.");
                         continue;
                     }
                     String failedBeanName = extractFailedBeanName(runError);
@@ -159,6 +167,7 @@ public final class SpringBootNativeLauncher {
                                              List<String> packagePrefixes,
                                              List<String> forceMockClassPrefixes,
                                              Set<String> forceMockBeanNames,
+                                             boolean suppressSpringApplicationCallbacks,
                                              StartRequest request) {
         List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
         InitializerHandle initializerHandle = createMockingInitializerHandle(
@@ -175,6 +184,9 @@ public final class SpringBootNativeLauncher {
                 new Class[]{initializerHandle.initializerArrayType},
                 new Object[]{initializerHandle.initializerArray}
         );
+        if (suppressSpringApplicationCallbacks) {
+            suppressSpringApplicationCallbacks(builder);
+        }
         builder = invokeBuilder(builder, "properties", new Class[]{String[].class}, new Object[]{propertyArgs.toArray(new String[0])});
         Object contextObject = invokeBuilder(
                 builder,
@@ -222,6 +234,26 @@ public final class SpringBootNativeLauncher {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private static boolean isPrepareContextFailure(Throwable error) {
+        Throwable cursor = error;
+        while (cursor != null) {
+            StackTraceElement[] stack = cursor.getStackTrace();
+            if (stack != null) {
+                for (StackTraceElement element : stack) {
+                    if (element == null) {
+                        continue;
+                    }
+                    if ("org.springframework.boot.SpringApplication".equals(element.getClassName())
+                            && "prepareContext".equals(element.getMethodName())) {
+                        return true;
+                    }
+                }
+            }
+            cursor = cursor.getCause();
+        }
+        return false;
     }
 
     private static boolean isBlank(String text) {
@@ -440,6 +472,38 @@ public final class SpringBootNativeLauncher {
             // Java 8 has no platform class loader API.
         }
         return null;
+    }
+
+    private static void suppressSpringApplicationCallbacks(Object builder) {
+        try {
+            Method applicationMethod = builder.getClass().getMethod("application");
+            Object springApplication = applicationMethod.invoke(builder);
+            if (springApplication == null) {
+                return;
+            }
+            Method getInitializers = springApplication.getClass().getMethod("getInitializers");
+            Object initializersObject = getInitializers.invoke(springApplication);
+            List<Object> retainedInitializers = new ArrayList<Object>();
+            if (initializersObject instanceof Collection) {
+                Collection<?> initializers = (Collection<?>) initializersObject;
+                for (Object initializer : initializers) {
+                    if (initializer == null) {
+                        continue;
+                    }
+                    String marker = String.valueOf(initializer);
+                    if (marker.contains("MockingInitializerProxy")) {
+                        retainedInitializers.add(initializer);
+                    }
+                }
+            }
+            Method setInitializers = springApplication.getClass().getMethod("setInitializers", Collection.class);
+            setInitializers.invoke(springApplication, retainedInitializers);
+            Method setListeners = springApplication.getClass().getMethod("setListeners", Collection.class);
+            setListeners.invoke(springApplication, Collections.emptyList());
+            LOG.warn("Suppressed SpringApplication callbacks: retainedInitializers={} listeners=0", retainedInitializers.size());
+        } catch (Exception error) {
+            LOG.warn("Failed suppressing SpringApplication callbacks.", error);
+        }
     }
 
     private static InitializerHandle createMockingInitializerHandle(final ClassLoader classLoader,
