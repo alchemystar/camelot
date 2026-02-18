@@ -594,6 +594,25 @@ public class RuntimeSandboxSimulator {
         System.out.println("[RUNTIME_DEBUG] " + message);
     }
 
+    public static void debugAdviceThrowable(String prefix, Throwable error) {
+        if (!ADVICE_DIAG_ENABLED || error == null) {
+            return;
+        }
+        String head = isBlank(prefix) ? "ADVICE_ERROR" : prefix;
+        debugAdviceLine(head + " error=" + error.getClass().getName() + ": " + error.getMessage());
+        String stack = stackTraceToString(error);
+        if (isBlank(stack)) {
+            return;
+        }
+        String[] lines = stack.split("\\r?\\n");
+        for (String line : lines) {
+            if (isBlank(line)) {
+                continue;
+            }
+            debugAdviceLine(head + " stack=" + line);
+        }
+    }
+
     public static boolean isAdviceReentryGuarded() {
         Integer depth = ADVICE_REENTRY_DEPTH.get();
         return depth != null && depth.intValue() > 0;
@@ -758,8 +777,7 @@ public class RuntimeSandboxSimulator {
         try {
             handler = Proxy.getInvocationHandler(self);
         } catch (Throwable error) {
-            debugAdviceLine("ADVICE_TYPE_RESOLVE_HANDLER_FAIL proxy="
-                    + runtimeName + " error=" + error.getClass().getName());
+            debugAdviceThrowable("ADVICE_TYPE_RESOLVE_HANDLER_FAIL proxy=" + runtimeName, error);
             return null;
         }
         if (handler == null) {
@@ -2223,16 +2241,14 @@ public class RuntimeSandboxSimulator {
                         try {
                             typeCollector.onMethodEnter(ownerTypeName, ownerMethodName, self, args);
                         } catch (Throwable error) {
-                            debugAdviceLine("TYPE_COLLECTOR_ENTER_ERROR methodId=" + methodId
-                                    + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                            debugAdviceThrowable("TYPE_COLLECTOR_ENTER_ERROR methodId=" + methodId, error);
                         }
                     }
                     if (executionCollector != null) {
                         try {
                             executionCollector.onMethodEnter(ownerTypeName, ownerMethodName, self, args);
                         } catch (Throwable error) {
-                            debugAdviceLine("EXEC_COLLECTOR_ENTER_ERROR methodId=" + methodId
-                                    + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                            debugAdviceThrowable("EXEC_COLLECTOR_ENTER_ERROR methodId=" + methodId, error);
                         }
                     }
                     return null;
@@ -2241,8 +2257,7 @@ public class RuntimeSandboxSimulator {
                 try {
                     collector.onEnter(methodId);
                 } catch (Throwable error) {
-                    debugAdviceLine("TRACE_COLLECTOR_ENTER_ERROR methodId=" + methodId
-                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    debugAdviceThrowable("TRACE_COLLECTOR_ENTER_ERROR methodId=" + methodId, error);
                     return null;
                 }
                 int afterCount = collector.getCallCount();
@@ -2255,16 +2270,14 @@ public class RuntimeSandboxSimulator {
                     try {
                         typeCollector.onMethodEnter(ownerTypeName, ownerMethodName, self, args);
                     } catch (Throwable error) {
-                        debugAdviceLine("TYPE_COLLECTOR_ENTER_ERROR methodId=" + methodId
-                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                        debugAdviceThrowable("TYPE_COLLECTOR_ENTER_ERROR methodId=" + methodId, error);
                     }
                 }
                 if (executionCollector != null) {
                     try {
                         executionCollector.onMethodEnter(ownerTypeName, ownerMethodName, self, args);
                     } catch (Throwable error) {
-                        debugAdviceLine("EXEC_COLLECTOR_ENTER_ERROR methodId=" + methodId
-                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                        debugAdviceThrowable("EXEC_COLLECTOR_ENTER_ERROR methodId=" + methodId, error);
                     }
                 }
                 return methodId;
@@ -2304,16 +2317,14 @@ public class RuntimeSandboxSimulator {
                     try {
                         typeCollector.onMethodExit(ownerTypeName, ownerMethodName, self, args, null, observedThrown);
                     } catch (Throwable error) {
-                        debugAdviceLine("TYPE_COLLECTOR_EXIT_ERROR methodId=" + methodId
-                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                        debugAdviceThrowable("TYPE_COLLECTOR_EXIT_ERROR methodId=" + methodId, error);
                     }
                 }
                 if (executionCollector != null) {
                     try {
                         executionCollector.onMethodExit(ownerTypeName, ownerMethodName, self, args, null, observedThrown, softFailSuppressed);
                     } catch (Throwable error) {
-                        debugAdviceLine("EXEC_COLLECTOR_EXIT_ERROR methodId=" + methodId
-                                + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                        debugAdviceThrowable("EXEC_COLLECTOR_EXIT_ERROR methodId=" + methodId, error);
                     }
                 }
                 return;
@@ -2321,24 +2332,21 @@ public class RuntimeSandboxSimulator {
             try {
                 collector.onExit(methodId);
             } catch (Throwable error) {
-                debugAdviceLine("TRACE_COLLECTOR_EXIT_ERROR methodId=" + methodId
-                        + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                debugAdviceThrowable("TRACE_COLLECTOR_EXIT_ERROR methodId=" + methodId, error);
                 return;
             }
             if (typeCollector != null) {
                 try {
                     typeCollector.onMethodExit(ownerTypeName, ownerMethodName, self, args, null, observedThrown);
                 } catch (Throwable error) {
-                    debugAdviceLine("TYPE_COLLECTOR_EXIT_ERROR methodId=" + methodId
-                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    debugAdviceThrowable("TYPE_COLLECTOR_EXIT_ERROR methodId=" + methodId, error);
                 }
             }
             if (executionCollector != null) {
                 try {
                     executionCollector.onMethodExit(ownerTypeName, ownerMethodName, self, args, null, observedThrown, softFailSuppressed);
                 } catch (Throwable error) {
-                    debugAdviceLine("EXEC_COLLECTOR_EXIT_ERROR methodId=" + methodId
-                            + " error=" + error.getClass().getName() + ": " + error.getMessage());
+                    debugAdviceThrowable("EXEC_COLLECTOR_EXIT_ERROR methodId=" + methodId, error);
                 }
             }
             } finally {
