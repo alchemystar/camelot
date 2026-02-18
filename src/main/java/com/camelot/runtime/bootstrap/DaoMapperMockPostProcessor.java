@@ -11,6 +11,7 @@ import org.springframework.beans.factory.support.RootBeanDefinition;
 import org.springframework.core.Ordered;
 import org.springframework.core.PriorityOrdered;
 
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -62,11 +63,15 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         List<String> beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
         for (String beanName : beanNames) {
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
-            MockTarget target = resolveTarget(definition);
+            boolean forcedByBeanName = beanName != null && forceMockBeanNames.contains(beanName);
+            MockTarget target = resolveTarget(beanFactory, beanName, definition);
+            if (target == null && forcedByBeanName) {
+                target = new MockTarget(Object.class.getName(), false);
+            }
             if (target == null) {
                 continue;
             }
-            if (!shouldMock(beanName, target)) {
+            if (!forcedByBeanName && !shouldMock(beanName, target)) {
                 continue;
             }
             RootBeanDefinition replacement = new RootBeanDefinition(NoOpBeanMockFactoryBean.class);
@@ -171,14 +176,36 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 continue;
             }
             String normalized = prefix.trim();
-            if (clean.equals(normalized) || clean.startsWith(normalized + ".")) {
+            if (matchesPrefix(clean, normalized)) {
                 return true;
             }
         }
         return false;
     }
 
-    private MockTarget resolveTarget(BeanDefinition definition) {
+    private boolean matchesPrefix(String clean, String normalizedPrefix) {
+        if (normalizedPrefix.isEmpty()) {
+            return false;
+        }
+        if (clean.equals(normalizedPrefix)) {
+            return true;
+        }
+        if (normalizedPrefix.endsWith(".")) {
+            return clean.startsWith(normalizedPrefix);
+        }
+        if (!clean.startsWith(normalizedPrefix)) {
+            return false;
+        }
+        if (clean.length() == normalizedPrefix.length()) {
+            return true;
+        }
+        char boundary = clean.charAt(normalizedPrefix.length());
+        return boundary == '.' || boundary == '$';
+    }
+
+    private MockTarget resolveTarget(ConfigurableListableBeanFactory beanFactory,
+                                     String beanName,
+                                     BeanDefinition definition) {
         String beanClassName = definition.getBeanClassName();
         if (MYBATIS_MAPPER_FACTORY.equals(beanClassName)) {
             String mapperType = resolveMapperInterfaceType(definition);
@@ -193,6 +220,14 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (mapperType != null) {
             return new MockTarget(mapperType, true);
         }
+        try {
+            Class<?> beanType = beanFactory.getType(beanName, false);
+            if (beanType != null) {
+                return new MockTarget(beanType.getName(), false);
+            }
+        } catch (Throwable ignored) {
+            // Best effort only.
+        }
         Object factoryType = definition.getAttribute("factoryBeanObjectType");
         String factoryTypeName = asTypeName(factoryType);
         if (factoryTypeName != null) {
@@ -205,6 +240,81 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         } catch (Throwable ignored) {
             // Best effort only.
+        }
+        String factoryMethodType = resolveFactoryMethodType(beanFactory, definition);
+        if (factoryMethodType != null) {
+            return new MockTarget(factoryMethodType, false);
+        }
+        return null;
+    }
+
+    private String resolveFactoryMethodType(ConfigurableListableBeanFactory beanFactory, BeanDefinition definition) {
+        String factoryMethodName = clean(definition.getFactoryMethodName());
+        if (factoryMethodName == null) {
+            return null;
+        }
+        String factoryClassName = resolveFactoryClassName(beanFactory, definition);
+        if (factoryClassName == null) {
+            return null;
+        }
+        Class<?> factoryClass;
+        try {
+            factoryClass = Class.forName(factoryClassName, false, Thread.currentThread().getContextClassLoader());
+        } catch (Throwable ignored) {
+            return null;
+        }
+        Method[] methods = factoryClass.getDeclaredMethods();
+        String candidate = null;
+        for (Method method : methods) {
+            if (!factoryMethodName.equals(method.getName())) {
+                continue;
+            }
+            if (Void.TYPE.equals(method.getReturnType())) {
+                continue;
+            }
+            String returnTypeName = method.getReturnType().getName();
+            if (candidate == null) {
+                candidate = returnTypeName;
+            } else if (!candidate.equals(returnTypeName)) {
+                return candidate;
+            }
+        }
+        if (candidate != null) {
+            return candidate;
+        }
+        for (Method method : factoryClass.getMethods()) {
+            if (factoryMethodName.equals(method.getName()) && !Void.TYPE.equals(method.getReturnType())) {
+                return method.getReturnType().getName();
+            }
+        }
+        return null;
+    }
+
+    private String resolveFactoryClassName(ConfigurableListableBeanFactory beanFactory, BeanDefinition definition) {
+        String direct = clean(definition.getBeanClassName());
+        if (direct != null) {
+            return direct;
+        }
+        String factoryBeanName = clean(definition.getFactoryBeanName());
+        if (factoryBeanName == null) {
+            return null;
+        }
+        try {
+            Class<?> factoryBeanType = beanFactory.getType(factoryBeanName, false);
+            if (factoryBeanType != null) {
+                return factoryBeanType.getName();
+            }
+        } catch (Throwable ignored) {
+            // Best effort only.
+        }
+        if (beanFactory.containsBeanDefinition(factoryBeanName)) {
+            BeanDefinition factoryBeanDefinition = beanFactory.getBeanDefinition(factoryBeanName);
+            String className = clean(factoryBeanDefinition.getBeanClassName());
+            if (className != null) {
+                return className;
+            }
+            String attributeType = asTypeName(factoryBeanDefinition.getAttribute("factoryBeanObjectType"));
+            return clean(attributeType);
         }
         return null;
     }
@@ -250,6 +360,14 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             return text.isEmpty() ? null : text;
         }
         return null;
+    }
+
+    private String clean(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 
     private static List<String> normalizePackages(List<String> prefixes) {

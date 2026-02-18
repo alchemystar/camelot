@@ -36,7 +36,9 @@ public final class SpringBootNativeLauncher {
     ));
     private static final List<Pattern> FAILED_BEAN_PATTERNS = Arrays.asList(
             Pattern.compile("Error creating bean with name '([^']+)'"),
+            Pattern.compile("Error creating bean with name \"([^\"]+)\""),
             Pattern.compile("bean named '([^']+)'"),
+            Pattern.compile("bean named \"([^\"]+)\""),
             Pattern.compile("No qualifying bean named '([^']+)'")
     );
     private static final int DEFAULT_MAX_INIT_SKIP_RETRIES = 12;
@@ -175,13 +177,12 @@ public final class SpringBootNativeLauncher {
         if (error == null) {
             return null;
         }
-        if (!"org.springframework.beans.factory.BeanCreationException".equals(error.getClass().getName())) {
-            return null;
-        }
         try {
             Method method = error.getClass().getMethod("getBeanName");
             Object result = method.invoke(error);
             return result == null ? null : String.valueOf(result);
+        } catch (NoSuchMethodException ignored) {
+            return null;
         } catch (Exception ignored) {
             return null;
         }

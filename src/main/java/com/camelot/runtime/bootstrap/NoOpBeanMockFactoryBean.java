@@ -73,7 +73,8 @@ public final class NoOpBeanMockFactoryBean implements FactoryBean<Object>, BeanC
             return Proxy.newProxyInstance(beanClassLoader, new Class[]{type}, handler);
         }
         if (Modifier.isFinal(type.getModifiers())) {
-            throw new IllegalStateException("Cannot create mock for final class: " + type.getName());
+            // Cannot CGLIB-subclass final classes. Create constructor-free instance as a safe startup stub.
+            return new ObjenesisStd(true).newInstance(type);
         }
 
         MethodInterceptor interceptor = new DefaultMethodInterceptor(type);

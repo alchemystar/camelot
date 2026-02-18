@@ -67,7 +67,7 @@ public final class SpringRuntimeBootstrapMain {
         private String projectDir;
         private final Set<String> profiles = new LinkedHashSet<String>();
         private final Set<String> scanPackages = new LinkedHashSet<String>();
-        private final Set<String> forceMockClassPrefixes = new LinkedHashSet<String>();
+        private final List<String> forceMockClassPrefixes = new ArrayList<String>();
         private final List<String> appArgs = new ArrayList<String>();
         private final Map<String, String> extraProperties = new LinkedHashMap<String, String>();
         private boolean keepRunning;
@@ -100,7 +100,7 @@ public final class SpringRuntimeBootstrapMain {
                     continue;
                 }
                 if (arg.startsWith("--force-mock-class-prefix=")) {
-                    addCommaSeparated(options.forceMockClassPrefixes, arg.substring("--force-mock-class-prefix=".length()));
+                    addCommaSeparatedToList(options.forceMockClassPrefixes, arg.substring("--force-mock-class-prefix=".length()));
                     continue;
                 }
                 if (arg.startsWith("--arg=")) {
@@ -146,6 +146,19 @@ public final class SpringRuntimeBootstrapMain {
         }
 
         private static void addCommaSeparated(Set<String> target, String raw) {
+            if (raw == null || raw.trim().isEmpty()) {
+                return;
+            }
+            List<String> values = Arrays.asList(raw.split(","));
+            for (String value : values) {
+                String trimmed = value == null ? "" : value.trim();
+                if (!trimmed.isEmpty()) {
+                    target.add(trimmed);
+                }
+            }
+        }
+
+        private static void addCommaSeparatedToList(List<String> target, String raw) {
             if (raw == null || raw.trim().isEmpty()) {
                 return;
             }
