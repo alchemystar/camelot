@@ -444,6 +444,12 @@ public final class SpringBootNativeLauncher {
                                                                     final List<String> forceMockClassPrefixes,
                                                                     final Set<String> forceMockBeanNames) {
         try {
+            LOG.info(
+                    "Create mocking initializer: scanPackages={} forceMockClassPrefixes={} forceMockBeanNames={}",
+                    packagePrefixes,
+                    forceMockClassPrefixes,
+                    forceMockBeanNames
+            );
             final Class<?> initializerType = Class.forName(
                     "org.springframework.context.ApplicationContextInitializer",
                     true,
@@ -469,6 +475,11 @@ public final class SpringBootNativeLauncher {
                     String name = method.getName();
                     if ("initialize".equals(name) && args != null && args.length == 1 && args[0] != null) {
                         Object context = args[0];
+                        LOG.info(
+                                "Initialize mocking post-processor for context={} classLoader={}",
+                                context.getClass().getName(),
+                                context.getClass().getClassLoader()
+                        );
                         Object postProcessor = constructor.newInstance(
                                 new ArrayList<String>(packagePrefixes),
                                 new ArrayList<String>(forceMockClassPrefixes),
@@ -480,6 +491,7 @@ public final class SpringBootNativeLauncher {
                                 beanFactoryPostProcessorType
                         );
                         addPostProcessor.invoke(context, postProcessor);
+                        LOG.info("Registered DaoMapperMockPostProcessor into Spring context.");
                         return null;
                     }
                     if ("toString".equals(name) && method.getParameterTypes().length == 0) {
