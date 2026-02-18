@@ -2310,6 +2310,7 @@ public class RuntimeSandboxSimulator {
                     && softFailController.shouldSuppress(ownerTypeName, ownerMethodName, thrown)) {
                 softFailController.recordSuppressed(methodId, thrown);
                 softFailSuppressed = true;
+                debugAdviceThrowable("SOFT_FAIL_SUPPRESSED methodId=" + methodId, thrown);
                 thrown = null;
             }
             if (collector == null || methodId == null) {
@@ -3949,6 +3950,25 @@ public class RuntimeSandboxSimulator {
             }
         }
 
+        private void debugBeanThrowable(String prefix, Throwable error) {
+            if (!options.debugRuntime || error == null) {
+                return;
+            }
+            String head = isBlank(prefix) ? "BEAN_ERROR" : prefix;
+            debugBean("%s error=%s: %s", head, error.getClass().getName(), error.getMessage());
+            String stack = stackTraceToString(error);
+            if (isBlank(stack)) {
+                return;
+            }
+            String[] lines = stack.split("\\r?\\n");
+            for (String line : lines) {
+                if (isBlank(line)) {
+                    continue;
+                }
+                debugBean("%s stack=%s", head, line);
+            }
+        }
+
         public List<String> suggestClassNames(String missingClass, int limit) {
             if (missingClass == null || missingClass.trim().isEmpty() || discoveredClassNames.isEmpty()) {
                 return Collections.emptyList();
@@ -4319,11 +4339,13 @@ public class RuntimeSandboxSimulator {
             } catch (Throwable error) {
                 String failure = error.getClass().getName() + ": " + error.getMessage();
                 beanCreateFailures.put(targetClass, failure);
-                debugBean("BEAN_CREATE_BRANCH_FAIL class=%s requested=%s reason=%s error=%s",
+                String requestedTypeName = requestedType == null ? "null" : requestedType.getName();
+                String head = String.format(Locale.ROOT,
+                        "BEAN_CREATE_BRANCH_FAIL class=%s requested=%s reason=%s",
                         targetClass.getName(),
-                        requestedType == null ? "null" : requestedType.getName(),
-                        reason,
-                        failure);
+                        requestedTypeName,
+                        reason);
+                debugBeanThrowable(head, error);
                 return null;
             } finally {
                 creating.remove(targetClass);
