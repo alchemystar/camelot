@@ -25,6 +25,7 @@ import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.beans.factory.config.InstantiationAwareBeanPostProcessor;
 import org.springframework.beans.factory.xml.XmlBeanDefinitionReader;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.support.PropertySourcesPlaceholderConfigurer;
 import org.springframework.cglib.proxy.Enhancer;
 import org.springframework.cglib.proxy.MethodInterceptor;
@@ -2061,12 +2062,12 @@ public class RuntimeSandboxSimulator {
     }
 
     private static class SpringContextRuntime implements BeanProvider {
-        private final AnnotationConfigApplicationContext context;
+        private final ConfigurableApplicationContext context;
         private final boolean debugRuntime;
         private final String startupClassName;
         private final ExternalDependencyGuard dependencyGuard;
 
-        private SpringContextRuntime(AnnotationConfigApplicationContext context,
+        private SpringContextRuntime(ConfigurableApplicationContext context,
                                      boolean debugRuntime,
                                      String startupClassName,
                                      ExternalDependencyGuard dependencyGuard) {
@@ -2083,6 +2084,16 @@ public class RuntimeSandboxSimulator {
         private static SpringContextRuntime tryStart(CliOptions options,
                                                      ClassLoader classLoader,
                                                      ProjectClassIndex projectClassIndex) {
+            Set<String> projectClassNames = projectClassIndex == null
+                    ? Collections.<String>emptySet()
+                    : new LinkedHashSet<String>(projectClassIndex.classNames);
+            Class<?> startupClass = resolveStartupClass(options, classLoader, projectClassNames);
+
+            SpringContextRuntime nativeRuntime = tryStartNativeSpringBoot(options, classLoader, startupClass);
+            if (nativeRuntime != null) {
+                return nativeRuntime;
+            }
+
             AnnotationConfigApplicationContext context = null;
             try {
                 context = new AnnotationConfigApplicationContext();
@@ -2091,14 +2102,10 @@ public class RuntimeSandboxSimulator {
                 context.getDefaultListableBeanFactory().setAllowCircularReferences(true);
                 context.getDefaultListableBeanFactory().setAllowRawInjectionDespiteWrapping(true);
 
-                Set<String> projectClassNames = projectClassIndex == null
-                        ? Collections.<String>emptySet()
-                        : new LinkedHashSet<String>(projectClassIndex.classNames);
                 ExternalDependencyGuard dependencyGuard = new ExternalDependencyGuard(projectClassNames, options.debugRuntime);
                 context.getBeanFactory().addBeanPostProcessor(dependencyGuard);
                 context.addBeanFactoryPostProcessor(lazyInitBeanFactoryPostProcessor(options.debugRuntime));
 
-                Class<?> startupClass = resolveStartupClass(options, classLoader, projectClassNames);
                 if (startupClass != null) {
                     context.register(startupClass);
                     if (options.debugRuntime) {
@@ -2187,6 +2194,7 @@ public class RuntimeSandboxSimulator {
                 if (options.debugRuntime) {
                     System.out.println("[RUNTIME_DEBUG] SPRING_CTX_READY beanDefs=" + context.getBeanDefinitionCount());
                     System.out.println("[RUNTIME_DEBUG] SPRING_CTX_STUB_SUMMARY " + dependencyGuard.summary());
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_MODE mode=ANNOTATION_FALLBACK");
                 }
                 return new SpringContextRuntime(
                         context,
@@ -2209,6 +2217,81 @@ public class RuntimeSandboxSimulator {
                 }
                 return null;
             }
+        }
+
+        private static SpringContextRuntime tryStartNativeSpringBoot(CliOptions options,
+                                                                     ClassLoader classLoader,
+                                                                     Class<?> startupClass) {
+            if (startupClass == null) {
+                return null;
+            }
+            Object contextObj = null;
+            try {
+                Class<?> springApplicationClass = Class.forName(
+                        "org.springframework.boot.SpringApplication",
+                        false,
+                        classLoader
+                );
+                Method runMethod = springApplicationClass.getMethod("run", Class.class, String[].class);
+                String[] args = buildNativeSpringBootArgs();
+                ClassLoader previousTccl = Thread.currentThread().getContextClassLoader();
+                try {
+                    Thread.currentThread().setContextClassLoader(classLoader);
+                    contextObj = runMethod.invoke(null, startupClass, (Object) args);
+                } finally {
+                    Thread.currentThread().setContextClassLoader(previousTccl);
+                }
+                if (!(contextObj instanceof ConfigurableApplicationContext)) {
+                    if (options.debugRuntime) {
+                        System.out.println("[RUNTIME_DEBUG] SPRING_CTX_NATIVE_SKIP class=" + startupClass.getName()
+                                + " reason=not-configurable-context result="
+                                + (contextObj == null ? "null" : contextObj.getClass().getName()));
+                    }
+                    return null;
+                }
+                ConfigurableApplicationContext nativeContext = (ConfigurableApplicationContext) contextObj;
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_READY beanDefs=" + nativeContext.getBeanDefinitionCount());
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_MODE mode=NATIVE_BOOT class=" + startupClass.getName());
+                }
+                return new SpringContextRuntime(nativeContext, options.debugRuntime, startupClass.getName(), null);
+            } catch (ClassNotFoundException noBootClass) {
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_NATIVE_SKIP class=" + startupClass.getName()
+                            + " reason=spring-boot-not-found");
+                }
+                return null;
+            } catch (Throwable error) {
+                Throwable root = error;
+                if (error instanceof java.lang.reflect.InvocationTargetException
+                        && ((java.lang.reflect.InvocationTargetException) error).getTargetException() != null) {
+                    root = ((java.lang.reflect.InvocationTargetException) error).getTargetException();
+                }
+                if (options.debugRuntime) {
+                    System.out.println("[RUNTIME_DEBUG] SPRING_CTX_NATIVE_FAIL class=" + startupClass.getName()
+                            + " error=" + root.getClass().getName() + ": " + root.getMessage());
+                    printErrorChain(root);
+                }
+                if (contextObj instanceof ConfigurableApplicationContext) {
+                    try {
+                        ((ConfigurableApplicationContext) contextObj).close();
+                    } catch (Throwable ignored) {
+                        // ignore
+                    }
+                }
+                return null;
+            }
+        }
+
+        private static String[] buildNativeSpringBootArgs() {
+            return new String[]{
+                    "--spring.main.web-application-type=none",
+                    "--spring.main.lazy-initialization=true",
+                    "--spring.main.banner-mode=off",
+                    "--spring.jmx.enabled=false",
+                    "--spring.main.allow-bean-definition-overriding=true",
+                    "--spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.validation.ValidationAutoConfiguration"
+            };
         }
 
         private static BeanFactoryPostProcessor lazyInitBeanFactoryPostProcessor(final boolean debugRuntime) {
@@ -4357,6 +4440,7 @@ public class RuntimeSandboxSimulator {
                 }
 
                 boolean projectClass = isProjectClass(name);
+                boolean childFirst = shouldUseChildFirst(name, projectClass);
                 if (projectClass) {
                     try {
                         Class<?> loaded = findClass(name);
@@ -4378,6 +4462,22 @@ public class RuntimeSandboxSimulator {
                         failedProjectClasses.add(name);
                         if (debugRuntime) {
                             System.out.println("[RUNTIME_DEBUG] PROJECT_CLASS_LOAD_SKIP class=" + name
+                                    + " error=" + linkageError.getClass().getName() + ": " + linkageError.getMessage());
+                        }
+                    }
+                }
+                if (childFirst && !projectClass) {
+                    try {
+                        Class<?> loaded = findClass(name);
+                        if (resolve) {
+                            resolveClass(loaded);
+                        }
+                        return loaded;
+                    } catch (ClassNotFoundException ignored) {
+                        // fallback to parent-first resolution
+                    } catch (LinkageError linkageError) {
+                        if (debugRuntime) {
+                            System.out.println("[RUNTIME_DEBUG] CHILD_FIRST_LOAD_SKIP class=" + name
                                     + " error=" + linkageError.getClass().getName() + ": " + linkageError.getMessage());
                         }
                     }
@@ -4432,6 +4532,32 @@ public class RuntimeSandboxSimulator {
                 }
             }
             return false;
+        }
+
+        private boolean shouldUseChildFirst(String className, boolean projectClass) {
+            if (className == null || className.isEmpty()) {
+                return false;
+            }
+            if (projectClass) {
+                return true;
+            }
+            if (isParentFirstRuntimeClass(className)) {
+                return false;
+            }
+            if (className.startsWith("java.")
+                    || className.startsWith("javax.crypto.")
+                    || className.startsWith("sun.")
+                    || className.startsWith("jdk.")
+                    || className.startsWith("com.sun.")) {
+                return false;
+            }
+            return className.startsWith("org.springframework.")
+                    || className.startsWith("org.hibernate.")
+                    || className.startsWith("javax.validation.")
+                    || className.startsWith("jakarta.validation.")
+                    || className.startsWith("org.apache.tomcat.")
+                    || className.startsWith("ch.qos.logback.")
+                    || className.startsWith("org.slf4j.");
         }
 
         private boolean isParentFirstRuntimeClass(String className) {
@@ -4496,6 +4622,10 @@ public class RuntimeSandboxSimulator {
                 new LinkedHashMap<String, Map<String, XmlPropertyAssignment>>();
         private final Map<Class<?>, Map<String, XmlPropertyAssignment>> xmlPropertiesByClass =
                 new LinkedHashMap<Class<?>, Map<String, XmlPropertyAssignment>>();
+        private final Map<String, Map<String, XmlMapEntryAssignment>> xmlUtilMapsByBeanName =
+                new LinkedHashMap<String, Map<String, XmlMapEntryAssignment>>();
+        private final Map<String, Map<Object, Object>> xmlUtilMapSingletonByName =
+                new LinkedHashMap<String, Map<Object, Object>>();
         private final Map<String, String> projectProperties = new LinkedHashMap<String, String>();
         private final Set<Class<?>> primaryBeanClasses = new LinkedHashSet<Class<?>>();
         private final Map<String, String> xmlAliasToName = new LinkedHashMap<String, String>();
@@ -4848,6 +4978,13 @@ public class RuntimeSandboxSimulator {
                 preferredName = fieldName;
             }
             if (hint != null && !isBlank(hint.preferredBeanName)) {
+                Object namedMap = resolveXmlUtilMapByName(hint.preferredBeanName, dependencyType);
+                if (namedMap != null) {
+                    debugBean("BEAN_RESOLVE_HIT strategy=xml-util-map bean=%s type=%s",
+                            hint.preferredBeanName,
+                            dependencyType == null ? "null" : dependencyType.getName());
+                    return namedMap;
+                }
                 Class<?> namedClass = resolveBeanClassByName(hint.preferredBeanName, dependencyType);
                 if (namedClass != null) {
                     debugBean("BEAN_RESOLVE_HIT strategy=by-resource-name bean=%s type=%s",
@@ -4856,11 +4993,32 @@ public class RuntimeSandboxSimulator {
                 }
             }
             if (hint != null && !isBlank(hint.qualifier)) {
+                Object qualifierMap = resolveXmlUtilMapByName(hint.qualifier, dependencyType);
+                if (qualifierMap != null) {
+                    debugBean("BEAN_RESOLVE_HIT strategy=xml-util-map-qualifier bean=%s type=%s",
+                            hint.qualifier,
+                            dependencyType == null ? "null" : dependencyType.getName());
+                    return qualifierMap;
+                }
                 Class<?> qualifierClass = resolveBeanClassByName(hint.qualifier, dependencyType);
                 if (qualifierClass != null) {
                     debugBean("BEAN_RESOLVE_HIT strategy=by-qualifier bean=%s type=%s",
                             hint.qualifier, qualifierClass.getName());
                     return getOrCreateConcreteBean(qualifierClass, dependencyType, "QUALIFIER");
+                }
+            }
+            if (dependencyType != null && Map.class.isAssignableFrom(dependencyType)) {
+                Object preferredMap = resolveXmlUtilMapByName(preferredName, dependencyType);
+                if (preferredMap != null) {
+                    debugBean("BEAN_RESOLVE_HIT strategy=xml-util-map-preferred bean=%s type=%s",
+                            preferredName, dependencyType.getName());
+                    return preferredMap;
+                }
+                Object fieldMap = resolveXmlUtilMapByName(fieldName, dependencyType);
+                if (fieldMap != null) {
+                    debugBean("BEAN_RESOLVE_HIT strategy=xml-util-map-field bean=%s type=%s",
+                            fieldName, dependencyType.getName());
+                    return fieldMap;
                 }
             }
             if (dependencyType.isInterface()) {
@@ -5414,6 +5572,8 @@ public class RuntimeSandboxSimulator {
                 factory.setExpandEntityReferences(false);
                 Document document = factory.newDocumentBuilder().parse(xmlFile.toFile());
 
+                parseXmlUtilMapDefinitions(document, xmlFile);
+
                 NodeList beanNodes = document.getElementsByTagName("bean");
                 for (int i = 0; i < beanNodes.getLength(); i++) {
                     Element beanElement = (Element) beanNodes.item(i);
@@ -5470,6 +5630,128 @@ public class RuntimeSandboxSimulator {
                             + " error=" + error.getClass().getName() + ": " + error.getMessage());
                 }
             }
+        }
+
+        private void parseXmlUtilMapDefinitions(Document document, Path xmlFile) {
+            if (document == null) {
+                return;
+            }
+            NodeList all = document.getElementsByTagName("*");
+            if (all == null || all.getLength() == 0) {
+                return;
+            }
+            for (int i = 0; i < all.getLength(); i++) {
+                Node node = all.item(i);
+                if (!(node instanceof Element)) {
+                    continue;
+                }
+                Element element = (Element) node;
+                if (!isUtilMapElement(element)) {
+                    continue;
+                }
+                List<String> mapNames = collectUtilMapNames(element);
+                if (mapNames.isEmpty()) {
+                    continue;
+                }
+                Map<String, XmlMapEntryAssignment> entries = parseUtilMapEntries(element, xmlFile);
+                if (entries.isEmpty()) {
+                    continue;
+                }
+                for (String rawName : mapNames) {
+                    String mapName = normalizeBeanName(rawName);
+                    if (isBlank(mapName)) {
+                        continue;
+                    }
+                    Map<String, XmlMapEntryAssignment> target =
+                            xmlUtilMapsByBeanName.computeIfAbsent(mapName, k -> new LinkedHashMap<String, XmlMapEntryAssignment>());
+                    target.putAll(entries);
+                    xmlUtilMapSingletonByName.remove(mapName);
+                    debugBean("BEAN_XML_UTIL_MAP_REGISTER name=%s entries=%d source=%s",
+                            mapName,
+                            target.size(),
+                            xmlFile.toAbsolutePath());
+                }
+            }
+        }
+
+        private boolean isUtilMapElement(Element element) {
+            if (element == null) {
+                return false;
+            }
+            String tagName = element.getTagName();
+            if ("util:map".equals(tagName)) {
+                return true;
+            }
+            String local = element.getLocalName();
+            String prefix = element.getPrefix();
+            return "map".equals(local) && "util".equals(prefix);
+        }
+
+        private List<String> collectUtilMapNames(Element mapElement) {
+            List<String> names = new ArrayList<String>();
+            if (mapElement == null) {
+                return names;
+            }
+            String id = normalizeBeanName(mapElement.getAttribute("id"));
+            if (!isBlank(id)) {
+                names.add(id);
+            }
+            String nameAttr = mapElement.getAttribute("name");
+            if (!isBlank(nameAttr)) {
+                String[] tokens = nameAttr.split("[,;\\s]+");
+                for (String token : tokens) {
+                    String normalized = normalizeBeanName(token);
+                    if (!isBlank(normalized)) {
+                        names.add(normalized);
+                    }
+                }
+            }
+            return names;
+        }
+
+        private Map<String, XmlMapEntryAssignment> parseUtilMapEntries(Element mapElement, Path xmlFile) {
+            Map<String, XmlMapEntryAssignment> entries = new LinkedHashMap<String, XmlMapEntryAssignment>();
+            if (mapElement == null) {
+                return entries;
+            }
+            NodeList children = mapElement.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                Node node = children.item(i);
+                if (!(node instanceof Element)) {
+                    continue;
+                }
+                Element entryElement = (Element) node;
+                String tagName = entryElement.getTagName();
+                if (!"entry".equals(tagName) && !tagName.endsWith(":entry")) {
+                    continue;
+                }
+                String key = normalizeBeanName(entryElement.getAttribute("key"));
+                if (isBlank(key)) {
+                    key = normalizeBeanName(entryElement.getAttribute("key-ref"));
+                }
+                if (isBlank(key)) {
+                    continue;
+                }
+                String valueRef = normalizeBeanName(entryElement.getAttribute("value-ref"));
+                if (isBlank(valueRef)) {
+                    valueRef = normalizeBeanName(entryElement.getAttribute("ref"));
+                }
+                String valueLiteral = entryElement.getAttribute("value");
+                if (isBlank(valueLiteral)) {
+                    Element valueElement = firstDirectChildByTag(entryElement, "value");
+                    if (valueElement != null) {
+                        valueLiteral = valueElement.getTextContent();
+                    }
+                }
+                XmlMapEntryAssignment assignment = new XmlMapEntryAssignment(
+                        key,
+                        valueLiteral,
+                        valueRef,
+                        xmlFile == null ? "" : xmlFile.toAbsolutePath().toString()
+                );
+                entries.put(key, assignment);
+            }
+            return entries;
         }
 
         private Map<String, XmlPropertyAssignment> parseXmlPropertyAssignments(Element beanElement, Path xmlFile) {
@@ -5617,6 +5899,84 @@ public class RuntimeSandboxSimulator {
                             xmlFile.toAbsolutePath());
                 }
             }
+        }
+
+        private Object resolveXmlUtilMapByName(String beanName, Class<?> requiredType) {
+            if (isBlank(beanName)) {
+                return null;
+            }
+            if (requiredType != null && !Map.class.isAssignableFrom(requiredType) && requiredType != Object.class) {
+                return null;
+            }
+            String normalized = resolveAlias(normalizeBeanName(beanName));
+            if (isBlank(normalized)) {
+                return null;
+            }
+            Map<Object, Object> cached = xmlUtilMapSingletonByName.get(normalized);
+            if (cached != null) {
+                return cached;
+            }
+            Map<String, XmlMapEntryAssignment> definition = xmlUtilMapsByBeanName.get(normalized);
+            if (definition == null || definition.isEmpty()) {
+                return null;
+            }
+            Map<Object, Object> materialized = materializeXmlUtilMap(normalized, definition, new LinkedHashSet<String>());
+            if (materialized == null) {
+                return null;
+            }
+            xmlUtilMapSingletonByName.put(normalized, materialized);
+            debugBean("BEAN_XML_UTIL_MAP_MATERIALIZED name=%s size=%d", normalized, materialized.size());
+            return materialized;
+        }
+
+        private Map<Object, Object> materializeXmlUtilMap(String mapName,
+                                                          Map<String, XmlMapEntryAssignment> definition,
+                                                          Set<String> visiting) {
+            if (definition == null || definition.isEmpty()) {
+                return Collections.emptyMap();
+            }
+            if (visiting != null && mapName != null && !visiting.add(mapName)) {
+                debugBean("BEAN_XML_UTIL_MAP_CYCLE name=%s", mapName);
+                return Collections.emptyMap();
+            }
+            Map<Object, Object> materialized = new LinkedHashMap<Object, Object>();
+            for (XmlMapEntryAssignment entry : definition.values()) {
+                if (entry == null || isBlank(entry.keyLiteral)) {
+                    continue;
+                }
+                Object value = null;
+                if (!isBlank(entry.valueRefBeanName)) {
+                    value = resolveXmlRef(entry.valueRefBeanName, visiting);
+                } else {
+                    value = resolvePropertyPlaceholders(entry.valueLiteral);
+                }
+                materialized.put(entry.keyLiteral, value);
+            }
+            if (visiting != null && mapName != null) {
+                visiting.remove(mapName);
+            }
+            return materialized;
+        }
+
+        private Object resolveXmlRef(String refBeanName, Set<String> visiting) {
+            if (isBlank(refBeanName)) {
+                return null;
+            }
+            String normalized = resolveAlias(normalizeBeanName(refBeanName));
+            if (isBlank(normalized)) {
+                return null;
+            }
+            Map<String, XmlMapEntryAssignment> utilMap = xmlUtilMapsByBeanName.get(normalized);
+            if (utilMap != null && !utilMap.isEmpty()) {
+                Map<Object, Object> nested = materializeXmlUtilMap(normalized, utilMap, visiting);
+                xmlUtilMapSingletonByName.put(normalized, nested);
+                return nested;
+            }
+            Class<?> refClass = resolveBeanClassByName(normalized, Object.class);
+            if (refClass != null) {
+                return getOrCreateConcreteBean(refClass, refClass, "XML_UTIL_MAP_REF");
+            }
+            return null;
         }
 
         private Class<?> resolveBeanClassByName(String beanName, Class<?> requiredType) {
@@ -6303,6 +6663,23 @@ public class RuntimeSandboxSimulator {
 
             private static XmlPropertyAssignment byRef(String propertyName, String refBeanName, String source) {
                 return new XmlPropertyAssignment(propertyName, "", refBeanName, source);
+            }
+        }
+
+        private static class XmlMapEntryAssignment {
+            public final String keyLiteral;
+            public final String valueLiteral;
+            public final String valueRefBeanName;
+            public final String source;
+
+            private XmlMapEntryAssignment(String keyLiteral,
+                                          String valueLiteral,
+                                          String valueRefBeanName,
+                                          String source) {
+                this.keyLiteral = keyLiteral == null ? "" : keyLiteral.trim();
+                this.valueLiteral = valueLiteral;
+                this.valueRefBeanName = normalizeBeanName(valueRefBeanName);
+                this.source = source == null ? "" : source;
             }
         }
 

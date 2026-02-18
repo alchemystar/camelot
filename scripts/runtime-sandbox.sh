@@ -82,6 +82,7 @@ else
 fi
 
 if [ -n "$PROJECT_EXTRA_CP" ]; then
+  JAVA_CP="${JAVA_CP}:${PROJECT_EXTRA_CP}"
   SIM_ARGS+=(--classpath "$PROJECT_EXTRA_CP")
 fi
 
