@@ -14,7 +14,11 @@ import org.springframework.core.type.MethodMetadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -80,6 +84,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
         BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
         List<String> beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
+        Map<String, String> inferredExpectedTypeByBeanName =
+                inferExpectedTypesFromBeanDefinitions(beanFactory, beanNames);
         Set<String> mockedBeanNames = new LinkedHashSet<String>();
 
         // Pass 1: explicit whitelist pre-filter. Any hit is mocked immediately.
@@ -97,7 +103,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 mockedBeanNames.add(beanName);
                 continue;
             }
-            if (tryMockByForcePrefix(registry, beanName, definition)) {
+            if (tryMockByForcePrefix(registry, beanName, definition, inferredExpectedTypeByBeanName)) {
                 mockedBeanNames.add(beanName);
             }
         }
@@ -110,6 +116,9 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
             boolean forcedByBeanName = beanName != null && forceMockBeanNames.contains(beanName);
             String forcedTargetType = forceMockBeanTargetTypes.get(beanName);
+            if (forcedTargetType == null && forcedByBeanName) {
+                forcedTargetType = inferredExpectedTypeByBeanName.get(beanName);
+            }
             MockTarget target = resolveTarget(beanName, definition);
             if (forcedTargetType != null) {
                 target = new MockTarget(forcedTargetType, false);
@@ -132,7 +141,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
     private boolean tryMockByForcePrefix(BeanDefinitionRegistry registry,
                                          String beanName,
-                                         BeanDefinition definition) {
+                                         BeanDefinition definition,
+                                         Map<String, String> inferredExpectedTypeByBeanName) {
         if (forceMockTypePrefixes.isEmpty()) {
             return false;
         }
@@ -151,8 +161,18 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         );
 
         MockTarget target = resolveTarget(beanName, definition);
+        String inferredExpectedType = inferredExpectedTypeByBeanName == null
+                ? null
+                : inferredExpectedTypeByBeanName.get(beanName);
         String thriftServiceInterface = resolveThriftServiceInterfaceType(definition, evaluation);
-        if (thriftServiceInterface != null) {
+        if (inferredExpectedType != null) {
+            target = new MockTarget(inferredExpectedType, false);
+            emitDiagnostic("Force-prefix inferred expected-type selected bean '" + beanName
+                    + "' -> '" + inferredExpectedType + "'");
+            LOG.info("Force-prefix inferred expected-type selected bean '{}' -> '{}'",
+                    beanName,
+                    inferredExpectedType);
+        } else if (thriftServiceInterface != null) {
             target = new MockTarget(thriftServiceInterface, false);
             emitDiagnostic("Force-prefix thrift serviceInterface selected bean '" + beanName
                     + "' -> '" + thriftServiceInterface + "'");
@@ -221,6 +241,298 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
     Map<String, String> snapshotMockedBeanTypes() {
         return Collections.unmodifiableMap(new LinkedHashMap<String, String>(mockedBeanTypes));
+    }
+
+    private Map<String, String> inferExpectedTypesFromBeanDefinitions(ConfigurableListableBeanFactory beanFactory,
+                                                                      List<String> beanNames) {
+        if (beanNames == null || beanNames.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        LinkedHashMap<String, String> inferred = new LinkedHashMap<String, String>();
+        LinkedHashSet<String> inspectedClasses = new LinkedHashSet<String>();
+        for (String consumerBeanName : beanNames) {
+            BeanDefinition definition = beanFactory.getBeanDefinition(consumerBeanName);
+            Class<?> consumerType = resolveInspectableBeanType(consumerBeanName, definition);
+            if (consumerType == null) {
+                continue;
+            }
+            if (!inspectedClasses.add(consumerType.getName())) {
+                continue;
+            }
+            collectExpectedTypesFromClass(beanFactory, consumerType, inferred);
+        }
+        if (!inferred.isEmpty()) {
+            emitDiagnostic("Inferred expected type mappings from bean definitions: " + inferred.size() + " -> " + inferred);
+            LOG.info("Inferred expected type mappings from bean definitions: {}", inferred);
+        }
+        return inferred;
+    }
+
+    private Class<?> resolveInspectableBeanType(String beanName, BeanDefinition definition) {
+        LinkedHashSet<String> candidates = new LinkedHashSet<String>();
+        addCandidate(candidates, clean(definition.getBeanClassName()));
+        for (String candidate : collectCandidateTypeNames(beanName, definition)) {
+            addCandidate(candidates, candidate);
+        }
+        for (String candidate : candidates) {
+            String clean = clean(candidate);
+            if (clean == null || looksLikeProxyTypeName(clean)) {
+                continue;
+            }
+            if (isFrameworkType(clean) && !isBusinessPackage(clean)) {
+                continue;
+            }
+            try {
+                Class<?> type = Class.forName(clean, false, Thread.currentThread().getContextClassLoader());
+                if (type.isInterface() || type.isAnnotation() || type.isEnum() || type.isPrimitive()) {
+                    continue;
+                }
+                return type;
+            } catch (Throwable ignored) {
+                // continue next candidate
+            }
+        }
+        return null;
+    }
+
+    private void collectExpectedTypesFromClass(ConfigurableListableBeanFactory beanFactory,
+                                               Class<?> consumerType,
+                                               Map<String, String> inferred) {
+        Class<?> cursor = consumerType;
+        while (cursor != null && cursor != Object.class) {
+            for (Field field : cursor.getDeclaredFields()) {
+                String targetBeanName = resolveInjectionBeanName(field.getAnnotations());
+                if (targetBeanName == null) {
+                    continue;
+                }
+                registerInferredExpectedType(beanFactory,
+                        inferred,
+                        targetBeanName,
+                        field.getType().getName(),
+                        consumerType.getName() + "#" + field.getName());
+            }
+            cursor = cursor.getSuperclass();
+        }
+
+        Constructor<?>[] constructors = consumerType.getDeclaredConstructors();
+        List<Constructor<?>> targetConstructors = selectInjectableConstructors(constructors);
+        for (Constructor<?> constructor : targetConstructors) {
+            Parameter[] parameters = constructor.getParameters();
+            Annotation[][] parameterAnnotations = constructor.getParameterAnnotations();
+            for (int index = 0; index < parameters.length; index++) {
+                Parameter parameter = parameters[index];
+                String targetBeanName = resolveInjectionBeanName(parameterAnnotations[index]);
+                if (targetBeanName == null && parameter.isNamePresent()) {
+                    targetBeanName = clean(parameter.getName());
+                }
+                if (targetBeanName == null) {
+                    continue;
+                }
+                registerInferredExpectedType(beanFactory,
+                        inferred,
+                        targetBeanName,
+                        parameter.getType().getName(),
+                        consumerType.getName() + "#<init>(" + index + ")");
+            }
+        }
+
+        for (Method method : consumerType.getDeclaredMethods()) {
+            boolean methodAutowired = hasAutowiredLikeAnnotation(method.getAnnotations());
+            String methodResourceBeanName = resolveMethodLevelResourceBeanName(method.getAnnotations());
+            Annotation[][] parameterAnnotations = method.getParameterAnnotations();
+            Parameter[] parameters = method.getParameters();
+            for (int index = 0; index < parameters.length; index++) {
+                String targetBeanName = resolveInjectionBeanName(parameterAnnotations[index]);
+                if (targetBeanName == null && methodResourceBeanName != null && parameters.length == 1) {
+                    targetBeanName = methodResourceBeanName;
+                }
+                if (targetBeanName == null && methodAutowired && parameters[index].isNamePresent()) {
+                    targetBeanName = clean(parameters[index].getName());
+                }
+                if (targetBeanName == null) {
+                    continue;
+                }
+                registerInferredExpectedType(beanFactory,
+                        inferred,
+                        targetBeanName,
+                        parameters[index].getType().getName(),
+                        consumerType.getName() + "#" + method.getName() + "(" + index + ")");
+            }
+        }
+    }
+
+    private List<Constructor<?>> selectInjectableConstructors(Constructor<?>[] constructors) {
+        if (constructors == null || constructors.length == 0) {
+            return Collections.emptyList();
+        }
+        List<Constructor<?>> annotated = new ArrayList<Constructor<?>>();
+        for (Constructor<?> constructor : constructors) {
+            if (hasAutowiredLikeAnnotation(constructor.getAnnotations())) {
+                annotated.add(constructor);
+            }
+        }
+        if (!annotated.isEmpty()) {
+            return annotated;
+        }
+        if (constructors.length == 1) {
+            return Collections.singletonList(constructors[0]);
+        }
+        return Collections.emptyList();
+    }
+
+    private boolean hasAutowiredLikeAnnotation(Annotation[] annotations) {
+        if (annotations == null) {
+            return false;
+        }
+        for (Annotation annotation : annotations) {
+            if (annotation == null) {
+                continue;
+            }
+            String annotationName = annotation.annotationType().getName();
+            if ("org.springframework.beans.factory.annotation.Autowired".equals(annotationName)
+                    || "javax.annotation.Resource".equals(annotationName)
+                    || "jakarta.annotation.Resource".equals(annotationName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String resolveInjectionBeanName(Annotation[] annotations) {
+        if (annotations == null || annotations.length == 0) {
+            return null;
+        }
+        for (Annotation annotation : annotations) {
+            if (annotation == null) {
+                continue;
+            }
+            String annotationName = annotation.annotationType().getName();
+            if ("org.springframework.beans.factory.annotation.Qualifier".equals(annotationName)
+                    || "javax.inject.Named".equals(annotationName)
+                    || "jakarta.inject.Named".equals(annotationName)) {
+                String value = invokeAnnotationStringAttribute(annotation, "value");
+                if (value != null) {
+                    return value;
+                }
+            }
+            if ("javax.annotation.Resource".equals(annotationName)
+                    || "jakarta.annotation.Resource".equals(annotationName)) {
+                String name = invokeAnnotationStringAttribute(annotation, "name");
+                if (name != null) {
+                    return name;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String resolveMethodLevelResourceBeanName(Annotation[] annotations) {
+        if (annotations == null || annotations.length == 0) {
+            return null;
+        }
+        for (Annotation annotation : annotations) {
+            if (annotation == null) {
+                continue;
+            }
+            String annotationName = annotation.annotationType().getName();
+            if (!"javax.annotation.Resource".equals(annotationName)
+                    && !"jakarta.annotation.Resource".equals(annotationName)) {
+                continue;
+            }
+            String name = invokeAnnotationStringAttribute(annotation, "name");
+            if (name != null) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    private String invokeAnnotationStringAttribute(Annotation annotation, String attributeName) {
+        if (annotation == null || attributeName == null) {
+            return null;
+        }
+        try {
+            Method method = annotation.annotationType().getMethod(attributeName);
+            Object value = method.invoke(annotation);
+            if (value == null) {
+                return null;
+            }
+            String text = String.valueOf(value).trim();
+            return text.isEmpty() ? null : text;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private void registerInferredExpectedType(ConfigurableListableBeanFactory beanFactory,
+                                              Map<String, String> inferred,
+                                              String beanName,
+                                              String expectedType,
+                                              String source) {
+        String cleanBeanName = clean(beanName);
+        String cleanExpectedType = clean(expectedType);
+        if (cleanBeanName == null || cleanExpectedType == null) {
+            return;
+        }
+        if (!beanFactory.containsBean(cleanBeanName) && !beanFactory.containsBeanDefinition(cleanBeanName)) {
+            return;
+        }
+        String existing = inferred.get(cleanBeanName);
+        if (existing == null) {
+            inferred.put(cleanBeanName, cleanExpectedType);
+            return;
+        }
+        if (existing.equals(cleanExpectedType)) {
+            return;
+        }
+        String preferred = preferExpectedType(existing, cleanExpectedType);
+        if (!preferred.equals(existing)) {
+            inferred.put(cleanBeanName, preferred);
+            LOG.info("Update inferred expected type bean='{}' {} -> {} source={}",
+                    cleanBeanName,
+                    existing,
+                    preferred,
+                    source);
+        }
+    }
+
+    private String preferExpectedType(String current, String candidate) {
+        if (candidate == null) {
+            return current;
+        }
+        if (current == null) {
+            return candidate;
+        }
+        if (current.equals(candidate)) {
+            return current;
+        }
+        int currentScore = expectedTypeScore(current);
+        int candidateScore = expectedTypeScore(candidate);
+        if (candidateScore > currentScore) {
+            return candidate;
+        }
+        return current;
+    }
+
+    private int expectedTypeScore(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return 0;
+        }
+        int score = 0;
+        if (!looksLikeProxyTypeName(clean)) {
+            score += 2;
+        }
+        if (isBusinessPackage(clean)) {
+            score += 2;
+        }
+        if (isInterfaceTypeStrict(clean) || clean.endsWith("$Iface")) {
+            score += 3;
+        }
+        if (!isFrameworkType(clean)) {
+            score += 1;
+        }
+        return score;
     }
 
     private String findMockReason(String beanName, MockTarget target) {
