@@ -74,7 +74,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                                Map<String, String> forceMockBeanTargetTypes,
                                List<String> mapperLocations) {
         this.packagePrefixes = normalizePackages(packagePrefixes);
-        this.daoMapperSuffixes = new LinkedHashSet<String>(Arrays.asList("Dao", "Mapper"));
+        this.daoMapperSuffixes = new LinkedHashSet<String>(Arrays.asList("DAO", "Mapper"));
         this.forceMockSuffixes = new LinkedHashSet<String>(Arrays.asList("DataSource"));
         this.forceMockTypeNames = new LinkedHashSet<String>(Arrays.asList(
                 "javax.sql.DataSource",
@@ -1121,11 +1121,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (target.mybatisMapperFactory) {
             return "mybatis-mapper-factory";
         }
-        if (hasAnySuffix(target.typeName, daoMapperSuffixes)) {
-            return "dao-mapper-type-suffix";
-        }
-        if (hasAnySuffix(beanName, daoMapperSuffixes)) {
-            return "dao-mapper-beanname-suffix";
+        if (hasAnySuffixIgnoreCase(target.typeName, daoMapperSuffixes)) {
+            return "dao-mapper-class-suffix";
         }
         return null;
     }
@@ -1394,6 +1391,27 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
         for (String suffix : suffixes) {
             if (clean.endsWith(suffix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasAnySuffixIgnoreCase(String value, Set<String> suffixes) {
+        String clean = value == null ? "" : value.trim();
+        if (clean.isEmpty()) {
+            return false;
+        }
+        String lowerValue = clean.toLowerCase();
+        for (String suffix : suffixes) {
+            if (suffix == null) {
+                continue;
+            }
+            String trimmed = suffix.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (lowerValue.endsWith(trimmed.toLowerCase())) {
                 return true;
             }
         }
