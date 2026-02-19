@@ -60,6 +60,11 @@ public final class SpringBootNativeLauncher {
             Pattern.compile("expected to be of type \"([^\"]+)\""),
             Pattern.compile("Required type: ([A-Za-z0-9_.$]+)")
     );
+    private static final List<Pattern> ACTUAL_TYPE_PATTERNS = Arrays.asList(
+            Pattern.compile("but was actually of type '([^']+)'"),
+            Pattern.compile("but was actually of type \"([^\"]+)\""),
+            Pattern.compile("actual type ([A-Za-z0-9_.$]+)")
+    );
     private static final List<String> BUILTIN_FORCE_MOCK_CLASS_PREFIXES = Arrays.asList(
             ".*ThriftClientProxy.*",
             ".*pay.mra.*",
@@ -123,6 +128,8 @@ public final class SpringBootNativeLauncher {
                     }
                     String failedBeanName = extractFailedBeanName(runError);
                     String expectedTypeName = extractExpectedTypeName(runError);
+                    String actualTypeName = extractActualTypeName(runError);
+                    String beanFailureReason = buildBeanFailureReason(runError, failedBeanName, expectedTypeName, actualTypeName);
                     if (!isBlank(failedBeanName) && !isBlank(expectedTypeName)) {
                         String normalizedBeanName = failedBeanName.trim();
                         String normalizedExpectedType = expectedTypeName.trim();
@@ -134,9 +141,10 @@ public final class SpringBootNativeLauncher {
                         }
                         if (expectedTypeChanged || beanAdded) {
                             LOG.warn(
-                                    "Spring startup type mismatch on bean '{}', force-mock expected type '{}' and retry.",
+                                    "Spring startup type mismatch on bean '{}', force-mock expected type '{}' and retry. reason={}",
                                     normalizedBeanName,
-                                    normalizedExpectedType
+                                    normalizedExpectedType,
+                                    beanFailureReason
                             );
                             continue;
                         }
@@ -144,7 +152,11 @@ public final class SpringBootNativeLauncher {
                     if (!isBlank(failedBeanName)) {
                         String normalizedBeanName = failedBeanName.trim();
                         if (forceMockBeanNames.add(normalizedBeanName)) {
-                            LOG.warn("Spring startup failed on bean '{}', force-mock and retry.", normalizedBeanName);
+                            LOG.warn(
+                                    "Spring startup failed on bean '{}', force-mock and retry. reason={}",
+                                    normalizedBeanName,
+                                    beanFailureReason
+                            );
                             continue;
                         }
                     }
@@ -266,6 +278,27 @@ public final class SpringBootNativeLauncher {
             String message = cursor.getMessage();
             if (!isBlank(message)) {
                 for (Pattern pattern : EXPECTED_TYPE_PATTERNS) {
+                    Matcher matcher = pattern.matcher(message);
+                    if (matcher.find()) {
+                        String candidate = normalizeTypeName(matcher.group(1));
+                        if (!isBlank(candidate)) {
+                            lastTypeName = candidate;
+                        }
+                    }
+                }
+            }
+            cursor = cursor.getCause();
+        }
+        return lastTypeName;
+    }
+
+    private static String extractActualTypeName(Throwable error) {
+        Throwable cursor = error;
+        String lastTypeName = null;
+        while (cursor != null) {
+            String message = cursor.getMessage();
+            if (!isBlank(message)) {
+                for (Pattern pattern : ACTUAL_TYPE_PATTERNS) {
                     Matcher matcher = pattern.matcher(message);
                     if (matcher.find()) {
                         String candidate = normalizeTypeName(matcher.group(1));
@@ -413,6 +446,50 @@ public final class SpringBootNativeLauncher {
             builder.append(stringWriter.toString());
         }
         return builder.toString();
+    }
+
+    private static String buildBeanFailureReason(Throwable error,
+                                                 String failedBeanName,
+                                                 String expectedTypeName,
+                                                 String actualTypeName) {
+        StringBuilder reason = new StringBuilder();
+        if (!isBlank(failedBeanName)) {
+            reason.append("bean=").append(failedBeanName.trim());
+        }
+        String failedTypeName = extractFailedTypeName(error);
+        if (!isBlank(failedTypeName)) {
+            if (reason.length() > 0) {
+                reason.append(", ");
+            }
+            reason.append("failedType=").append(failedTypeName.trim());
+        }
+        if (!isBlank(expectedTypeName)) {
+            if (reason.length() > 0) {
+                reason.append(", ");
+            }
+            reason.append("expectedType=").append(expectedTypeName.trim());
+        }
+        if (!isBlank(actualTypeName)) {
+            if (reason.length() > 0) {
+                reason.append(", ");
+            }
+            reason.append("actualType=").append(actualTypeName.trim());
+        }
+        Throwable root = findRootCause(error);
+        if (root != null) {
+            if (reason.length() > 0) {
+                reason.append(", ");
+            }
+            reason.append("rootCause=").append(root.getClass().getName());
+            String rootMessage = root.getMessage();
+            if (!isBlank(rootMessage)) {
+                reason.append(": ").append(rootMessage.trim());
+            }
+        }
+        if (reason.length() == 0) {
+            return "unknown";
+        }
+        return reason.toString();
     }
 
     private static Throwable findRootCause(Throwable error) {
