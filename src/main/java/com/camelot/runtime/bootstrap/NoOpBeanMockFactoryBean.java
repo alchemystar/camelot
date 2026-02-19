@@ -48,7 +48,8 @@ public final class NoOpBeanMockFactoryBean implements FactoryBean<Object>, BeanC
         if (targetTypeName == null || targetTypeName.trim().isEmpty()) {
             throw new IllegalStateException("targetTypeName is required for NoOpBeanMockFactoryBean");
         }
-        this.targetType = ClassUtils.forName(targetTypeName, beanClassLoader);
+        Class<?> resolvedType = ClassUtils.forName(targetTypeName, beanClassLoader);
+        this.targetType = normalizeTargetType(resolvedType);
         this.singletonMock = buildMock(this.targetType);
     }
 
@@ -76,7 +77,8 @@ public final class NoOpBeanMockFactoryBean implements FactoryBean<Object>, BeanC
         }
         if (type.isInterface()) {
             InvocationHandler handler = new DefaultInvocationHandler(type);
-            return Proxy.newProxyInstance(beanClassLoader, new Class[]{type}, handler);
+            ClassLoader loader = type.getClassLoader() != null ? type.getClassLoader() : beanClassLoader;
+            return Proxy.newProxyInstance(loader, new Class[]{type}, handler);
         }
         if (Modifier.isFinal(type.getModifiers())) {
             // Cannot CGLIB-subclass final classes. Create constructor-free instance as a safe startup stub.
@@ -85,7 +87,8 @@ public final class NoOpBeanMockFactoryBean implements FactoryBean<Object>, BeanC
 
         MethodInterceptor interceptor = new DefaultMethodInterceptor(type);
         Enhancer enhancer = new Enhancer();
-        enhancer.setClassLoader(beanClassLoader);
+        ClassLoader enhancerLoader = type.getClassLoader() != null ? type.getClassLoader() : beanClassLoader;
+        enhancer.setClassLoader(enhancerLoader);
         enhancer.setSuperclass(type);
         enhancer.setCallbackType(MethodInterceptor.class);
         Class<?> proxyType = enhancer.createClass();
@@ -94,6 +97,19 @@ public final class NoOpBeanMockFactoryBean implements FactoryBean<Object>, BeanC
         Object instance = objenesis.newInstance(proxyType);
         ((Factory) instance).setCallbacks(new Callback[]{interceptor});
         return instance;
+    }
+
+    private Class<?> normalizeTargetType(Class<?> resolvedType) {
+        if (resolvedType == null) {
+            return null;
+        }
+        if (isCglibProxyClass(resolvedType)) {
+            Class<?> superClass = resolvedType.getSuperclass();
+            if (superClass != null && superClass != Object.class) {
+                return superClass;
+            }
+        }
+        return resolvedType;
     }
 
     private Object buildJdkProxyClassMock(Class<?> proxyType) {

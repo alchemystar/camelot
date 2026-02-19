@@ -357,7 +357,29 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (clean == null) {
             return;
         }
+        String normalized = normalizeCglibTypeName(clean);
+        if (normalized != null) {
+            candidates.add(normalized);
+        }
         candidates.add(clean);
+    }
+
+    private String normalizeCglibTypeName(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return null;
+        }
+        int marker = clean.indexOf("$$");
+        if (marker <= 0) {
+            return null;
+        }
+        String suffix = clean.substring(marker);
+        if (!suffix.startsWith("$$EnhancerBySpringCGLIB$$")
+                && !suffix.startsWith("$$EnhancerByCGLIB$$")
+                && !suffix.startsWith("$$SpringCGLIB$$")) {
+            return null;
+        }
+        return clean.substring(0, marker);
     }
 
     private String resolveResolvableTypeNameFromDefinition(BeanDefinition definition) {
