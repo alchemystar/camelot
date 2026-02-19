@@ -23,6 +23,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProcessor, PriorityOrdered {
 
@@ -289,6 +290,13 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (normalizedPrefix.isEmpty()) {
             return false;
         }
+        if (looksLikeRegexRule(normalizedPrefix)) {
+            try {
+                return Pattern.compile(normalizedPrefix).matcher(clean).matches();
+            } catch (Exception ignored) {
+                // fallback to prefix matching below
+            }
+        }
         if (clean.equals(normalizedPrefix)) {
             return true;
         }
@@ -303,6 +311,13 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
         char boundary = clean.charAt(normalizedPrefix.length());
         return boundary == '.' || boundary == '$';
+    }
+
+    private boolean looksLikeRegexRule(String rule) {
+        return rule.indexOf('*') >= 0
+                || rule.indexOf('[') >= 0
+                || rule.indexOf('(') >= 0
+                || rule.indexOf('|') >= 0;
     }
 
     private MockTarget resolveTarget(String beanName,

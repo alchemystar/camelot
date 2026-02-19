@@ -55,6 +55,11 @@ public final class SpringBootNativeLauncher {
             Pattern.compile("Could not resolve matching constructor on bean class \\[([^\\]]+)\\]"),
             Pattern.compile("Lookup method resolution failed; nested exception is java\\.lang\\.IllegalStateException: Failed to introspect Class \\[([^\\]]+)\\]")
     );
+    private static final List<String> BUILTIN_FORCE_MOCK_CLASS_PREFIXES = Arrays.asList(
+            ".*ThriftClientProxy.*",
+            ".*pay.mra.*",
+            "com.taobao.*"
+    );
     public StartResult start(StartRequest request) {
         validate(request);
 
@@ -70,6 +75,7 @@ public final class SpringBootNativeLauncher {
                     : request.getActiveProfiles();
             Map<String, String> launchProperties = mergeLaunchProperties(request.getExtraProperties());
             List<String> forceMockClassPrefixes = new ArrayList<String>(request.getForceMockClassPrefixes());
+            appendIfAbsent(forceMockClassPrefixes, BUILTIN_FORCE_MOCK_CLASS_PREFIXES);
             LinkedHashSet<String> forceMockBeanNames = new LinkedHashSet<String>();
             boolean servletFallbackApplied = false;
             boolean broadPrefixFallbackApplied = false;
