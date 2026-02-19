@@ -207,10 +207,11 @@ public final class SpringBootNativeLauncher {
 
     private static String extractFailedBeanName(Throwable error) {
         Throwable cursor = error;
+        String lastBeanName = null;
         while (cursor != null) {
             String beanNameFromType = extractBeanNameFromExceptionType(cursor);
             if (!isBlank(beanNameFromType)) {
-                return beanNameFromType;
+                lastBeanName = beanNameFromType;
             }
             String message = cursor.getMessage();
             if (!isBlank(message)) {
@@ -219,14 +220,14 @@ public final class SpringBootNativeLauncher {
                     if (matcher.find()) {
                         String candidate = matcher.group(1);
                         if (!isBlank(candidate)) {
-                            return candidate;
+                            lastBeanName = candidate;
                         }
                     }
                 }
             }
             cursor = cursor.getCause();
         }
-        return null;
+        return lastBeanName;
     }
 
     private static String extractBeanNameFromExceptionType(Throwable error) {
@@ -270,6 +271,7 @@ public final class SpringBootNativeLauncher {
 
     private static String extractFailedTypeName(Throwable error) {
         Throwable cursor = error;
+        String lastTypeName = null;
         while (cursor != null) {
             String message = cursor.getMessage();
             if (!isBlank(message)) {
@@ -278,14 +280,14 @@ public final class SpringBootNativeLauncher {
                     if (matcher.find()) {
                         String candidate = matcher.group(1);
                         if (!isBlank(candidate)) {
-                            return candidate;
+                            lastTypeName = candidate;
                         }
                     }
                 }
             }
             cursor = cursor.getCause();
         }
-        return null;
+        return lastTypeName;
     }
 
     private static boolean addIfAbsent(List<String> target, String candidate) {
