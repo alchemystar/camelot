@@ -68,6 +68,12 @@ public final class NoOpBeanMockFactoryBean implements FactoryBean<Object>, BeanC
     }
 
     private Object buildMock(Class<?> type) {
+        if (Proxy.isProxyClass(type)) {
+            return buildJdkProxyClassMock(type);
+        }
+        if (isCglibProxyClass(type)) {
+            return buildCglibProxyClassMock(type);
+        }
         if (type.isInterface()) {
             InvocationHandler handler = new DefaultInvocationHandler(type);
             return Proxy.newProxyInstance(beanClassLoader, new Class[]{type}, handler);
@@ -88,6 +94,34 @@ public final class NoOpBeanMockFactoryBean implements FactoryBean<Object>, BeanC
         Object instance = objenesis.newInstance(proxyType);
         ((Factory) instance).setCallbacks(new Callback[]{interceptor});
         return instance;
+    }
+
+    private Object buildJdkProxyClassMock(Class<?> proxyType) {
+        InvocationHandler handler = new DefaultInvocationHandler(proxyType);
+        try {
+            return proxyType.getConstructor(InvocationHandler.class).newInstance(handler);
+        } catch (Throwable ignored) {
+            Class<?>[] interfaces = proxyType.getInterfaces();
+            ClassLoader loader = proxyType.getClassLoader();
+            return Proxy.newProxyInstance(loader, interfaces, handler);
+        }
+    }
+
+    private Object buildCglibProxyClassMock(Class<?> proxyType) {
+        MethodInterceptor interceptor = new DefaultMethodInterceptor(proxyType);
+        ObjenesisStd objenesis = new ObjenesisStd(true);
+        Object instance = objenesis.newInstance(proxyType);
+        if (instance instanceof Factory) {
+            ((Factory) instance).setCallbacks(new Callback[]{interceptor});
+        }
+        return instance;
+    }
+
+    private boolean isCglibProxyClass(Class<?> type) {
+        String name = type.getName();
+        return name.contains("$$EnhancerBySpringCGLIB$$")
+                || name.contains("$$EnhancerByCGLIB$$")
+                || name.contains("$$SpringCGLIB$$");
     }
 
     private static final class DefaultInvocationHandler implements InvocationHandler {
