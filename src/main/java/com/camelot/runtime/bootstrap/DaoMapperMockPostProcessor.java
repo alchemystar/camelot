@@ -139,7 +139,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 continue;
             }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
-            String forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(forceMockBeanTargetTypes, beanName));
+            String forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(beanFactory, forceMockBeanTargetTypes, beanName));
             if (forcedTargetType != null) {
                 replaceWithNoOpMock(
                         registry,
@@ -151,7 +151,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 mockedBeanNames.add(beanName);
                 continue;
             }
-            if (tryMockByForcePrefix(registry, beanName, definition, inferredExpectedTypeByBeanName)) {
+            if (tryMockByForcePrefix(registry, beanFactory, beanName, definition, inferredExpectedTypeByBeanName)) {
                 mockedBeanNames.add(beanName);
             }
         }
@@ -162,10 +162,10 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 continue;
             }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
-            boolean forcedByBeanName = containsBeanName(forceMockBeanNames, beanName);
-            String forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(forceMockBeanTargetTypes, beanName));
+            boolean forcedByBeanName = containsBeanName(beanFactory, forceMockBeanNames, beanName);
+            String forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(beanFactory, forceMockBeanTargetTypes, beanName));
             if (forcedTargetType == null && forcedByBeanName) {
-                forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(inferredExpectedTypeByBeanName, beanName));
+                forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(beanFactory, inferredExpectedTypeByBeanName, beanName));
             }
             MockTarget target = resolveTarget(beanName, definition);
             if (forcedTargetType != null) {
@@ -344,6 +344,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     }
 
     private boolean tryMockByForcePrefix(BeanDefinitionRegistry registry,
+                                         ConfigurableListableBeanFactory beanFactory,
                                          String beanName,
                                          BeanDefinition definition,
                                          Map<String, String> inferredExpectedTypeByBeanName) {
@@ -368,7 +369,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         String inferredExpectedType = sanitizeForcedTargetType(
                 inferredExpectedTypeByBeanName == null
                         ? null
-                        : findValueByBeanName(inferredExpectedTypeByBeanName, beanName)
+                        : findValueByBeanName(beanFactory, inferredExpectedTypeByBeanName, beanName)
         );
         String thriftServiceInterface = sanitizeForcedTargetType(resolveThriftServiceInterfaceType(definition, evaluation));
         if (inferredExpectedType != null) {
@@ -1733,6 +1734,20 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return hasAnySuffixIgnoreCase(typeName, daoMapperSuffixes);
     }
 
+    private boolean containsBeanName(ConfigurableListableBeanFactory beanFactory,
+                                     Set<String> names,
+                                     String beanName) {
+        if (containsBeanName(names, beanName)) {
+            return true;
+        }
+        for (String alias : resolveBeanNameAliases(beanFactory, beanName)) {
+            if (containsBeanName(names, alias)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean containsBeanName(Set<String> names, String beanName) {
         if (names == null || names.isEmpty()) {
             return false;
@@ -1755,6 +1770,22 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         return false;
+    }
+
+    private String findValueByBeanName(ConfigurableListableBeanFactory beanFactory,
+                                       Map<String, String> source,
+                                       String beanName) {
+        String direct = findValueByBeanName(source, beanName);
+        if (direct != null) {
+            return direct;
+        }
+        for (String alias : resolveBeanNameAliases(beanFactory, beanName)) {
+            String aliasValue = findValueByBeanName(source, alias);
+            if (aliasValue != null) {
+                return aliasValue;
+            }
+        }
+        return null;
     }
 
     private String findValueByBeanName(Map<String, String> source, String beanName) {
@@ -1783,6 +1814,47 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         return null;
+    }
+
+    private List<String> resolveBeanNameAliases(ConfigurableListableBeanFactory beanFactory, String beanName) {
+        if (beanFactory == null) {
+            return Collections.emptyList();
+        }
+        String cleanBeanName = clean(beanName);
+        if (cleanBeanName == null) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> aliases = new LinkedHashSet<String>();
+        addAliases(beanFactory, cleanBeanName, aliases);
+        if (cleanBeanName.startsWith("&") && cleanBeanName.length() > 1) {
+            addAliases(beanFactory, cleanBeanName.substring(1), aliases);
+        } else {
+            addAliases(beanFactory, "&" + cleanBeanName, aliases);
+        }
+        aliases.remove(cleanBeanName);
+        return aliases.isEmpty() ? Collections.<String>emptyList() : new ArrayList<String>(aliases);
+    }
+
+    private void addAliases(ConfigurableListableBeanFactory beanFactory,
+                            String beanName,
+                            Set<String> output) {
+        if (beanFactory == null || beanName == null || output == null) {
+            return;
+        }
+        try {
+            String[] aliases = beanFactory.getAliases(beanName);
+            if (aliases == null || aliases.length == 0) {
+                return;
+            }
+            for (String alias : aliases) {
+                String clean = clean(alias);
+                if (clean != null) {
+                    output.add(clean);
+                }
+            }
+        } catch (Throwable ignored) {
+            // ignore alias lookup failures
+        }
     }
 
     private String sanitizeForcedTargetType(String typeName) {
