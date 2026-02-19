@@ -118,10 +118,21 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         applyDefaultPlaceholderValues(beanFactory, beanNames);
         Map<String, String> inferredExpectedTypeByBeanName =
                 inferExpectedTypesFromBeanDefinitions(beanFactory, beanNames);
-        Set<String> mockedBeanNames = new LinkedHashSet<String>();
+        Set<String> inferredRequiredDaoMapperTypes =
+                inferRequiredDaoMapperTypesFromBeanDefinitions(beanFactory, beanNames);
+        Set<String> mockedBeanNames = preRegisterRequiredDaoMapperMocks(
+                registry,
+                beanFactory,
+                inferredExpectedTypeByBeanName,
+                inferredRequiredDaoMapperTypes
+        );
+        beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
 
         // Pass 1: explicit whitelist pre-filter. Any hit is mocked immediately.
         for (String beanName : beanNames) {
+            if (mockedBeanNames.contains(beanName)) {
+                continue;
+            }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
             String forcedTargetType = forceMockBeanTargetTypes.get(beanName);
             if (forcedTargetType != null) {
@@ -169,6 +180,129 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
             replaceWithNoOpMock(registry, beanName, definition, target, reason);
         }
+    }
+
+    private Set<String> preRegisterRequiredDaoMapperMocks(BeanDefinitionRegistry registry,
+                                                          ConfigurableListableBeanFactory beanFactory,
+                                                          Map<String, String> inferredExpectedTypeByBeanName,
+                                                          Set<String> inferredRequiredDaoMapperTypes) {
+        LinkedHashSet<String> mockedBeanNames = new LinkedHashSet<String>();
+        if (registry == null || beanFactory == null) {
+            return mockedBeanNames;
+        }
+
+        if (inferredExpectedTypeByBeanName != null && !inferredExpectedTypeByBeanName.isEmpty()) {
+            for (Map.Entry<String, String> entry : inferredExpectedTypeByBeanName.entrySet()) {
+                if (entry == null) {
+                    continue;
+                }
+                String beanName = clean(entry.getKey());
+                String expectedType = clean(entry.getValue());
+                if (beanName == null || expectedType == null) {
+                    continue;
+                }
+                if (!isDaoOrMapperType(expectedType)) {
+                    continue;
+                }
+                if (beanFactory.containsBean(beanName) || beanFactory.containsBeanDefinition(beanName)) {
+                    continue;
+                }
+                RootBeanDefinition replacement = buildNoOpMockBeanDefinition(expectedType);
+                replacement.setPrimary(true);
+                registry.registerBeanDefinition(beanName, replacement);
+                mockedBeanTypes.put(beanName, expectedType);
+                mockedBeanNames.add(beanName);
+                emitDiagnostic("Pre-register mock bean '" + beanName + "' as '" + expectedType
+                        + "' reason=required-dao-mapper-by-name");
+                LOG.info("Pre-register mock bean '{}' as '{}' reason=required-dao-mapper-by-name",
+                        beanName,
+                        expectedType);
+            }
+        }
+
+        if (inferredRequiredDaoMapperTypes != null && !inferredRequiredDaoMapperTypes.isEmpty()) {
+            for (String requiredType : inferredRequiredDaoMapperTypes) {
+                String typeName = clean(requiredType);
+                if (typeName == null || !isDaoOrMapperType(typeName)) {
+                    continue;
+                }
+                if (hasBeanCandidateOfType(beanFactory, typeName)) {
+                    continue;
+                }
+                String generatedBeanName = generateBeanNameForType(registry, typeName);
+                RootBeanDefinition replacement = buildNoOpMockBeanDefinition(typeName);
+                replacement.setPrimary(true);
+                registry.registerBeanDefinition(generatedBeanName, replacement);
+                mockedBeanTypes.put(generatedBeanName, typeName);
+                mockedBeanNames.add(generatedBeanName);
+                emitDiagnostic("Pre-register mock bean '" + generatedBeanName + "' as '" + typeName
+                        + "' reason=required-dao-mapper-by-type");
+                LOG.info("Pre-register mock bean '{}' as '{}' reason=required-dao-mapper-by-type",
+                        generatedBeanName,
+                        typeName);
+            }
+        }
+        return mockedBeanNames;
+    }
+
+    private RootBeanDefinition buildNoOpMockBeanDefinition(String targetTypeName) {
+        RootBeanDefinition replacement = new RootBeanDefinition(NoOpBeanMockFactoryBean.class);
+        replacement.getPropertyValues().add("targetTypeName", targetTypeName);
+        replacement.setLazyInit(true);
+        replacement.setRole(BeanDefinition.ROLE_APPLICATION);
+        replacement.setScope(BeanDefinition.SCOPE_SINGLETON);
+        return replacement;
+    }
+
+    private String generateBeanNameForType(BeanDefinitionRegistry registry, String typeName) {
+        String cleanType = clean(typeName);
+        String simpleName = cleanType;
+        int split = cleanType == null ? -1 : cleanType.lastIndexOf('.');
+        if (split >= 0 && split < cleanType.length() - 1) {
+            simpleName = cleanType.substring(split + 1);
+        }
+        if (simpleName == null || simpleName.trim().isEmpty()) {
+            simpleName = "daoMapperMock";
+        }
+        String baseName = Character.toLowerCase(simpleName.charAt(0)) + simpleName.substring(1);
+        if (!registry.containsBeanDefinition(baseName)) {
+            return baseName;
+        }
+        int index = 1;
+        while (true) {
+            String candidate = baseName + "#mock" + index;
+            if (!registry.containsBeanDefinition(candidate)) {
+                return candidate;
+            }
+            index++;
+        }
+    }
+
+    private boolean hasBeanCandidateOfType(ConfigurableListableBeanFactory beanFactory, String expectedTypeName) {
+        if (beanFactory == null) {
+            return false;
+        }
+        String expected = clean(expectedTypeName);
+        if (expected == null) {
+            return false;
+        }
+        for (String beanName : beanFactory.getBeanDefinitionNames()) {
+            BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
+            for (String candidate : collectCandidateTypeNames(beanName, definition)) {
+                String cleanCandidate = clean(candidate);
+                if (cleanCandidate == null) {
+                    continue;
+                }
+                if (expected.equals(cleanCandidate)) {
+                    return true;
+                }
+                String normalizedCandidate = normalizeCglibTypeName(cleanCandidate);
+                if (expected.equals(normalizedCandidate)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private boolean tryMockByForcePrefix(BeanDefinitionRegistry registry,
@@ -831,6 +965,31 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return inferred;
     }
 
+    private Set<String> inferRequiredDaoMapperTypesFromBeanDefinitions(ConfigurableListableBeanFactory beanFactory,
+                                                                       List<String> beanNames) {
+        if (beanNames == null || beanNames.isEmpty()) {
+            return Collections.emptySet();
+        }
+        LinkedHashSet<String> requiredTypes = new LinkedHashSet<String>();
+        LinkedHashSet<String> inspectedClasses = new LinkedHashSet<String>();
+        for (String consumerBeanName : beanNames) {
+            BeanDefinition definition = beanFactory.getBeanDefinition(consumerBeanName);
+            Class<?> consumerType = resolveInspectableBeanType(consumerBeanName, definition);
+            if (consumerType == null) {
+                continue;
+            }
+            if (!inspectedClasses.add(consumerType.getName())) {
+                continue;
+            }
+            collectRequiredDaoMapperTypesFromClass(consumerType, requiredTypes);
+        }
+        if (!requiredTypes.isEmpty()) {
+            emitDiagnostic("Inferred required DAO/Mapper types: " + requiredTypes.size() + " -> " + requiredTypes);
+            LOG.info("Inferred required DAO/Mapper types: {}", requiredTypes);
+        }
+        return requiredTypes;
+    }
+
     private Class<?> resolveInspectableBeanType(String beanName, BeanDefinition definition) {
         LinkedHashSet<String> candidates = new LinkedHashSet<String>();
         addCandidate(candidates, clean(definition.getBeanClassName()));
@@ -856,6 +1015,55 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         return null;
+    }
+
+    private void collectRequiredDaoMapperTypesFromClass(Class<?> consumerType, Set<String> requiredTypes) {
+        if (consumerType == null || requiredTypes == null) {
+            return;
+        }
+        Class<?> cursor = consumerType;
+        while (cursor != null && cursor != Object.class) {
+            for (Field field : cursor.getDeclaredFields()) {
+                Annotation[] annotations = field.getAnnotations();
+                if (!hasAutowiredLikeAnnotation(annotations)
+                        && resolveInjectionBeanName(annotations) == null
+                        && resolveMethodLevelResourceBeanName(annotations) == null) {
+                    continue;
+                }
+                registerRequiredDaoMapperType(field.getType(), requiredTypes);
+            }
+            cursor = cursor.getSuperclass();
+        }
+
+        Constructor<?>[] constructors = consumerType.getDeclaredConstructors();
+        List<Constructor<?>> targetConstructors = selectInjectableConstructors(constructors);
+        for (Constructor<?> constructor : targetConstructors) {
+            for (Parameter parameter : constructor.getParameters()) {
+                registerRequiredDaoMapperType(parameter.getType(), requiredTypes);
+            }
+        }
+
+        for (Method method : consumerType.getDeclaredMethods()) {
+            boolean methodAutowired = hasAutowiredLikeAnnotation(method.getAnnotations());
+            String methodResourceBeanName = resolveMethodLevelResourceBeanName(method.getAnnotations());
+            if (!methodAutowired && methodResourceBeanName == null) {
+                continue;
+            }
+            for (Parameter parameter : method.getParameters()) {
+                registerRequiredDaoMapperType(parameter.getType(), requiredTypes);
+            }
+        }
+    }
+
+    private void registerRequiredDaoMapperType(Class<?> type, Set<String> requiredTypes) {
+        if (type == null || requiredTypes == null) {
+            return;
+        }
+        String typeName = clean(type.getName());
+        if (typeName == null || !isDaoOrMapperType(typeName)) {
+            return;
+        }
+        requiredTypes.add(typeName);
     }
 
     private void collectExpectedTypesFromClass(ConfigurableListableBeanFactory beanFactory,
@@ -1035,9 +1243,6 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         String cleanBeanName = clean(beanName);
         String cleanExpectedType = clean(expectedType);
         if (cleanBeanName == null || cleanExpectedType == null) {
-            return;
-        }
-        if (!beanFactory.containsBean(cleanBeanName) && !beanFactory.containsBeanDefinition(cleanBeanName)) {
             return;
         }
         String existing = inferred.get(cleanBeanName);
@@ -1416,6 +1621,10 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         return false;
+    }
+
+    private boolean isDaoOrMapperType(String typeName) {
+        return hasAnySuffixIgnoreCase(typeName, daoMapperSuffixes);
     }
 
     private ForcePrefixEvaluation evaluateForcePrefix(String beanName,
