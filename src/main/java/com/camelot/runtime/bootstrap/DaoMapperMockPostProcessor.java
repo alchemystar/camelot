@@ -1384,6 +1384,14 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (serviceInterfaceType == null) {
             return null;
         }
+        String thriftIfaceType = resolveThriftIfaceType(serviceInterfaceType);
+        if (thriftIfaceType != null) {
+            if (!thriftIfaceType.equals(serviceInterfaceType)) {
+                emitDiagnostic("Thrift serviceInterface refined to Iface: " + serviceInterfaceType + " -> " + thriftIfaceType);
+                LOG.info("Thrift serviceInterface refined to Iface: {} -> {}", serviceInterfaceType, thriftIfaceType);
+            }
+            return thriftIfaceType;
+        }
         if (isInterfaceType(serviceInterfaceType)) {
             return serviceInterfaceType;
         }
@@ -1441,6 +1449,48 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    private String resolveThriftIfaceType(String serviceInterfaceType) {
+        String clean = clean(serviceInterfaceType);
+        if (clean == null) {
+            return null;
+        }
+        LinkedHashSet<String> candidates = new LinkedHashSet<String>();
+        candidates.add(clean);
+        if (clean.endsWith(".Iface")) {
+            candidates.add(clean.substring(0, clean.length() - ".Iface".length()) + "$Iface");
+        }
+        if (!clean.endsWith("$Iface") && !clean.endsWith(".Iface")) {
+            candidates.add(clean + "$Iface");
+            candidates.add(clean + ".Iface");
+        }
+        for (String candidate : candidates) {
+            String normalized = normalizeDottedNestedTypeName(candidate);
+            if (normalized != null && isInterfaceTypeStrict(normalized)) {
+                return normalized;
+            }
+        }
+        return null;
+    }
+
+    private String normalizeDottedNestedTypeName(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return null;
+        }
+        if (isInterfaceTypeStrict(clean)) {
+            return clean;
+        }
+        int packageDot = clean.lastIndexOf('.');
+        if (packageDot <= 0 || packageDot >= clean.length() - 1) {
+            return clean;
+        }
+        String nested = clean.substring(0, packageDot) + "$" + clean.substring(packageDot + 1);
+        if (isInterfaceTypeStrict(nested)) {
+            return nested;
+        }
+        return clean;
     }
 
     private String pickForceExpectedType(Set<String> candidates, String matchedPrefix) {
