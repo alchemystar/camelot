@@ -130,13 +130,23 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         );
 
         MockTarget target = resolveTarget(beanName, definition);
-        String expectedType = resolveForceMockExpectedType(definition, evaluation);
-        if (expectedType != null) {
-            target = new MockTarget(expectedType, false);
-            emitDiagnostic("Force-prefix expected-type selected bean '" + beanName + "' -> '" + expectedType + "'");
-            LOG.info("Force-prefix expected-type selected bean '{}' -> '{}'", beanName, expectedType);
-        } else if (target == null) {
-            target = new MockTarget(evaluation.matchedTypeName, false);
+        String thriftServiceInterface = resolveThriftServiceInterfaceType(definition, evaluation);
+        if (thriftServiceInterface != null) {
+            target = new MockTarget(thriftServiceInterface, false);
+            emitDiagnostic("Force-prefix thrift serviceInterface selected bean '" + beanName
+                    + "' -> '" + thriftServiceInterface + "'");
+            LOG.info("Force-prefix thrift serviceInterface selected bean '{}' -> '{}'",
+                    beanName,
+                    thriftServiceInterface);
+        } else {
+            String expectedType = resolveForceMockExpectedType(definition, evaluation);
+            if (expectedType != null) {
+                target = new MockTarget(expectedType, false);
+                emitDiagnostic("Force-prefix expected-type selected bean '" + beanName + "' -> '" + expectedType + "'");
+                LOG.info("Force-prefix expected-type selected bean '{}' -> '{}'", beanName, expectedType);
+            } else if (target == null) {
+                target = new MockTarget(evaluation.matchedTypeName, false);
+            }
         }
         try {
             replaceWithNoOpMock(
@@ -242,12 +252,68 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private List<String> collectExplicitExpectedTypeNames(BeanDefinition definition) {
         LinkedHashSet<String> candidates = new LinkedHashSet<String>();
         addCandidate(candidates, resolveMapperInterfaceType(definition));
+        addCandidate(candidates, resolveServiceInterfaceType(definition));
         addCandidate(candidates, asTypeName(definition.getAttribute("factoryBeanObjectType")));
         addCandidate(candidates, asTypeName(definition.getAttribute("targetType")));
         addCandidate(candidates, resolveResolvableTypeNameFromDefinition(definition));
         addCandidate(candidates, resolveMethodMetadataReturnType(definition));
         addCandidate(candidates, resolveFactoryMethodType(definition));
         return new ArrayList<String>(candidates);
+    }
+
+    private String resolveThriftServiceInterfaceType(BeanDefinition definition,
+                                                     ForcePrefixEvaluation evaluation) {
+        if (!isThriftClientProxyMatch(evaluation)) {
+            return null;
+        }
+        String serviceInterfaceType = resolveServiceInterfaceType(definition);
+        if (serviceInterfaceType == null) {
+            return null;
+        }
+        if (isInterfaceType(serviceInterfaceType)) {
+            return serviceInterfaceType;
+        }
+        LOG.warn("ThriftClientProxy matched but serviceInterface is not an interface: {}", serviceInterfaceType);
+        return null;
+    }
+
+    private boolean isThriftClientProxyMatch(ForcePrefixEvaluation evaluation) {
+        if (evaluation == null) {
+            return false;
+        }
+        if (containsIgnoreCase(evaluation.matchedPrefix, "thriftclientproxy")) {
+            return true;
+        }
+        if (containsIgnoreCase(evaluation.matchedTypeName, "thriftclientproxy")) {
+            return true;
+        }
+        for (String candidate : evaluation.candidateTypes) {
+            if (containsIgnoreCase(candidate, "thriftclientproxy")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean containsIgnoreCase(String value, String fragment) {
+        if (value == null || fragment == null) {
+            return false;
+        }
+        return value.toLowerCase().contains(fragment.toLowerCase());
+    }
+
+    private boolean isInterfaceType(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return false;
+        }
+        try {
+            Class<?> type = Class.forName(clean, false, Thread.currentThread().getContextClassLoader());
+            return type.isInterface();
+        } catch (Throwable ignored) {
+            // If class cannot be loaded now, keep compatibility and trust definition metadata.
+            return true;
+        }
     }
 
     private String pickForceExpectedType(Set<String> candidates, String matchedPrefix) {
@@ -457,8 +523,10 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
         String mapperType = resolveMapperInterfaceType(definition);
         addCandidate(candidates, mapperType);
+        addCandidate(candidates, resolveServiceInterfaceType(definition));
 
         addCandidate(candidates, asTypeName(definition.getAttribute("factoryBeanObjectType")));
+        addCandidate(candidates, asTypeName(definition.getAttribute("serviceInterface")));
         addCandidate(candidates, asTypeName(definition.getAttribute("targetType")));
         addCandidate(candidates, resolveResolvableTypeNameFromDefinition(definition));
         addCandidate(candidates, resolveMethodMetadataReturnType(definition));
@@ -639,6 +707,17 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         return null;
+    }
+
+    private String resolveServiceInterfaceType(BeanDefinition definition) {
+        PropertyValue serviceInterface = definition.getPropertyValues().getPropertyValue("serviceInterface");
+        if (serviceInterface != null) {
+            String typeName = asTypeName(serviceInterface.getValue());
+            if (typeName != null) {
+                return typeName;
+            }
+        }
+        return asTypeName(definition.getAttribute("serviceInterface"));
     }
 
     private String asTypeName(Object source) {
