@@ -64,6 +64,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private final Set<String> forceMockBeanNames;
     private final Map<String, String> forceMockBeanTargetTypes;
     private final List<String> explicitMapperLocations;
+    private final Set<String> forceMockMissingTypeNames;
     private Set<String> mapperLocationTypeNames = Collections.emptySet();
     private List<String> mapperLocationPackagePrefixes = Collections.emptyList();
     private List<String> mybatisScanPackagePrefixes = Collections.emptyList();
@@ -73,7 +74,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                                List<String> forceMockTypePrefixes,
                                Set<String> forceMockBeanNames,
                                Map<String, String> forceMockBeanTargetTypes,
-                               List<String> mapperLocations) {
+                               List<String> mapperLocations,
+                               Set<String> forceMockMissingTypeNames) {
         this.packagePrefixes = normalizePackages(packagePrefixes);
         this.daoMapperSuffixes = new LinkedHashSet<String>(Arrays.asList("DAO", "Mapper"));
         this.forceMockSuffixes = new LinkedHashSet<String>(Arrays.asList("DataSource"));
@@ -87,6 +89,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 : new LinkedHashSet<String>(forceMockBeanNames);
         this.forceMockBeanTargetTypes = normalizeForceMockBeanTargetTypes(forceMockBeanTargetTypes);
         this.explicitMapperLocations = normalizeMapperLocations(mapperLocations);
+        this.forceMockMissingTypeNames = normalizeTypeNameSet(forceMockMissingTypeNames);
     }
 
     @Override
@@ -125,7 +128,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 registry,
                 beanFactory,
                 inferredExpectedTypeByBeanName,
-                inferredRequiredDaoMapperTypes
+                inferredRequiredDaoMapperTypes,
+                forceMockMissingTypeNames
         );
         beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
 
@@ -186,7 +190,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private Set<String> preRegisterRequiredDaoMapperMocks(BeanDefinitionRegistry registry,
                                                           ConfigurableListableBeanFactory beanFactory,
                                                           Map<String, String> inferredExpectedTypeByBeanName,
-                                                          Set<String> inferredRequiredDaoMapperTypes) {
+                                                          Set<String> inferredRequiredDaoMapperTypes,
+                                                          Set<String> forcedMissingTypeNames) {
         LinkedHashSet<String> mockedBeanNames = new LinkedHashSet<String>();
         if (registry == null || beanFactory == null) {
             return mockedBeanNames;
@@ -239,6 +244,29 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 emitDiagnostic("Pre-register mock bean '" + generatedBeanName + "' as '" + typeName
                         + "' reason=required-dao-mapper-by-type");
                 LOG.info("Pre-register mock bean '{}' as '{}' reason=required-dao-mapper-by-type",
+                        generatedBeanName,
+                        typeName);
+            }
+        }
+
+        if (forcedMissingTypeNames != null && !forcedMissingTypeNames.isEmpty()) {
+            for (String missingType : forcedMissingTypeNames) {
+                String typeName = sanitizeForcedTargetType(missingType);
+                if (typeName == null) {
+                    continue;
+                }
+                if (hasBeanCandidateOfType(beanFactory, typeName)) {
+                    continue;
+                }
+                String generatedBeanName = generateBeanNameForType(registry, typeName);
+                RootBeanDefinition replacement = buildNoOpMockBeanDefinition(typeName);
+                replacement.setPrimary(true);
+                registry.registerBeanDefinition(generatedBeanName, replacement);
+                mockedBeanTypes.put(generatedBeanName, typeName);
+                mockedBeanNames.add(generatedBeanName);
+                emitDiagnostic("Pre-register mock bean '" + generatedBeanName + "' as '" + typeName
+                        + "' reason=forced-missing-type");
+                LOG.info("Pre-register mock bean '{}' as '{}' reason=forced-missing-type",
                         generatedBeanName,
                         typeName);
             }
@@ -2320,6 +2348,25 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return normalized.isEmpty()
                 ? Collections.<String, String>emptyMap()
                 : Collections.unmodifiableMap(normalized);
+    }
+
+    private static Set<String> normalizeTypeNameSet(Set<String> source) {
+        if (source == null || source.isEmpty()) {
+            return Collections.emptySet();
+        }
+        LinkedHashSet<String> normalized = new LinkedHashSet<String>();
+        for (String item : source) {
+            if (item == null) {
+                continue;
+            }
+            String clean = item.trim();
+            if (!clean.isEmpty()) {
+                normalized.add(clean);
+            }
+        }
+        return normalized.isEmpty()
+                ? Collections.<String>emptySet()
+                : Collections.unmodifiableSet(normalized);
     }
 
     private static final class MapperLocationDiscovery {

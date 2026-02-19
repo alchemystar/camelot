@@ -60,6 +60,12 @@ public final class SpringBootNativeLauncher {
             Pattern.compile("expected to be of type \"([^\"]+)\""),
             Pattern.compile("Required type: ([A-Za-z0-9_.$]+)")
     );
+    private static final List<Pattern> MISSING_BEAN_TYPE_PATTERNS = Arrays.asList(
+            Pattern.compile("No qualifying bean of type '([^']+)'"),
+            Pattern.compile("No qualifying bean of type \"([^\"]+)\""),
+            Pattern.compile("required a bean of type '([^']+)'"),
+            Pattern.compile("required a bean of type \"([^\"]+)\"")
+    );
     private static final List<Pattern> ACTUAL_TYPE_PATTERNS = Arrays.asList(
             Pattern.compile("but was actually of type '([^']+)'"),
             Pattern.compile("but was actually of type \"([^\"]+)\""),
@@ -88,6 +94,7 @@ public final class SpringBootNativeLauncher {
             appendIfAbsent(forceMockClassPrefixes, BUILTIN_FORCE_MOCK_CLASS_PREFIXES);
             LinkedHashSet<String> forceMockBeanNames = new LinkedHashSet<String>();
             LinkedHashMap<String, String> forceMockBeanTargetTypes = new LinkedHashMap<String, String>();
+            LinkedHashSet<String> forceMockMissingTypeNames = new LinkedHashSet<String>();
             boolean servletFallbackApplied = false;
             boolean suppressSpringApplicationCallbacks = false;
             RunOutcome outcome = null;
@@ -105,6 +112,7 @@ public final class SpringBootNativeLauncher {
                             forceMockClassPrefixes,
                             forceMockBeanNames,
                             forceMockBeanTargetTypes,
+                            forceMockMissingTypeNames,
                             suppressSpringApplicationCallbacks,
                             request
                     );
@@ -129,6 +137,7 @@ public final class SpringBootNativeLauncher {
                     String failedBeanName = extractFailedBeanName(runError);
                     String expectedTypeName = extractExpectedTypeName(runError);
                     String actualTypeName = extractActualTypeName(runError);
+                    String missingBeanTypeName = extractMissingBeanTypeName(runError);
                     String beanFailureReason = buildBeanFailureReason(runError, failedBeanName, expectedTypeName, actualTypeName);
                     if (!isBlank(failedBeanName) && !isBlank(expectedTypeName)) {
                         String normalizedBeanName = failedBeanName.trim();
@@ -154,6 +163,17 @@ public final class SpringBootNativeLauncher {
                                     "Spring startup failed on bean '{}', expected type '{}' is unsupported; force-mock by bean name only and retry. reason={}",
                                     normalizedBeanName,
                                     normalizedExpectedType,
+                                    beanFailureReason
+                            );
+                            continue;
+                        }
+                    }
+                    if (isUsableForcedTargetType(missingBeanTypeName)) {
+                        String normalizedMissingType = missingBeanTypeName.trim();
+                        if (forceMockMissingTypeNames.add(normalizedMissingType)) {
+                            LOG.warn(
+                                    "Spring startup missing bean type '{}', pre-register no-op mock and retry. reason={}",
+                                    normalizedMissingType,
                                     beanFailureReason
                             );
                             continue;
@@ -205,6 +225,7 @@ public final class SpringBootNativeLauncher {
                                              List<String> forceMockClassPrefixes,
                                              Set<String> forceMockBeanNames,
                                              Map<String, String> forceMockBeanTargetTypes,
+                                             Set<String> forceMockMissingTypeNames,
                                              boolean suppressSpringApplicationCallbacks,
                                              StartRequest request) {
         List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
@@ -213,7 +234,8 @@ public final class SpringBootNativeLauncher {
                 packagePrefixes,
                 forceMockClassPrefixes,
                 forceMockBeanNames,
-                forceMockBeanTargetTypes
+                forceMockBeanTargetTypes,
+                forceMockMissingTypeNames
         );
         Object builder = createBuilderInstance(startupClass, classLoader);
         builder = invokeBuilder(builder, "profiles", new Class[]{String[].class}, new Object[]{activeProfiles.toArray(new String[0])});
@@ -302,6 +324,31 @@ public final class SpringBootNativeLauncher {
         return lastTypeName;
     }
 
+    private static String extractMissingBeanTypeName(Throwable error) {
+        Throwable cursor = error;
+        String lastTypeName = null;
+        while (cursor != null) {
+            String beanTypeFromException = extractMissingBeanTypeFromExceptionType(cursor);
+            if (!isBlank(beanTypeFromException)) {
+                lastTypeName = normalizeTypeName(beanTypeFromException);
+            }
+            String message = cursor.getMessage();
+            if (!isBlank(message)) {
+                for (Pattern pattern : MISSING_BEAN_TYPE_PATTERNS) {
+                    Matcher matcher = pattern.matcher(message);
+                    if (matcher.find()) {
+                        String candidate = normalizeTypeName(matcher.group(1));
+                        if (!isBlank(candidate)) {
+                            lastTypeName = candidate;
+                        }
+                    }
+                }
+            }
+            cursor = cursor.getCause();
+        }
+        return lastTypeName;
+    }
+
     private static String extractActualTypeName(Throwable error) {
         Throwable cursor = error;
         String lastTypeName = null;
@@ -329,6 +376,24 @@ public final class SpringBootNativeLauncher {
         }
         try {
             Method method = error.getClass().getMethod("getRequiredType");
+            Object result = method.invoke(error);
+            if (result instanceof Class<?>) {
+                return ((Class<?>) result).getName();
+            }
+            return result == null ? null : String.valueOf(result);
+        } catch (NoSuchMethodException ignored) {
+            return null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String extractMissingBeanTypeFromExceptionType(Throwable error) {
+        if (error == null) {
+            return null;
+        }
+        try {
+            Method method = error.getClass().getMethod("getBeanType");
             Object result = method.invoke(error);
             if (result instanceof Class<?>) {
                 return ((Class<?>) result).getName();
@@ -711,14 +776,16 @@ public final class SpringBootNativeLauncher {
                                                                     final List<String> packagePrefixes,
                                                                     final List<String> forceMockClassPrefixes,
                                                                     final Set<String> forceMockBeanNames,
-                                                                    final Map<String, String> forceMockBeanTargetTypes) {
+                                                                    final Map<String, String> forceMockBeanTargetTypes,
+                                                                    final Set<String> forceMockMissingTypeNames) {
         try {
             LOG.info(
-                    "Create mocking initializer: scanPackages={} forceMockClassPrefixes={} forceMockBeanNames={} forceMockBeanTargetTypes={}",
+                    "Create mocking initializer: scanPackages={} forceMockClassPrefixes={} forceMockBeanNames={} forceMockBeanTargetTypes={} forceMockMissingTypeNames={}",
                     packagePrefixes,
                     forceMockClassPrefixes,
                     forceMockBeanNames,
-                    forceMockBeanTargetTypes
+                    forceMockBeanTargetTypes,
+                    forceMockMissingTypeNames
             );
             final Class<?> initializerType = Class.forName(
                     "org.springframework.context.ApplicationContextInitializer",
@@ -749,7 +816,8 @@ public final class SpringBootNativeLauncher {
                     List.class,
                     Set.class,
                     Map.class,
-                    List.class
+                    List.class,
+                    Set.class
             );
             constructor.setAccessible(true);
             final AtomicReference<Object> postProcessorRef = new AtomicReference<Object>();
@@ -771,7 +839,8 @@ public final class SpringBootNativeLauncher {
                                 new ArrayList<String>(forceMockClassPrefixes),
                                 new LinkedHashSet<String>(forceMockBeanNames),
                                 new LinkedHashMap<String, String>(forceMockBeanTargetTypes),
-                                mapperLocations
+                                mapperLocations,
+                                new LinkedHashSet<String>(forceMockMissingTypeNames)
                         );
                         postProcessorRef.set(postProcessor);
                         Method addPostProcessor = context.getClass().getMethod(
