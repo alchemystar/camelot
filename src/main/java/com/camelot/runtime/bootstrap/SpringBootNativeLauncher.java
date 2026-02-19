@@ -78,7 +78,6 @@ public final class SpringBootNativeLauncher {
             appendIfAbsent(forceMockClassPrefixes, BUILTIN_FORCE_MOCK_CLASS_PREFIXES);
             LinkedHashSet<String> forceMockBeanNames = new LinkedHashSet<String>();
             boolean servletFallbackApplied = false;
-            boolean broadPrefixFallbackApplied = false;
             boolean suppressSpringApplicationCallbacks = false;
             RunOutcome outcome = null;
             IllegalStateException lastError = null;
@@ -122,23 +121,6 @@ public final class SpringBootNativeLauncher {
                             LOG.warn("Spring startup failed on bean '{}', force-mock and retry.", normalizedBeanName);
                             continue;
                         }
-                    }
-                    String failedTypeName = extractFailedTypeName(runError);
-                    if (!isBlank(failedTypeName)) {
-                        String normalizedType = failedTypeName.trim();
-                        if (addIfAbsent(forceMockClassPrefixes, normalizedType)) {
-                            LOG.warn("Spring startup failed on type '{}', add to force-mock prefix list and retry.", normalizedType);
-                            continue;
-                        }
-                    }
-                    if (!broadPrefixFallbackApplied && appendIfAbsent(forceMockClassPrefixes, packagePrefixes)) {
-                        broadPrefixFallbackApplied = true;
-                        LOG.warn(
-                                "Unable to extract precise failing bean/type; broaden force-mock to scan packages {} and retry. diagnostics:\n{}",
-                                packagePrefixes,
-                                buildFailureDiagnostics(runError)
-                        );
-                        continue;
                     }
                     LOG.error("Spring startup failed and no further fallback can be applied. diagnostics:\n{}",
                             buildFailureDiagnostics(runError));
