@@ -55,6 +55,11 @@ public final class SpringBootNativeLauncher {
             Pattern.compile("Could not resolve matching constructor on bean class \\[([^\\]]+)\\]"),
             Pattern.compile("Lookup method resolution failed; nested exception is java\\.lang\\.IllegalStateException: Failed to introspect Class \\[([^\\]]+)\\]")
     );
+    private static final List<Pattern> EXPECTED_TYPE_PATTERNS = Arrays.asList(
+            Pattern.compile("expected to be of type '([^']+)'"),
+            Pattern.compile("expected to be of type \"([^\"]+)\""),
+            Pattern.compile("Required type: ([A-Za-z0-9_.$]+)")
+    );
     private static final List<String> BUILTIN_FORCE_MOCK_CLASS_PREFIXES = Arrays.asList(
             ".*ThriftClientProxy.*",
             ".*pay.mra.*",
@@ -77,6 +82,7 @@ public final class SpringBootNativeLauncher {
             List<String> forceMockClassPrefixes = new ArrayList<String>(request.getForceMockClassPrefixes());
             appendIfAbsent(forceMockClassPrefixes, BUILTIN_FORCE_MOCK_CLASS_PREFIXES);
             LinkedHashSet<String> forceMockBeanNames = new LinkedHashSet<String>();
+            LinkedHashMap<String, String> forceMockBeanTargetTypes = new LinkedHashMap<String, String>();
             boolean servletFallbackApplied = false;
             boolean suppressSpringApplicationCallbacks = false;
             RunOutcome outcome = null;
@@ -93,6 +99,7 @@ public final class SpringBootNativeLauncher {
                             packagePrefixes,
                             forceMockClassPrefixes,
                             forceMockBeanNames,
+                            forceMockBeanTargetTypes,
                             suppressSpringApplicationCallbacks,
                             request
                     );
@@ -115,6 +122,25 @@ public final class SpringBootNativeLauncher {
                         continue;
                     }
                     String failedBeanName = extractFailedBeanName(runError);
+                    String expectedTypeName = extractExpectedTypeName(runError);
+                    if (!isBlank(failedBeanName) && !isBlank(expectedTypeName)) {
+                        String normalizedBeanName = failedBeanName.trim();
+                        String normalizedExpectedType = expectedTypeName.trim();
+                        String previousExpectedType = forceMockBeanTargetTypes.get(normalizedBeanName);
+                        boolean expectedTypeChanged = !normalizedExpectedType.equals(previousExpectedType);
+                        boolean beanAdded = forceMockBeanNames.add(normalizedBeanName);
+                        if (expectedTypeChanged) {
+                            forceMockBeanTargetTypes.put(normalizedBeanName, normalizedExpectedType);
+                        }
+                        if (expectedTypeChanged || beanAdded) {
+                            LOG.warn(
+                                    "Spring startup type mismatch on bean '{}', force-mock expected type '{}' and retry.",
+                                    normalizedBeanName,
+                                    normalizedExpectedType
+                            );
+                            continue;
+                        }
+                    }
                     if (!isBlank(failedBeanName)) {
                         String normalizedBeanName = failedBeanName.trim();
                         if (forceMockBeanNames.add(normalizedBeanName)) {
@@ -156,6 +182,7 @@ public final class SpringBootNativeLauncher {
                                              List<String> packagePrefixes,
                                              List<String> forceMockClassPrefixes,
                                              Set<String> forceMockBeanNames,
+                                             Map<String, String> forceMockBeanTargetTypes,
                                              boolean suppressSpringApplicationCallbacks,
                                              StartRequest request) {
         List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
@@ -163,7 +190,8 @@ public final class SpringBootNativeLauncher {
                 classLoader,
                 packagePrefixes,
                 forceMockClassPrefixes,
-                forceMockBeanNames
+                forceMockBeanNames,
+                forceMockBeanTargetTypes
         );
         Object builder = createBuilderInstance(startupClass, classLoader);
         builder = invokeBuilder(builder, "profiles", new Class[]{String[].class}, new Object[]{activeProfiles.toArray(new String[0])});
@@ -225,6 +253,62 @@ public final class SpringBootNativeLauncher {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private static String extractExpectedTypeName(Throwable error) {
+        Throwable cursor = error;
+        String lastTypeName = null;
+        while (cursor != null) {
+            String requiredTypeFromException = extractRequiredTypeFromExceptionType(cursor);
+            if (!isBlank(requiredTypeFromException)) {
+                lastTypeName = normalizeTypeName(requiredTypeFromException);
+            }
+            String message = cursor.getMessage();
+            if (!isBlank(message)) {
+                for (Pattern pattern : EXPECTED_TYPE_PATTERNS) {
+                    Matcher matcher = pattern.matcher(message);
+                    if (matcher.find()) {
+                        String candidate = normalizeTypeName(matcher.group(1));
+                        if (!isBlank(candidate)) {
+                            lastTypeName = candidate;
+                        }
+                    }
+                }
+            }
+            cursor = cursor.getCause();
+        }
+        return lastTypeName;
+    }
+
+    private static String extractRequiredTypeFromExceptionType(Throwable error) {
+        if (error == null) {
+            return null;
+        }
+        try {
+            Method method = error.getClass().getMethod("getRequiredType");
+            Object result = method.invoke(error);
+            if (result instanceof Class<?>) {
+                return ((Class<?>) result).getName();
+            }
+            return result == null ? null : String.valueOf(result);
+        } catch (NoSuchMethodException ignored) {
+            return null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String normalizeTypeName(String rawTypeName) {
+        if (isBlank(rawTypeName)) {
+            return null;
+        }
+        String normalized = rawTypeName.trim();
+        if (normalized.startsWith("class ")) {
+            normalized = normalized.substring("class ".length()).trim();
+        } else if (normalized.startsWith("interface ")) {
+            normalized = normalized.substring("interface ".length()).trim();
+        }
+        return isBlank(normalized) ? null : normalized;
     }
 
     private static boolean isPrepareContextFailure(Throwable error) {
@@ -516,13 +600,15 @@ public final class SpringBootNativeLauncher {
     private static InitializerHandle createMockingInitializerHandle(final ClassLoader classLoader,
                                                                     final List<String> packagePrefixes,
                                                                     final List<String> forceMockClassPrefixes,
-                                                                    final Set<String> forceMockBeanNames) {
+                                                                    final Set<String> forceMockBeanNames,
+                                                                    final Map<String, String> forceMockBeanTargetTypes) {
         try {
             LOG.info(
-                    "Create mocking initializer: scanPackages={} forceMockClassPrefixes={} forceMockBeanNames={}",
+                    "Create mocking initializer: scanPackages={} forceMockClassPrefixes={} forceMockBeanNames={} forceMockBeanTargetTypes={}",
                     packagePrefixes,
                     forceMockClassPrefixes,
-                    forceMockBeanNames
+                    forceMockBeanNames,
+                    forceMockBeanTargetTypes
             );
             final Class<?> initializerType = Class.forName(
                     "org.springframework.context.ApplicationContextInitializer",
@@ -548,7 +634,12 @@ public final class SpringBootNativeLauncher {
                             ? "unknown"
                             : postProcessorClass.getProtectionDomain().getCodeSource().getLocation()
             );
-            final Constructor<?> constructor = postProcessorClass.getDeclaredConstructor(List.class, List.class, Set.class);
+            final Constructor<?> constructor = postProcessorClass.getDeclaredConstructor(
+                    List.class,
+                    List.class,
+                    Set.class,
+                    Map.class
+            );
             constructor.setAccessible(true);
             final AtomicReference<Object> postProcessorRef = new AtomicReference<Object>();
 
@@ -566,7 +657,8 @@ public final class SpringBootNativeLauncher {
                         Object postProcessor = constructor.newInstance(
                                 new ArrayList<String>(packagePrefixes),
                                 new ArrayList<String>(forceMockClassPrefixes),
-                                new LinkedHashSet<String>(forceMockBeanNames)
+                                new LinkedHashSet<String>(forceMockBeanNames),
+                                new LinkedHashMap<String, String>(forceMockBeanTargetTypes)
                         );
                         postProcessorRef.set(postProcessor);
                         Method addPostProcessor = context.getClass().getMethod(

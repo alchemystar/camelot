@@ -38,11 +38,13 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private final Set<String> forceMockTypeNames;
     private final List<String> forceMockTypePrefixes;
     private final Set<String> forceMockBeanNames;
+    private final Map<String, String> forceMockBeanTargetTypes;
     private final Map<String, String> mockedBeanTypes = new LinkedHashMap<String, String>();
 
     DaoMapperMockPostProcessor(List<String> packagePrefixes,
                                List<String> forceMockTypePrefixes,
-                               Set<String> forceMockBeanNames) {
+                               Set<String> forceMockBeanNames,
+                               Map<String, String> forceMockBeanTargetTypes) {
         this.packagePrefixes = normalizePackages(packagePrefixes);
         this.daoMapperSuffixes = new LinkedHashSet<String>(Arrays.asList("Dao", "Mapper"));
         this.forceMockSuffixes = new LinkedHashSet<String>(Arrays.asList("DataSource"));
@@ -54,6 +56,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         this.forceMockBeanNames = forceMockBeanNames == null
                 ? Collections.<String>emptySet()
                 : new LinkedHashSet<String>(forceMockBeanNames);
+        this.forceMockBeanTargetTypes = normalizeForceMockBeanTargetTypes(forceMockBeanTargetTypes);
     }
 
     @Override
@@ -82,6 +85,18 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         // Pass 1: explicit whitelist pre-filter. Any hit is mocked immediately.
         for (String beanName : beanNames) {
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
+            String forcedTargetType = forceMockBeanTargetTypes.get(beanName);
+            if (forcedTargetType != null) {
+                replaceWithNoOpMock(
+                        registry,
+                        beanName,
+                        definition,
+                        new MockTarget(forcedTargetType, false),
+                        "forced-by-expected-type"
+                );
+                mockedBeanNames.add(beanName);
+                continue;
+            }
             if (tryMockByForcePrefix(registry, beanName, definition)) {
                 mockedBeanNames.add(beanName);
             }
@@ -94,9 +109,15 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
             boolean forcedByBeanName = beanName != null && forceMockBeanNames.contains(beanName);
+            String forcedTargetType = forceMockBeanTargetTypes.get(beanName);
             MockTarget target = resolveTarget(beanName, definition);
+            if (forcedTargetType != null) {
+                target = new MockTarget(forcedTargetType, false);
+            }
             if (target == null && forcedByBeanName) {
-                target = new MockTarget(Object.class.getName(), false);
+                target = forcedTargetType != null
+                        ? new MockTarget(forcedTargetType, false)
+                        : new MockTarget(Object.class.getName(), false);
             }
             if (target == null) {
                 continue;
@@ -316,6 +337,19 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
     }
 
+    private boolean isInterfaceTypeStrict(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return false;
+        }
+        try {
+            Class<?> type = Class.forName(clean, false, Thread.currentThread().getContextClassLoader());
+            return type.isInterface();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private String pickForceExpectedType(Set<String> candidates, String matchedPrefix) {
         String businessFallback = null;
         String nonFrameworkFallback = null;
@@ -511,10 +545,64 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 return new MockTarget(mapperType, true);
             }
         }
-        for (String candidate : collectCandidateTypeNames(beanName, definition)) {
-            return new MockTarget(candidate, false);
+        List<String> candidates = collectCandidateTypeNames(beanName, definition);
+        String preferred = chooseBestMockTargetType(candidates);
+        if (preferred != null) {
+            return new MockTarget(preferred, false);
         }
         return null;
+    }
+
+    private String chooseBestMockTargetType(List<String> candidates) {
+        if (candidates == null || candidates.isEmpty()) {
+            return null;
+        }
+        String businessInterface = null;
+        String anyInterface = null;
+        String businessClass = null;
+        String anyClass = null;
+        String proxyFallback = null;
+        for (String candidate : candidates) {
+            String clean = clean(candidate);
+            if (clean == null) {
+                continue;
+            }
+            if (looksLikeProxyTypeName(clean)) {
+                if (proxyFallback == null) {
+                    proxyFallback = clean;
+                }
+                continue;
+            }
+            boolean interfaceType = isInterfaceTypeStrict(clean) || clean.endsWith("$Iface");
+            if (interfaceType) {
+                if (isBusinessPackage(clean) && businessInterface == null) {
+                    businessInterface = clean;
+                }
+                if (anyInterface == null) {
+                    anyInterface = clean;
+                }
+                continue;
+            }
+            if (isBusinessPackage(clean) && businessClass == null) {
+                businessClass = clean;
+            }
+            if (anyClass == null) {
+                anyClass = clean;
+            }
+        }
+        if (businessInterface != null) {
+            return businessInterface;
+        }
+        if (anyInterface != null) {
+            return anyInterface;
+        }
+        if (businessClass != null) {
+            return businessClass;
+        }
+        if (anyClass != null) {
+            return anyClass;
+        }
+        return proxyFallback != null ? proxyFallback : candidates.get(0);
     }
 
     private List<String> collectCandidateTypeNames(String beanName,
@@ -822,6 +910,27 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         return normalized.isEmpty() ? Collections.<String>emptyList() : new ArrayList<String>(normalized);
+    }
+
+    private static Map<String, String> normalizeForceMockBeanTargetTypes(Map<String, String> source) {
+        if (source == null || source.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        LinkedHashMap<String, String> normalized = new LinkedHashMap<String, String>();
+        for (Map.Entry<String, String> entry : source.entrySet()) {
+            if (entry == null) {
+                continue;
+            }
+            String beanName = entry.getKey() == null ? null : entry.getKey().trim();
+            String targetType = entry.getValue() == null ? null : entry.getValue().trim();
+            if (beanName == null || beanName.isEmpty() || targetType == null || targetType.isEmpty()) {
+                continue;
+            }
+            normalized.put(beanName, targetType);
+        }
+        return normalized.isEmpty()
+                ? Collections.<String, String>emptyMap()
+                : Collections.unmodifiableMap(normalized);
     }
 
     private static final class MockTarget {
