@@ -135,7 +135,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 continue;
             }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
-            String forcedTargetType = findValueByBeanName(forceMockBeanTargetTypes, beanName);
+            String forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(forceMockBeanTargetTypes, beanName));
             if (forcedTargetType != null) {
                 replaceWithNoOpMock(
                         registry,
@@ -159,9 +159,9 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
             boolean forcedByBeanName = containsBeanName(forceMockBeanNames, beanName);
-            String forcedTargetType = findValueByBeanName(forceMockBeanTargetTypes, beanName);
+            String forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(forceMockBeanTargetTypes, beanName));
             if (forcedTargetType == null && forcedByBeanName) {
-                forcedTargetType = findValueByBeanName(inferredExpectedTypeByBeanName, beanName);
+                forcedTargetType = sanitizeForcedTargetType(findValueByBeanName(inferredExpectedTypeByBeanName, beanName));
             }
             MockTarget target = resolveTarget(beanName, definition);
             if (forcedTargetType != null) {
@@ -1737,6 +1737,42 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         return null;
+    }
+
+    private String sanitizeForcedTargetType(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return null;
+        }
+        if (isUnsupportedForcedTargetType(clean)) {
+            emitDiagnostic("Ignore unsupported forced target type: " + clean);
+            LOG.warn("Ignore unsupported forced target type: {}", clean);
+            return null;
+        }
+        return clean;
+    }
+
+    private boolean isUnsupportedForcedTargetType(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return true;
+        }
+        if ("java.lang.Object".equals(clean)) {
+            return true;
+        }
+        if (clean.startsWith("org.springframework.beans.factory.")
+                || clean.startsWith("org.springframework.context.")
+                || clean.startsWith("org.springframework.core.")
+                || clean.startsWith("org.springframework.boot.")) {
+            return true;
+        }
+        return "org.springframework.beans.factory.InitializingBean".equals(clean)
+                || "org.springframework.beans.factory.DisposableBean".equals(clean)
+                || "org.springframework.beans.factory.FactoryBean".equals(clean)
+                || "org.springframework.beans.factory.SmartFactoryBean".equals(clean)
+                || "org.springframework.beans.factory.config.BeanPostProcessor".equals(clean)
+                || "org.springframework.beans.factory.config.BeanFactoryPostProcessor".equals(clean)
+                || "org.springframework.context.SmartLifecycle".equals(clean);
     }
 
     private List<String> beanNameCandidates(String beanName) {

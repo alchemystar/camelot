@@ -133,15 +133,25 @@ public final class SpringBootNativeLauncher {
                     if (!isBlank(failedBeanName) && !isBlank(expectedTypeName)) {
                         String normalizedBeanName = failedBeanName.trim();
                         String normalizedExpectedType = expectedTypeName.trim();
-                        String previousExpectedType = forceMockBeanTargetTypes.get(normalizedBeanName);
-                        boolean expectedTypeChanged = !normalizedExpectedType.equals(previousExpectedType);
                         boolean beanAdded = forceMockBeanNames.add(normalizedBeanName);
-                        if (expectedTypeChanged) {
-                            forceMockBeanTargetTypes.put(normalizedBeanName, normalizedExpectedType);
-                        }
-                        if (expectedTypeChanged || beanAdded) {
+                        if (isUsableForcedTargetType(normalizedExpectedType)) {
+                            String previousExpectedType = forceMockBeanTargetTypes.get(normalizedBeanName);
+                            boolean expectedTypeChanged = !normalizedExpectedType.equals(previousExpectedType);
+                            if (expectedTypeChanged) {
+                                forceMockBeanTargetTypes.put(normalizedBeanName, normalizedExpectedType);
+                            }
+                            if (expectedTypeChanged || beanAdded) {
+                                LOG.warn(
+                                        "Spring startup type mismatch on bean '{}', force-mock expected type '{}' and retry. reason={}",
+                                        normalizedBeanName,
+                                        normalizedExpectedType,
+                                        beanFailureReason
+                                );
+                                continue;
+                            }
+                        } else if (beanAdded) {
                             LOG.warn(
-                                    "Spring startup type mismatch on bean '{}', force-mock expected type '{}' and retry. reason={}",
+                                    "Spring startup failed on bean '{}', expected type '{}' is unsupported; force-mock by bean name only and retry. reason={}",
                                     normalizedBeanName,
                                     normalizedExpectedType,
                                     beanFailureReason
@@ -366,6 +376,29 @@ public final class SpringBootNativeLauncher {
 
     private static boolean isBlank(String text) {
         return text == null || text.trim().isEmpty();
+    }
+
+    private static boolean isUsableForcedTargetType(String typeName) {
+        if (isBlank(typeName)) {
+            return false;
+        }
+        String clean = typeName.trim();
+        if ("java.lang.Object".equals(clean)) {
+            return false;
+        }
+        if (clean.startsWith("org.springframework.beans.factory.")
+                || clean.startsWith("org.springframework.context.")
+                || clean.startsWith("org.springframework.core.")
+                || clean.startsWith("org.springframework.boot.")) {
+            return false;
+        }
+        return !"org.springframework.beans.factory.InitializingBean".equals(clean)
+                && !"org.springframework.beans.factory.DisposableBean".equals(clean)
+                && !"org.springframework.beans.factory.FactoryBean".equals(clean)
+                && !"org.springframework.beans.factory.SmartFactoryBean".equals(clean)
+                && !"org.springframework.beans.factory.config.BeanPostProcessor".equals(clean)
+                && !"org.springframework.beans.factory.config.BeanFactoryPostProcessor".equals(clean)
+                && !"org.springframework.context.SmartLifecycle".equals(clean);
     }
 
     private static String extractFailedTypeName(Throwable error) {
