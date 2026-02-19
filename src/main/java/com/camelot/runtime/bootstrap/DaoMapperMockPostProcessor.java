@@ -8,6 +8,8 @@ import org.springframework.beans.factory.config.ConstructorArgumentValues;
 import org.springframework.beans.factory.support.BeanDefinitionRegistry;
 import org.springframework.beans.factory.support.BeanDefinitionRegistryPostProcessor;
 import org.springframework.beans.factory.support.RootBeanDefinition;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.support.PropertySourcesPlaceholderConfigurer;
 import org.springframework.core.Ordered;
 import org.springframework.core.PriorityOrdered;
 import org.springframework.core.type.MethodMetadata;
@@ -28,13 +30,16 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.regex.Matcher;
 
 final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProcessor, PriorityOrdered {
 
     private static final Logger LOG = LoggerFactory.getLogger(DaoMapperMockPostProcessor.class);
     private static final String MYBATIS_MAPPER_FACTORY = "org.mybatis.spring.mapper.MapperFactoryBean";
+    private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\$\\{([^}]+)}");
 
     private final List<String> packagePrefixes;
     private final Set<String> daoMapperSuffixes;
@@ -84,6 +89,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
         BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
         List<String> beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
+        applyDefaultPlaceholderValues(beanFactory, beanNames);
         Map<String, String> inferredExpectedTypeByBeanName =
                 inferExpectedTypesFromBeanDefinitions(beanFactory, beanNames);
         Set<String> mockedBeanNames = new LinkedHashSet<String>();
@@ -241,6 +247,159 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
     Map<String, String> snapshotMockedBeanTypes() {
         return Collections.unmodifiableMap(new LinkedHashMap<String, String>(mockedBeanTypes));
+    }
+
+    private void applyDefaultPlaceholderValues(ConfigurableListableBeanFactory beanFactory,
+                                               List<String> beanNames) {
+        if (beanNames == null || beanNames.isEmpty()) {
+            return;
+        }
+        LinkedHashMap<String, String> defaultsByKey = new LinkedHashMap<String, String>();
+        LinkedHashSet<String> inspectedTypes = new LinkedHashSet<String>();
+        for (String beanName : beanNames) {
+            BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
+            Class<?> beanType = resolveInspectableBeanType(beanName, definition);
+            if (beanType == null) {
+                continue;
+            }
+            if (!inspectedTypes.add(beanType.getName())) {
+                continue;
+            }
+            collectPlaceholderDefaults(beanType, defaultsByKey);
+        }
+        if (defaultsByKey.isEmpty()) {
+            return;
+        }
+        Properties defaults = new Properties();
+        for (Map.Entry<String, String> entry : defaultsByKey.entrySet()) {
+            if (entry == null || entry.getKey() == null || entry.getValue() == null) {
+                continue;
+            }
+            defaults.setProperty(entry.getKey(), entry.getValue());
+        }
+        if (defaults.isEmpty()) {
+            return;
+        }
+        PropertySourcesPlaceholderConfigurer configurer = new PropertySourcesPlaceholderConfigurer();
+        configurer.setLocalOverride(false);
+        configurer.setIgnoreUnresolvablePlaceholders(true);
+        configurer.setProperties(defaults);
+        configurer.postProcessBeanFactory(beanFactory);
+        emitDiagnostic("Applied placeholder defaults: count=" + defaults.size() + " keys=" + defaultsByKey.keySet());
+        LOG.info("Applied placeholder defaults: count={} keys={}", defaults.size(), defaultsByKey.keySet());
+    }
+
+    private void collectPlaceholderDefaults(Class<?> beanType, Map<String, String> defaultsByKey) {
+        if (beanType == null || defaultsByKey == null) {
+            return;
+        }
+        Class<?> cursor = beanType;
+        while (cursor != null && cursor != Object.class) {
+            for (Field field : cursor.getDeclaredFields()) {
+                Value value = field.getAnnotation(Value.class);
+                if (value == null) {
+                    continue;
+                }
+                registerPlaceholderDefault(value.value(), field.getType(), defaultsByKey);
+            }
+            cursor = cursor.getSuperclass();
+        }
+        Constructor<?>[] constructors = beanType.getDeclaredConstructors();
+        for (Constructor<?> constructor : constructors) {
+            Parameter[] parameters = constructor.getParameters();
+            for (Parameter parameter : parameters) {
+                Value value = parameter.getAnnotation(Value.class);
+                if (value == null) {
+                    continue;
+                }
+                registerPlaceholderDefault(value.value(), parameter.getType(), defaultsByKey);
+            }
+        }
+        Method[] methods = beanType.getDeclaredMethods();
+        for (Method method : methods) {
+            Value methodValue = method.getAnnotation(Value.class);
+            if (methodValue != null) {
+                registerPlaceholderDefault(methodValue.value(), method.getReturnType(), defaultsByKey);
+            }
+            Parameter[] parameters = method.getParameters();
+            for (Parameter parameter : parameters) {
+                Value value = parameter.getAnnotation(Value.class);
+                if (value == null) {
+                    continue;
+                }
+                registerPlaceholderDefault(value.value(), parameter.getType(), defaultsByKey);
+            }
+        }
+    }
+
+    private void registerPlaceholderDefault(String expression,
+                                            Class<?> targetType,
+                                            Map<String, String> defaultsByKey) {
+        if (expression == null || defaultsByKey == null) {
+            return;
+        }
+        Matcher matcher = PLACEHOLDER_PATTERN.matcher(expression);
+        while (matcher.find()) {
+            String content = clean(matcher.group(1));
+            if (content == null) {
+                continue;
+            }
+            int split = content.indexOf(':');
+            String key = split >= 0 ? content.substring(0, split) : content;
+            key = clean(key);
+            if (key == null || key.contains("#{")) {
+                continue;
+            }
+            String inferredDefault = inferPlaceholderDefaultValue(targetType);
+            String existing = defaultsByKey.get(key);
+            if (existing == null) {
+                defaultsByKey.put(key, inferredDefault);
+                continue;
+            }
+            String preferred = preferPlaceholderDefault(existing, inferredDefault);
+            defaultsByKey.put(key, preferred);
+        }
+    }
+
+    private String inferPlaceholderDefaultValue(Class<?> targetType) {
+        if (targetType == null) {
+            return "";
+        }
+        if (String.class.equals(targetType) || CharSequence.class.isAssignableFrom(targetType)) {
+            return "";
+        }
+        if (Boolean.TYPE.equals(targetType) || Boolean.class.equals(targetType)) {
+            return "false";
+        }
+        if (Character.TYPE.equals(targetType) || Character.class.equals(targetType)) {
+            return "0";
+        }
+        if (Number.class.isAssignableFrom(targetType)
+                || Byte.TYPE.equals(targetType)
+                || Short.TYPE.equals(targetType)
+                || Integer.TYPE.equals(targetType)
+                || Long.TYPE.equals(targetType)
+                || Float.TYPE.equals(targetType)
+                || Double.TYPE.equals(targetType)) {
+            return "0";
+        }
+        return "";
+    }
+
+    private String preferPlaceholderDefault(String current, String candidate) {
+        if (candidate == null) {
+            return current;
+        }
+        if (current == null) {
+            return candidate;
+        }
+        if (current.equals(candidate)) {
+            return current;
+        }
+        if (current.isEmpty() && !candidate.isEmpty()) {
+            return candidate;
+        }
+        return current;
     }
 
     private Map<String, String> inferExpectedTypesFromBeanDefinitions(ConfigurableListableBeanFactory beanFactory,
