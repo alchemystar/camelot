@@ -10,20 +10,27 @@ import org.springframework.beans.factory.support.BeanDefinitionRegistryPostProce
 import org.springframework.beans.factory.support.RootBeanDefinition;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.support.PropertySourcesPlaceholderConfigurer;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.core.Ordered;
 import org.springframework.core.PriorityOrdered;
 import org.springframework.core.type.MethodMetadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.LinkedHashMap;
@@ -40,6 +47,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private static final Logger LOG = LoggerFactory.getLogger(DaoMapperMockPostProcessor.class);
     private static final String MYBATIS_MAPPER_FACTORY = "org.mybatis.spring.mapper.MapperFactoryBean";
     private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\$\\{([^}]+)}");
+    private static final Pattern MAPPER_NAMESPACE_PATTERN =
+            Pattern.compile("<mapper\\b[^>]*\\bnamespace\\s*=\\s*['\"]([^'\"]+)['\"]");
 
     private final List<String> packagePrefixes;
     private final Set<String> daoMapperSuffixes;
@@ -48,12 +57,16 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private final List<String> forceMockTypePrefixes;
     private final Set<String> forceMockBeanNames;
     private final Map<String, String> forceMockBeanTargetTypes;
+    private final List<String> explicitMapperLocations;
+    private Set<String> mapperLocationTypeNames = Collections.emptySet();
+    private List<String> mapperLocationPackagePrefixes = Collections.emptyList();
     private final Map<String, String> mockedBeanTypes = new LinkedHashMap<String, String>();
 
     DaoMapperMockPostProcessor(List<String> packagePrefixes,
                                List<String> forceMockTypePrefixes,
                                Set<String> forceMockBeanNames,
-                               Map<String, String> forceMockBeanTargetTypes) {
+                               Map<String, String> forceMockBeanTargetTypes,
+                               List<String> mapperLocations) {
         this.packagePrefixes = normalizePackages(packagePrefixes);
         this.daoMapperSuffixes = new LinkedHashSet<String>(Arrays.asList("Dao", "Mapper"));
         this.forceMockSuffixes = new LinkedHashSet<String>(Arrays.asList("DataSource"));
@@ -66,6 +79,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 ? Collections.<String>emptySet()
                 : new LinkedHashSet<String>(forceMockBeanNames);
         this.forceMockBeanTargetTypes = normalizeForceMockBeanTargetTypes(forceMockBeanTargetTypes);
+        this.explicitMapperLocations = normalizeMapperLocations(mapperLocations);
     }
 
     @Override
@@ -89,6 +103,9 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
         BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
         List<String> beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
+        MapperLocationDiscovery mapperLocationDiscovery = discoverMapperLocationTypes(beanFactory, beanNames);
+        this.mapperLocationTypeNames = mapperLocationDiscovery.mapperTypeNames;
+        this.mapperLocationPackagePrefixes = mapperLocationDiscovery.packagePrefixes;
         applyDefaultPlaceholderValues(beanFactory, beanNames);
         Map<String, String> inferredExpectedTypeByBeanName =
                 inferExpectedTypesFromBeanDefinitions(beanFactory, beanNames);
@@ -247,6 +264,150 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
     Map<String, String> snapshotMockedBeanTypes() {
         return Collections.unmodifiableMap(new LinkedHashMap<String, String>(mockedBeanTypes));
+    }
+
+    private MapperLocationDiscovery discoverMapperLocationTypes(ConfigurableListableBeanFactory beanFactory,
+                                                                List<String> beanNames) {
+        LinkedHashSet<String> locationPatterns = new LinkedHashSet<String>(explicitMapperLocations);
+        collectMapperLocationsFromBeanDefinitions(beanFactory, beanNames, locationPatterns);
+        if (locationPatterns.isEmpty()) {
+            return MapperLocationDiscovery.empty();
+        }
+
+        LinkedHashSet<String> mapperTypes = new LinkedHashSet<String>();
+        LinkedHashSet<String> packagePrefixes = new LinkedHashSet<String>();
+        PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver(
+                Thread.currentThread().getContextClassLoader()
+        );
+        for (String locationPattern : locationPatterns) {
+            Resource[] resources;
+            try {
+                resources = resolver.getResources(locationPattern);
+            } catch (Throwable error) {
+                LOG.warn("Resolve mapper-location failed: {}", locationPattern, error);
+                continue;
+            }
+            for (Resource resource : resources) {
+                String namespace = extractMapperNamespace(resource);
+                if (namespace == null) {
+                    continue;
+                }
+                mapperTypes.add(namespace);
+                int split = namespace.lastIndexOf('.');
+                if (split > 0) {
+                    packagePrefixes.add(namespace.substring(0, split));
+                }
+            }
+        }
+
+        if (!mapperTypes.isEmpty()) {
+            emitDiagnostic("Mapper-locations resolved mapper types: " + mapperTypes.size() + " -> " + mapperTypes);
+            LOG.info("Mapper-locations resolved mapper types: {}", mapperTypes);
+        }
+        return new MapperLocationDiscovery(mapperTypes, packagePrefixes);
+    }
+
+    private void collectMapperLocationsFromBeanDefinitions(ConfigurableListableBeanFactory beanFactory,
+                                                           List<String> beanNames,
+                                                           Set<String> locationPatterns) {
+        if (beanNames == null || beanNames.isEmpty()) {
+            return;
+        }
+        for (String beanName : beanNames) {
+            BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
+            PropertyValue mapperLocations = definition.getPropertyValues().getPropertyValue("mapperLocations");
+            if (mapperLocations != null) {
+                extractMapperLocationPatterns(mapperLocations.getValue(), locationPatterns);
+            }
+            PropertyValue mapperLocation = definition.getPropertyValues().getPropertyValue("mapperLocation");
+            if (mapperLocation != null) {
+                extractMapperLocationPatterns(mapperLocation.getValue(), locationPatterns);
+            }
+        }
+    }
+
+    private void extractMapperLocationPatterns(Object source, Set<String> output) {
+        if (source == null || output == null) {
+            return;
+        }
+        if (source instanceof String) {
+            for (String item : splitLocationText((String) source)) {
+                String clean = clean(item);
+                if (clean != null && !clean.contains("${")) {
+                    output.add(clean);
+                }
+            }
+            return;
+        }
+        if (source instanceof String[]) {
+            for (String item : (String[]) source) {
+                extractMapperLocationPatterns(item, output);
+            }
+            return;
+        }
+        if (source instanceof Collection) {
+            for (Object item : (Collection<?>) source) {
+                extractMapperLocationPatterns(item, output);
+            }
+            return;
+        }
+        if (source.getClass().isArray()) {
+            int length = java.lang.reflect.Array.getLength(source);
+            for (int index = 0; index < length; index++) {
+                extractMapperLocationPatterns(java.lang.reflect.Array.get(source, index), output);
+            }
+            return;
+        }
+        if ("org.springframework.beans.factory.config.TypedStringValue".equals(source.getClass().getName())) {
+            try {
+                Method getValue = source.getClass().getMethod("getValue");
+                Object value = getValue.invoke(source);
+                extractMapperLocationPatterns(value, output);
+                return;
+            } catch (Throwable ignored) {
+                // fallback below
+            }
+        }
+        String text = clean(String.valueOf(source));
+        if (text != null) {
+            extractMapperLocationPatterns(text, output);
+        }
+    }
+
+    private String extractMapperNamespace(Resource resource) {
+        if (resource == null || !resource.exists()) {
+            return null;
+        }
+        StringBuilder xml = new StringBuilder(4096);
+        try {
+            InputStream inputStream = resource.getInputStream();
+            try {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8));
+                String line;
+                int total = 0;
+                while ((line = reader.readLine()) != null) {
+                    xml.append(line);
+                    total += line.length();
+                    if (total > 200000) {
+                        break;
+                    }
+                }
+            } finally {
+                inputStream.close();
+            }
+        } catch (Throwable error) {
+            LOG.debug("Read mapper xml failed: {}", resource, error);
+            return null;
+        }
+        Matcher matcher = MAPPER_NAMESPACE_PATTERN.matcher(xml);
+        if (!matcher.find()) {
+            return null;
+        }
+        String namespace = clean(matcher.group(1));
+        if (namespace == null || namespace.contains(" ")) {
+            return null;
+        }
+        return namespace;
     }
 
     private void applyDefaultPlaceholderValues(ConfigurableListableBeanFactory beanFactory,
@@ -702,6 +863,9 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (isForceMockType(beanName, target)) {
             return "force-mock-external-type";
         }
+        if (isMapperLocationType(target.typeName)) {
+            return "mybatis-mapper-location";
+        }
         if (!isBusinessPackage(target.typeName)) {
             return null;
         }
@@ -899,7 +1063,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     }
 
     private boolean isBusinessPackage(String className) {
-        if (packagePrefixes.isEmpty()) {
+        if (packagePrefixes.isEmpty() && mapperLocationPackagePrefixes.isEmpty()) {
             return true;
         }
         for (String prefix : packagePrefixes) {
@@ -907,7 +1071,24 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 return true;
             }
         }
+        for (String prefix : mapperLocationPackagePrefixes) {
+            if (className.equals(prefix) || className.startsWith(prefix + ".")) {
+                return true;
+            }
+        }
         return false;
+    }
+
+    private boolean isMapperLocationType(String className) {
+        String clean = clean(className);
+        if (clean == null || mapperLocationTypeNames.isEmpty()) {
+            return false;
+        }
+        if (mapperLocationTypeNames.contains(clean)) {
+            return true;
+        }
+        String normalized = normalizeCglibTypeName(clean);
+        return normalized != null && mapperLocationTypeNames.contains(normalized);
     }
 
     private boolean isFrameworkType(String className) {
@@ -1083,6 +1264,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         String mapperType = resolveMapperInterfaceType(definition);
         addCandidate(candidates, mapperType);
         addCandidate(candidates, resolveServiceInterfaceType(definition));
+        addCandidate(candidates, resolveNoOpTargetType(definition));
 
         addCandidate(candidates, asTypeName(definition.getAttribute("factoryBeanObjectType")));
         addCandidate(candidates, asTypeName(definition.getAttribute("serviceInterface")));
@@ -1279,6 +1461,14 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return toLooseTypeName(definition.getAttribute("serviceInterface"));
     }
 
+    private String resolveNoOpTargetType(BeanDefinition definition) {
+        PropertyValue targetTypeName = definition.getPropertyValues().getPropertyValue("targetTypeName");
+        if (targetTypeName == null) {
+            return null;
+        }
+        return toLooseTypeName(targetTypeName.getValue());
+    }
+
     private String toLooseTypeName(Object source) {
         if (source == null) {
             return null;
@@ -1383,6 +1573,48 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return normalized.isEmpty() ? Collections.<String>emptyList() : new ArrayList<String>(normalized);
     }
 
+    private static List<String> normalizeMapperLocations(List<String> mapperLocations) {
+        if (mapperLocations == null || mapperLocations.isEmpty()) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> normalized = new LinkedHashSet<String>();
+        for (String mapperLocation : mapperLocations) {
+            for (String split : splitLocationText(mapperLocation)) {
+                String clean = split == null ? null : split.trim();
+                if (clean != null && !clean.isEmpty()) {
+                    normalized.add(clean);
+                }
+            }
+        }
+        return normalized.isEmpty()
+                ? Collections.<String>emptyList()
+                : new ArrayList<String>(normalized);
+    }
+
+    private static List<String> splitLocationText(String text) {
+        if (text == null) {
+            return Collections.emptyList();
+        }
+        List<String> values = new ArrayList<String>();
+        String[] commaSplit = text.split(",");
+        for (String part : commaSplit) {
+            if (part == null) {
+                continue;
+            }
+            String[] semicolonSplit = part.split(";");
+            for (String item : semicolonSplit) {
+                if (item == null) {
+                    continue;
+                }
+                String clean = item.trim();
+                if (!clean.isEmpty()) {
+                    values.add(clean);
+                }
+            }
+        }
+        return values;
+    }
+
     private static Map<String, String> normalizeForceMockBeanTargetTypes(Map<String, String> source) {
         if (source == null || source.isEmpty()) {
             return Collections.emptyMap();
@@ -1402,6 +1634,24 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         return normalized.isEmpty()
                 ? Collections.<String, String>emptyMap()
                 : Collections.unmodifiableMap(normalized);
+    }
+
+    private static final class MapperLocationDiscovery {
+        private final Set<String> mapperTypeNames;
+        private final List<String> packagePrefixes;
+
+        private MapperLocationDiscovery(Set<String> mapperTypeNames, Set<String> packagePrefixes) {
+            this.mapperTypeNames = mapperTypeNames == null || mapperTypeNames.isEmpty()
+                    ? Collections.<String>emptySet()
+                    : Collections.unmodifiableSet(new LinkedHashSet<String>(mapperTypeNames));
+            this.packagePrefixes = packagePrefixes == null || packagePrefixes.isEmpty()
+                    ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(packagePrefixes));
+        }
+
+        private static MapperLocationDiscovery empty() {
+            return new MapperLocationDiscovery(Collections.<String>emptySet(), Collections.<String>emptySet());
+        }
     }
 
     private static final class MockTarget {

@@ -715,7 +715,8 @@ public final class SpringBootNativeLauncher {
                     List.class,
                     List.class,
                     Set.class,
-                    Map.class
+                    Map.class,
+                    List.class
             );
             constructor.setAccessible(true);
             final AtomicReference<Object> postProcessorRef = new AtomicReference<Object>();
@@ -731,11 +732,13 @@ public final class SpringBootNativeLauncher {
                                 context.getClass().getName(),
                                 context.getClass().getClassLoader()
                         );
+                        List<String> mapperLocations = resolveMapperLocationsFromEnvironment(context);
                         Object postProcessor = constructor.newInstance(
                                 new ArrayList<String>(packagePrefixes),
                                 new ArrayList<String>(forceMockClassPrefixes),
                                 new LinkedHashSet<String>(forceMockBeanNames),
-                                new LinkedHashMap<String, String>(forceMockBeanTargetTypes)
+                                new LinkedHashMap<String, String>(forceMockBeanTargetTypes),
+                                mapperLocations
                         );
                         postProcessorRef.set(postProcessor);
                         Method addPostProcessor = context.getClass().getMethod(
@@ -773,6 +776,54 @@ public final class SpringBootNativeLauncher {
             );
         } catch (Exception error) {
             throw new IllegalStateException("Failed to create cross-classloader mocking initializer", error);
+        }
+    }
+
+    private static List<String> resolveMapperLocationsFromEnvironment(Object context) {
+        if (context == null) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> locations = new LinkedHashSet<String>();
+        try {
+            Method getEnvironment = context.getClass().getMethod("getEnvironment");
+            Object environment = getEnvironment.invoke(context);
+            if (environment == null) {
+                return Collections.emptyList();
+            }
+            Method getProperty = environment.getClass().getMethod("getProperty", String.class);
+            addLocationValues(locations, getProperty.invoke(environment, "mybatis.mapper-locations"));
+            addLocationValues(locations, getProperty.invoke(environment, "mybatis-plus.mapper-locations"));
+            addLocationValues(locations, getProperty.invoke(environment, "mybatis.mapperLocations"));
+        } catch (Throwable error) {
+            LOG.debug("Resolve mapper locations from environment failed.", error);
+        }
+        if (!locations.isEmpty()) {
+            LOG.info("Resolved mapper-locations from environment: {}", locations);
+        }
+        return locations.isEmpty() ? Collections.<String>emptyList() : new ArrayList<String>(locations);
+    }
+
+    private static void addLocationValues(Set<String> target, Object rawValue) {
+        if (target == null || rawValue == null) {
+            return;
+        }
+        String text = String.valueOf(rawValue).trim();
+        if (text.isEmpty()) {
+            return;
+        }
+        for (String commaSegment : text.split(",")) {
+            if (commaSegment == null) {
+                continue;
+            }
+            for (String semicolonSegment : commaSegment.split(";")) {
+                if (semicolonSegment == null) {
+                    continue;
+                }
+                String clean = semicolonSegment.trim();
+                if (!clean.isEmpty()) {
+                    target.add(clean);
+                }
+            }
         }
     }
 
