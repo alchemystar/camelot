@@ -15,9 +15,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Method;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -128,7 +130,12 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         );
 
         MockTarget target = resolveTarget(beanName, definition);
-        if (target == null) {
+        String expectedType = resolveForceMockExpectedType(definition, evaluation);
+        if (expectedType != null) {
+            target = new MockTarget(expectedType, false);
+            emitDiagnostic("Force-prefix expected-type selected bean '" + beanName + "' -> '" + expectedType + "'");
+            LOG.info("Force-prefix expected-type selected bean '{}' -> '{}'", beanName, expectedType);
+        } else if (target == null) {
             target = new MockTarget(evaluation.matchedTypeName, false);
         }
         try {
@@ -209,6 +216,115 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             return "dao-mapper-beanname-suffix";
         }
         return null;
+    }
+
+    private String resolveForceMockExpectedType(BeanDefinition definition,
+                                                ForcePrefixEvaluation evaluation) {
+        LinkedHashSet<String> expectedCandidates = new LinkedHashSet<String>();
+        for (String explicit : collectExplicitExpectedTypeNames(definition)) {
+            addCandidate(expectedCandidates, explicit);
+        }
+        String preferred = pickForceExpectedType(expectedCandidates, evaluation.matchedPrefix);
+        if (preferred != null) {
+            return preferred;
+        }
+
+        LinkedHashSet<String> expandedCandidates = new LinkedHashSet<String>();
+        for (String candidate : evaluation.candidateTypes) {
+            addCandidate(expandedCandidates, candidate);
+            for (String derived : deriveExpectedTypesFromRuntimeType(candidate)) {
+                addCandidate(expandedCandidates, derived);
+            }
+        }
+        return pickForceExpectedType(expandedCandidates, evaluation.matchedPrefix);
+    }
+
+    private List<String> collectExplicitExpectedTypeNames(BeanDefinition definition) {
+        LinkedHashSet<String> candidates = new LinkedHashSet<String>();
+        addCandidate(candidates, resolveMapperInterfaceType(definition));
+        addCandidate(candidates, asTypeName(definition.getAttribute("factoryBeanObjectType")));
+        addCandidate(candidates, asTypeName(definition.getAttribute("targetType")));
+        addCandidate(candidates, resolveResolvableTypeNameFromDefinition(definition));
+        addCandidate(candidates, resolveMethodMetadataReturnType(definition));
+        addCandidate(candidates, resolveFactoryMethodType(definition));
+        return new ArrayList<String>(candidates);
+    }
+
+    private String pickForceExpectedType(Set<String> candidates, String matchedPrefix) {
+        String businessFallback = null;
+        String nonFrameworkFallback = null;
+        for (String candidate : candidates) {
+            String clean = clean(candidate);
+            if (clean == null) {
+                continue;
+            }
+            if (looksLikeProxyTypeName(clean)) {
+                continue;
+            }
+            if (matchedPrefix != null && matchesPrefix(clean, matchedPrefix)) {
+                continue;
+            }
+            if (isBusinessPackage(clean)) {
+                return clean;
+            }
+            if (!isFrameworkType(clean) && businessFallback == null) {
+                businessFallback = clean;
+                continue;
+            }
+            if (nonFrameworkFallback == null) {
+                nonFrameworkFallback = clean;
+            }
+        }
+        return businessFallback != null ? businessFallback : nonFrameworkFallback;
+    }
+
+    private List<String> deriveExpectedTypesFromRuntimeType(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return Collections.emptyList();
+        }
+        Class<?> runtimeType;
+        try {
+            runtimeType = Class.forName(clean, false, Thread.currentThread().getContextClassLoader());
+        } catch (Throwable ignored) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> derived = new LinkedHashSet<String>();
+        Deque<Class<?>> queue = new ArrayDeque<Class<?>>();
+        LinkedHashSet<Class<?>> visited = new LinkedHashSet<Class<?>>();
+        queue.add(runtimeType);
+        while (!queue.isEmpty()) {
+            Class<?> current = queue.removeFirst();
+            if (current == null || !visited.add(current)) {
+                continue;
+            }
+            for (Class<?> iface : current.getInterfaces()) {
+                if (iface != null) {
+                    addCandidate(derived, iface.getName());
+                    queue.addLast(iface);
+                }
+            }
+            Class<?> superClass = current.getSuperclass();
+            if (superClass != null && superClass != Object.class) {
+                addCandidate(derived, superClass.getName());
+                queue.addLast(superClass);
+            }
+        }
+        return new ArrayList<String>(derived);
+    }
+
+    private boolean looksLikeProxyTypeName(String typeName) {
+        String clean = clean(typeName);
+        if (clean == null) {
+            return false;
+        }
+        if (normalizeCglibTypeName(clean) != null) {
+            return true;
+        }
+        return clean.contains(".$Proxy")
+                || clean.startsWith("com.sun.proxy.$Proxy")
+                || clean.startsWith("jdk.proxy")
+                || clean.contains("$$Lambda$");
     }
 
     private boolean isBusinessPackage(String className) {
