@@ -22,6 +22,7 @@ import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.IOException;
+import java.beans.Introspector;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -134,7 +135,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 continue;
             }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
-            String forcedTargetType = forceMockBeanTargetTypes.get(beanName);
+            String forcedTargetType = findValueByBeanName(forceMockBeanTargetTypes, beanName);
             if (forcedTargetType != null) {
                 replaceWithNoOpMock(
                         registry,
@@ -157,10 +158,10 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 continue;
             }
             BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
-            boolean forcedByBeanName = beanName != null && forceMockBeanNames.contains(beanName);
-            String forcedTargetType = forceMockBeanTargetTypes.get(beanName);
+            boolean forcedByBeanName = containsBeanName(forceMockBeanNames, beanName);
+            String forcedTargetType = findValueByBeanName(forceMockBeanTargetTypes, beanName);
             if (forcedTargetType == null && forcedByBeanName) {
-                forcedTargetType = inferredExpectedTypeByBeanName.get(beanName);
+                forcedTargetType = findValueByBeanName(inferredExpectedTypeByBeanName, beanName);
             }
             MockTarget target = resolveTarget(beanName, definition);
             if (forcedTargetType != null) {
@@ -264,10 +265,19 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (simpleName == null || simpleName.trim().isEmpty()) {
             simpleName = "daoMapperMock";
         }
-        String baseName = Character.toLowerCase(simpleName.charAt(0)) + simpleName.substring(1);
-        if (!registry.containsBeanDefinition(baseName)) {
-            return baseName;
+        LinkedHashSet<String> candidates = new LinkedHashSet<String>();
+        candidates.add(simpleName);
+        candidates.add(Introspector.decapitalize(simpleName));
+        candidates.add(Character.toLowerCase(simpleName.charAt(0)) + simpleName.substring(1));
+        for (String candidate : candidates) {
+            if (candidate == null || candidate.trim().isEmpty()) {
+                continue;
+            }
+            if (!registry.containsBeanDefinition(candidate)) {
+                return candidate;
+            }
         }
+        String baseName = simpleName;
         int index = 1;
         while (true) {
             String candidate = baseName + "#mock" + index;
@@ -1625,6 +1635,73 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
 
     private boolean isDaoOrMapperType(String typeName) {
         return hasAnySuffixIgnoreCase(typeName, daoMapperSuffixes);
+    }
+
+    private boolean containsBeanName(Set<String> names, String beanName) {
+        if (names == null || names.isEmpty()) {
+            return false;
+        }
+        String cleanBeanName = clean(beanName);
+        if (cleanBeanName == null) {
+            return false;
+        }
+        for (String candidate : beanNameCandidates(cleanBeanName)) {
+            if (names.contains(candidate)) {
+                return true;
+            }
+        }
+        for (String existing : names) {
+            if (existing == null) {
+                continue;
+            }
+            if (cleanBeanName.equalsIgnoreCase(existing.trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String findValueByBeanName(Map<String, String> source, String beanName) {
+        if (source == null || source.isEmpty()) {
+            return null;
+        }
+        String cleanBeanName = clean(beanName);
+        if (cleanBeanName == null) {
+            return null;
+        }
+        for (String candidate : beanNameCandidates(cleanBeanName)) {
+            String value = source.get(candidate);
+            if (clean(value) != null) {
+                return value;
+            }
+        }
+        for (Map.Entry<String, String> entry : source.entrySet()) {
+            if (entry == null || entry.getKey() == null) {
+                continue;
+            }
+            if (cleanBeanName.equalsIgnoreCase(entry.getKey().trim())) {
+                String value = clean(entry.getValue());
+                if (value != null) {
+                    return value;
+                }
+            }
+        }
+        return null;
+    }
+
+    private List<String> beanNameCandidates(String beanName) {
+        String cleanBeanName = clean(beanName);
+        if (cleanBeanName == null) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> candidates = new LinkedHashSet<String>();
+        candidates.add(cleanBeanName);
+        candidates.add(Introspector.decapitalize(cleanBeanName));
+        if (!cleanBeanName.isEmpty()) {
+            candidates.add(Character.toLowerCase(cleanBeanName.charAt(0)) + cleanBeanName.substring(1));
+            candidates.add(Character.toUpperCase(cleanBeanName.charAt(0)) + cleanBeanName.substring(1));
+        }
+        return new ArrayList<String>(candidates);
     }
 
     private ForcePrefixEvaluation evaluateForcePrefix(String beanName,
