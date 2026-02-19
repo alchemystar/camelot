@@ -21,6 +21,7 @@ import org.slf4j.LoggerFactory;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -49,6 +50,10 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\$\\{([^}]+)}");
     private static final Pattern MAPPER_NAMESPACE_PATTERN =
             Pattern.compile("<mapper\\b[^>]*\\bnamespace\\s*=\\s*['\"]([^'\"]+)['\"]");
+    private static final Pattern YAML_MAPPER_LOCATION_PATTERN =
+            Pattern.compile("^\\s*mapper-locations\\s*:\\s*(.+)$");
+    private static final Pattern FLAT_MAPPER_LOCATION_PATTERN =
+            Pattern.compile("^\\s*(mybatis|mybatis-plus)\\.mapper-locations\\s*[:=]\\s*(.+)$");
 
     private final List<String> packagePrefixes;
     private final Set<String> daoMapperSuffixes;
@@ -60,6 +65,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private final List<String> explicitMapperLocations;
     private Set<String> mapperLocationTypeNames = Collections.emptySet();
     private List<String> mapperLocationPackagePrefixes = Collections.emptyList();
+    private List<String> mybatisScanPackagePrefixes = Collections.emptyList();
     private final Map<String, String> mockedBeanTypes = new LinkedHashMap<String, String>();
 
     DaoMapperMockPostProcessor(List<String> packagePrefixes,
@@ -103,9 +109,12 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
         BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
         List<String> beanNames = new ArrayList<String>(Arrays.asList(beanFactory.getBeanDefinitionNames()));
-        MapperLocationDiscovery mapperLocationDiscovery = discoverMapperLocationTypes(beanFactory, beanNames);
+        LinkedHashSet<String> mapperLocations = new LinkedHashSet<String>(explicitMapperLocations);
+        mapperLocations.addAll(discoverMapperLocationsFromEnvironment(beanFactory));
+        MapperLocationDiscovery mapperLocationDiscovery = discoverMapperLocationTypes(beanFactory, beanNames, mapperLocations);
         this.mapperLocationTypeNames = mapperLocationDiscovery.mapperTypeNames;
         this.mapperLocationPackagePrefixes = mapperLocationDiscovery.packagePrefixes;
+        this.mybatisScanPackagePrefixes = discoverMybatisScanPackages(beanFactory, beanNames);
         applyDefaultPlaceholderValues(beanFactory, beanNames);
         Map<String, String> inferredExpectedTypeByBeanName =
                 inferExpectedTypesFromBeanDefinitions(beanFactory, beanNames);
@@ -267,8 +276,12 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     }
 
     private MapperLocationDiscovery discoverMapperLocationTypes(ConfigurableListableBeanFactory beanFactory,
-                                                                List<String> beanNames) {
-        LinkedHashSet<String> locationPatterns = new LinkedHashSet<String>(explicitMapperLocations);
+                                                                List<String> beanNames,
+                                                                Set<String> baseMapperLocations) {
+        LinkedHashSet<String> locationPatterns = new LinkedHashSet<String>();
+        if (baseMapperLocations != null) {
+            locationPatterns.addAll(baseMapperLocations);
+        }
         collectMapperLocationsFromBeanDefinitions(beanFactory, beanNames, locationPatterns);
         if (locationPatterns.isEmpty()) {
             return MapperLocationDiscovery.empty();
@@ -305,6 +318,236 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             LOG.info("Mapper-locations resolved mapper types: {}", mapperTypes);
         }
         return new MapperLocationDiscovery(mapperTypes, packagePrefixes);
+    }
+
+    private List<String> discoverMapperLocationsFromEnvironment(ConfigurableListableBeanFactory beanFactory) {
+        if (beanFactory == null) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> locations = new LinkedHashSet<String>();
+        try {
+            Object environment = beanFactory.getBean("environment");
+            if (environment == null) {
+                return Collections.emptyList();
+            }
+            Method getProperty = environment.getClass().getMethod("getProperty", String.class);
+            addMapperLocationPropertyValues(locations, getProperty.invoke(environment, "mybatis.mapper-locations"));
+            addMapperLocationPropertyValues(locations, getProperty.invoke(environment, "mybatis-plus.mapper-locations"));
+            addMapperLocationPropertyValues(locations, getProperty.invoke(environment, "mybatis.mapperLocations"));
+        } catch (Throwable ignored) {
+            // ignore environment resolution failure
+        }
+        if (locations.isEmpty()) {
+            locations.addAll(discoverMapperLocationsFromConfigResources());
+        }
+        if (!locations.isEmpty()) {
+            emitDiagnostic("Resolved mapper-locations from Spring Environment: " + locations);
+            LOG.info("Resolved mapper-locations from Spring Environment: {}", locations);
+        }
+        return locations.isEmpty() ? Collections.<String>emptyList() : new ArrayList<String>(locations);
+    }
+
+    private void addMapperLocationPropertyValues(Set<String> output, Object rawValue) {
+        if (output == null || rawValue == null) {
+            return;
+        }
+        for (String split : splitLocationText(String.valueOf(rawValue))) {
+            String clean = clean(split);
+            if (clean != null && !clean.contains("${")) {
+                output.add(clean);
+            }
+        }
+    }
+
+    private List<String> discoverMapperLocationsFromConfigResources() {
+        LinkedHashSet<String> locations = new LinkedHashSet<String>();
+        PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver(
+                Thread.currentThread().getContextClassLoader()
+        );
+        collectMapperLocationsFromYamlResources(resolver, "classpath*:application*.yml", locations);
+        collectMapperLocationsFromYamlResources(resolver, "classpath*:application*.yaml", locations);
+        collectMapperLocationsFromPropertiesResources(resolver, "classpath*:application*.properties", locations);
+        if (!locations.isEmpty()) {
+            emitDiagnostic("Resolved mapper-locations from config resources: " + locations);
+            LOG.info("Resolved mapper-locations from config resources: {}", locations);
+        }
+        return locations.isEmpty() ? Collections.<String>emptyList() : new ArrayList<String>(locations);
+    }
+
+    private void collectMapperLocationsFromYamlResources(PathMatchingResourcePatternResolver resolver,
+                                                         String pattern,
+                                                         Set<String> output) {
+        Resource[] resources;
+        try {
+            resources = resolver.getResources(pattern);
+        } catch (IOException ignored) {
+            return;
+        }
+        for (Resource resource : resources) {
+            List<String> lines = readResourceLines(resource);
+            if (lines.isEmpty()) {
+                continue;
+            }
+            int mybatisIndent = -1;
+            int mybatisPlusIndent = -1;
+            for (String rawLine : lines) {
+                if (rawLine == null) {
+                    continue;
+                }
+                String line = stripLineComment(rawLine);
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+                int indent = countLeadingSpaces(line);
+                if (mybatisIndent >= 0 && indent <= mybatisIndent && !line.trim().startsWith("mybatis:")) {
+                    mybatisIndent = -1;
+                }
+                if (mybatisPlusIndent >= 0 && indent <= mybatisPlusIndent && !line.trim().startsWith("mybatis-plus:")) {
+                    mybatisPlusIndent = -1;
+                }
+                if (line.trim().startsWith("mybatis:")) {
+                    mybatisIndent = indent;
+                    continue;
+                }
+                if (line.trim().startsWith("mybatis-plus:")) {
+                    mybatisPlusIndent = indent;
+                    continue;
+                }
+                Matcher flatMatcher = FLAT_MAPPER_LOCATION_PATTERN.matcher(line);
+                if (flatMatcher.find()) {
+                    addMapperLocationPropertyValues(output, flatMatcher.group(2));
+                    continue;
+                }
+                Matcher nestedMatcher = YAML_MAPPER_LOCATION_PATTERN.matcher(line);
+                if (!nestedMatcher.find()) {
+                    continue;
+                }
+                if ((mybatisIndent >= 0 && indent > mybatisIndent)
+                        || (mybatisPlusIndent >= 0 && indent > mybatisPlusIndent)) {
+                    addMapperLocationPropertyValues(output, nestedMatcher.group(1));
+                }
+            }
+        }
+    }
+
+    private void collectMapperLocationsFromPropertiesResources(PathMatchingResourcePatternResolver resolver,
+                                                               String pattern,
+                                                               Set<String> output) {
+        Resource[] resources;
+        try {
+            resources = resolver.getResources(pattern);
+        } catch (IOException ignored) {
+            return;
+        }
+        for (Resource resource : resources) {
+            if (resource == null || !resource.exists()) {
+                continue;
+            }
+            Properties properties = new Properties();
+            try {
+                InputStream inputStream = resource.getInputStream();
+                try {
+                    properties.load(inputStream);
+                } finally {
+                    inputStream.close();
+                }
+            } catch (Throwable ignored) {
+                continue;
+            }
+            addMapperLocationPropertyValues(output, properties.getProperty("mybatis.mapper-locations"));
+            addMapperLocationPropertyValues(output, properties.getProperty("mybatis-plus.mapper-locations"));
+            addMapperLocationPropertyValues(output, properties.getProperty("mybatis.mapperLocations"));
+        }
+    }
+
+    private List<String> readResourceLines(Resource resource) {
+        if (resource == null || !resource.exists()) {
+            return Collections.emptyList();
+        }
+        ArrayList<String> lines = new ArrayList<String>();
+        try {
+            InputStream inputStream = resource.getInputStream();
+            try {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    lines.add(line);
+                }
+            } finally {
+                inputStream.close();
+            }
+        } catch (Throwable ignored) {
+            return Collections.emptyList();
+        }
+        return lines;
+    }
+
+    private String stripLineComment(String line) {
+        if (line == null) {
+            return "";
+        }
+        int commentIndex = line.indexOf('#');
+        if (commentIndex < 0) {
+            return line;
+        }
+        return line.substring(0, commentIndex);
+    }
+
+    private int countLeadingSpaces(String text) {
+        if (text == null || text.isEmpty()) {
+            return 0;
+        }
+        int count = 0;
+        while (count < text.length() && Character.isWhitespace(text.charAt(count))) {
+            count++;
+        }
+        return count;
+    }
+
+    private List<String> discoverMybatisScanPackages(ConfigurableListableBeanFactory beanFactory,
+                                                     List<String> beanNames) {
+        if (beanNames == null || beanNames.isEmpty()) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> packages = new LinkedHashSet<String>();
+        for (String beanName : beanNames) {
+            BeanDefinition definition = beanFactory.getBeanDefinition(beanName);
+            String beanClassName = clean(definition.getBeanClassName());
+            if (!isMapperScannerConfigurerDefinition(beanName, beanClassName, definition)) {
+                continue;
+            }
+            PropertyValue basePackage = definition.getPropertyValues().getPropertyValue("basePackage");
+            if (basePackage != null) {
+                for (String split : splitLocationText(String.valueOf(basePackage.getValue()))) {
+                    String clean = clean(split);
+                    if (clean != null) {
+                        packages.add(clean);
+                    }
+                }
+            }
+        }
+        if (!packages.isEmpty()) {
+            emitDiagnostic("Resolved mybatis scan packages from context: " + packages);
+            LOG.info("Resolved mybatis scan packages from context: {}", packages);
+        }
+        return packages.isEmpty() ? Collections.<String>emptyList() : new ArrayList<String>(packages);
+    }
+
+    private boolean isMapperScannerConfigurerDefinition(String beanName,
+                                                        String beanClassName,
+                                                        BeanDefinition definition) {
+        if ("org.mybatis.spring.mapper.MapperScannerConfigurer".equals(beanClassName)) {
+            return true;
+        }
+        PropertyValue basePackage = definition.getPropertyValues().getPropertyValue("basePackage");
+        if (basePackage == null) {
+            return false;
+        }
+        String name = beanName == null ? "" : beanName.toLowerCase();
+        String className = beanClassName == null ? "" : beanClassName.toLowerCase();
+        return name.contains("mapperscanner")
+                || className.contains("mapperscanner")
+                || className.contains("scanner");
     }
 
     private void collectMapperLocationsFromBeanDefinitions(ConfigurableListableBeanFactory beanFactory,
@@ -866,6 +1109,9 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         if (isMapperLocationType(target.typeName)) {
             return "mybatis-mapper-location";
         }
+        if (isMybatisScannedType(target.typeName)) {
+            return "mybatis-scan-package";
+        }
         if (!isBusinessPackage(target.typeName)) {
             return null;
         }
@@ -1063,7 +1309,9 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     }
 
     private boolean isBusinessPackage(String className) {
-        if (packagePrefixes.isEmpty() && mapperLocationPackagePrefixes.isEmpty()) {
+        if (packagePrefixes.isEmpty()
+                && mapperLocationPackagePrefixes.isEmpty()
+                && mybatisScanPackagePrefixes.isEmpty()) {
             return true;
         }
         for (String prefix : packagePrefixes) {
@@ -1072,6 +1320,11 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         for (String prefix : mapperLocationPackagePrefixes) {
+            if (className.equals(prefix) || className.startsWith(prefix + ".")) {
+                return true;
+            }
+        }
+        for (String prefix : mybatisScanPackagePrefixes) {
             if (className.equals(prefix) || className.startsWith(prefix + ".")) {
                 return true;
             }
@@ -1089,6 +1342,28 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         }
         String normalized = normalizeCglibTypeName(clean);
         return normalized != null && mapperLocationTypeNames.contains(normalized);
+    }
+
+    private boolean isMybatisScannedType(String className) {
+        String clean = clean(className);
+        if (clean == null || mybatisScanPackagePrefixes.isEmpty()) {
+            return false;
+        }
+        for (String prefix : mybatisScanPackagePrefixes) {
+            if (clean.equals(prefix) || clean.startsWith(prefix + ".")) {
+                return true;
+            }
+        }
+        String normalized = normalizeCglibTypeName(clean);
+        if (normalized == null) {
+            return false;
+        }
+        for (String prefix : mybatisScanPackagePrefixes) {
+            if (normalized.equals(prefix) || normalized.startsWith(prefix + ".")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean isFrameworkType(String className) {

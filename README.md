@@ -29,6 +29,8 @@ mvn -q -Dmaven.repo.local=.m2repo exec:java \
 - `Spring context started.`
 - `Profiles: [test]`
 - `Mocked bean count: ...`
+- `Resolved mapper-locations from Spring Environment: ...`（支持从 `application*.yml/.yaml/.properties` 发现）
+- `Resolved mybatis scan packages from context: ...`（从 Spring 上下文里的 mapper scanner `basePackage` 提取）
 - `[DEMO] runner finished: ...`（说明启动阶段调用了 Service，Dao/Mapper 没有触发真实外部访问）
 
 ## 3. 运行你的 Spring 工程
