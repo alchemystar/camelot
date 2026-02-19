@@ -337,10 +337,12 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         );
 
         MockTarget target = resolveTarget(beanName, definition);
-        String inferredExpectedType = inferredExpectedTypeByBeanName == null
-                ? null
-                : inferredExpectedTypeByBeanName.get(beanName);
-        String thriftServiceInterface = resolveThriftServiceInterfaceType(definition, evaluation);
+        String inferredExpectedType = sanitizeForcedTargetType(
+                inferredExpectedTypeByBeanName == null
+                        ? null
+                        : findValueByBeanName(inferredExpectedTypeByBeanName, beanName)
+        );
+        String thriftServiceInterface = sanitizeForcedTargetType(resolveThriftServiceInterfaceType(definition, evaluation));
         if (inferredExpectedType != null) {
             target = new MockTarget(inferredExpectedType, false);
             emitDiagnostic("Force-prefix inferred expected-type selected bean '" + beanName
@@ -356,13 +358,29 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                     beanName,
                     thriftServiceInterface);
         } else {
-            String expectedType = resolveForceMockExpectedType(definition, evaluation);
+            String expectedType = sanitizeForcedTargetType(resolveForceMockExpectedType(definition, evaluation));
             if (expectedType != null) {
                 target = new MockTarget(expectedType, false);
                 emitDiagnostic("Force-prefix expected-type selected bean '" + beanName + "' -> '" + expectedType + "'");
                 LOG.info("Force-prefix expected-type selected bean '{}' -> '{}'", beanName, expectedType);
             } else if (target == null) {
-                target = new MockTarget(evaluation.matchedTypeName, false);
+                String matchedType = sanitizeForcedTargetType(evaluation.matchedTypeName);
+                if (matchedType != null) {
+                    target = new MockTarget(matchedType, false);
+                }
+            }
+        }
+        if (target != null && sanitizeForcedTargetType(target.typeName) == null) {
+            String fallbackType = sanitizeForcedTargetType(chooseBestMockTargetType(evaluation.candidateTypes));
+            if (fallbackType != null) {
+                target = new MockTarget(fallbackType, false);
+                emitDiagnostic("Force-prefix fallback selected bean '" + beanName + "' -> '" + fallbackType + "'");
+                LOG.info("Force-prefix fallback selected bean '{}' -> '{}'", beanName, fallbackType);
+            } else {
+                LOG.warn("Force-prefix matched bean '{}' but no usable target type found. candidates={}",
+                        beanName,
+                        evaluation.candidateTypes);
+                return false;
             }
         }
         try {
@@ -1882,6 +1900,9 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
         for (String candidate : candidates) {
             String clean = clean(candidate);
             if (clean == null) {
+                continue;
+            }
+            if (isUnsupportedForcedTargetType(clean)) {
                 continue;
             }
             if (looksLikeProxyTypeName(clean)) {
