@@ -712,12 +712,43 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
     private String resolveServiceInterfaceType(BeanDefinition definition) {
         PropertyValue serviceInterface = definition.getPropertyValues().getPropertyValue("serviceInterface");
         if (serviceInterface != null) {
-            String typeName = asTypeName(serviceInterface.getValue());
+            String typeName = toLooseTypeName(serviceInterface.getValue());
             if (typeName != null) {
                 return typeName;
             }
         }
-        return asTypeName(definition.getAttribute("serviceInterface"));
+        return toLooseTypeName(definition.getAttribute("serviceInterface"));
+    }
+
+    private String toLooseTypeName(Object source) {
+        if (source == null) {
+            return null;
+        }
+        if (source instanceof Class) {
+            return ((Class<?>) source).getName();
+        }
+        Object value = source;
+        if ("org.springframework.beans.factory.config.TypedStringValue".equals(source.getClass().getName())) {
+            try {
+                Method getValue = source.getClass().getMethod("getValue");
+                Object typedValue = getValue.invoke(source);
+                if (typedValue != null) {
+                    value = typedValue;
+                }
+            } catch (Throwable ignored) {
+                // keep source.toString fallback
+            }
+        }
+        String text = String.valueOf(value).trim();
+        if (text.isEmpty()) {
+            return null;
+        }
+        if (text.startsWith("class ")) {
+            text = text.substring("class ".length()).trim();
+        } else if (text.startsWith("interface ")) {
+            text = text.substring("interface ".length()).trim();
+        }
+        return clean(text);
     }
 
     private String asTypeName(Object source) {
