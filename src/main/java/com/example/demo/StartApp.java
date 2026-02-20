@@ -11,6 +11,7 @@ import com.example.demo.thrift.DemoThriftClientProxyRegistrar;
 @Import({DemoThriftClientProxyRegistrar.class, DemoMybatisMapperRegistrar.class})
 public class StartApp {
     public static void main(String[] args) {
+        System.out.println("hahaha");
         SpringApplication.run(StartApp.class, args);
     }
 }

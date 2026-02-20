@@ -228,35 +228,151 @@ public final class SpringBootNativeLauncher {
                                              Set<String> forceMockMissingTypeNames,
                                              boolean suppressSpringApplicationCallbacks,
                                              StartRequest request) {
-        List<String> propertyArgs = mapToKeyValueArgs(launchProperties);
-        InitializerHandle initializerHandle = createMockingInitializerHandle(
-                classLoader,
+        RuntimeLaunchBridgeAccessor bridge = RuntimeLaunchBridgeAccessor.forClassLoader(classLoader);
+        bridge.reset();
+        Method mainMethod = resolveMainMethod(startupClass);
+        List<String> mainArgs = buildMainArgs(
+                activeProfiles,
+                launchProperties,
+                request.getApplicationArgs(),
                 packagePrefixes,
                 forceMockClassPrefixes,
                 forceMockBeanNames,
                 forceMockBeanTargetTypes,
                 forceMockMissingTypeNames
         );
-        Object builder = createBuilderInstance(startupClass, classLoader);
-        builder = invokeBuilder(builder, "profiles", new Class[]{String[].class}, new Object[]{activeProfiles.toArray(new String[0])});
-        builder = invokeBuilder(
-                builder,
-                "initializers",
-                new Class[]{initializerHandle.initializerArrayType},
-                new Object[]{initializerHandle.initializerArray}
-        );
-        suppressSpringApplicationListeners(builder);
-        if (suppressSpringApplicationCallbacks) {
-            suppressSpringApplicationCallbacks(builder);
+        try {
+            mainMethod.invoke(null, (Object) mainArgs.toArray(new String[0]));
+        } catch (Exception invokeError) {
+            throw wrapMainInvocationFailure(invokeError);
         }
-        builder = invokeBuilder(builder, "properties", new Class[]{String[].class}, new Object[]{propertyArgs.toArray(new String[0])});
-        Object contextObject = invokeBuilder(
-                builder,
-                "run",
-                new Class[]{String[].class},
-                new Object[]{request.getApplicationArgs().toArray(new String[0])}
-        );
-        return new RunOutcome(contextObject, initializerHandle.snapshotMockedBeanTypes());
+        Object contextObject = bridge.getContext();
+        if (contextObject == null) {
+            throw new IllegalStateException("Startup main method returned but no Spring context captured");
+        }
+        return new RunOutcome(contextObject, bridge.snapshotMockedBeanTypes());
+    }
+
+    private static Method resolveMainMethod(Class<?> startupClass) {
+        try {
+            Method mainMethod = startupClass.getMethod("main", String[].class);
+            if ((mainMethod.getModifiers() & java.lang.reflect.Modifier.STATIC) == 0) {
+                throw new IllegalStateException("Startup class main method is not static: " + startupClass.getName());
+            }
+            return mainMethod;
+        } catch (NoSuchMethodException noMain) {
+            throw new IllegalStateException("Startup class has no main(String[]) method: " + startupClass.getName(), noMain);
+        }
+    }
+
+    private static List<String> buildMainArgs(List<String> activeProfiles,
+                                              Map<String, String> launchProperties,
+                                              List<String> applicationArgs,
+                                              List<String> packagePrefixes,
+                                              List<String> forceMockClassPrefixes,
+                                              Set<String> forceMockBeanNames,
+                                              Map<String, String> forceMockBeanTargetTypes,
+                                              Set<String> forceMockMissingTypeNames) {
+        LinkedHashSet<String> args = new LinkedHashSet<String>();
+        if (activeProfiles != null && !activeProfiles.isEmpty()) {
+            args.add("--spring.profiles.active=" + joinWithComma(activeProfiles));
+        }
+        if (launchProperties != null && !launchProperties.isEmpty()) {
+            for (Map.Entry<String, String> entry : launchProperties.entrySet()) {
+                if (entry == null || isBlank(entry.getKey())) {
+                    continue;
+                }
+                args.add("--" + entry.getKey().trim() + "=" + (entry.getValue() == null ? "" : entry.getValue()));
+            }
+        }
+        args.add("--context.initializer.classes=com.camelot.runtime.bootstrap.CamelotRuntimeContextInitializer");
+        addEncodedListArg(args, "camelot.mock.scan-packages", packagePrefixes);
+        addEncodedListArg(args, "camelot.mock.force-class-prefixes", forceMockClassPrefixes);
+        addEncodedSetArg(args, "camelot.mock.force-bean-names", forceMockBeanNames);
+        addEncodedMapArg(args, "camelot.mock.force-bean-target-types", forceMockBeanTargetTypes);
+        addEncodedSetArg(args, "camelot.mock.force-missing-type-names", forceMockMissingTypeNames);
+        if (applicationArgs != null && !applicationArgs.isEmpty()) {
+            args.addAll(applicationArgs);
+        }
+        return new ArrayList<String>(args);
+    }
+
+    private static void addEncodedListArg(Set<String> target, String key, List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return;
+        }
+        target.add("--" + key + "=" + joinWithComma(values));
+    }
+
+    private static void addEncodedSetArg(Set<String> target, String key, Set<String> values) {
+        if (values == null || values.isEmpty()) {
+            return;
+        }
+        target.add("--" + key + "=" + joinWithComma(new ArrayList<String>(values)));
+    }
+
+    private static void addEncodedMapArg(Set<String> target, String key, Map<String, String> values) {
+        if (values == null || values.isEmpty()) {
+            return;
+        }
+        List<String> entries = new ArrayList<String>();
+        for (Map.Entry<String, String> entry : values.entrySet()) {
+            if (entry == null || isBlank(entry.getKey()) || isBlank(entry.getValue())) {
+                continue;
+            }
+            entries.add(entry.getKey().trim() + ":" + entry.getValue().trim());
+        }
+        if (!entries.isEmpty()) {
+            target.add("--" + key + "=" + joinWithSemicolon(entries));
+        }
+    }
+
+    private static String joinWithComma(List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (String value : values) {
+            if (isBlank(value)) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(',');
+            }
+            builder.append(value.trim());
+        }
+        return builder.toString();
+    }
+
+    private static String joinWithSemicolon(List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (String value : values) {
+            if (isBlank(value)) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(';');
+            }
+            builder.append(value.trim());
+        }
+        return builder.toString();
+    }
+
+    private static RuntimeException wrapMainInvocationFailure(Exception invokeError) {
+        Throwable error = invokeError;
+        if (invokeError instanceof java.lang.reflect.InvocationTargetException) {
+            Throwable target = ((java.lang.reflect.InvocationTargetException) invokeError).getTargetException();
+            if (target != null) {
+                error = target;
+            }
+        }
+        if (error instanceof RuntimeException) {
+            return (RuntimeException) error;
+        }
+        return new IllegalStateException("Startup main invocation failed", error);
     }
 
     private static String extractFailedBeanName(Throwable error) {
@@ -1202,6 +1318,67 @@ public final class SpringBootNativeLauncher {
             return method.invoke(builder, args);
         } catch (Exception error) {
             throw new IllegalStateException("Failed invoking SpringApplicationBuilder." + methodName + "(...)", error);
+        }
+    }
+
+    private static final class RuntimeLaunchBridgeAccessor {
+        private final Method resetMethod;
+        private final Method getContextMethod;
+        private final Method snapshotMethod;
+
+        private RuntimeLaunchBridgeAccessor(Method resetMethod, Method getContextMethod, Method snapshotMethod) {
+            this.resetMethod = resetMethod;
+            this.getContextMethod = getContextMethod;
+            this.snapshotMethod = snapshotMethod;
+        }
+
+        private static RuntimeLaunchBridgeAccessor forClassLoader(ClassLoader classLoader) {
+            try {
+                Class<?> bridgeClass = Class.forName(
+                        "com.camelot.runtime.bootstrap.RuntimeLaunchBridge",
+                        true,
+                        classLoader
+                );
+                Method reset = bridgeClass.getMethod("reset");
+                Method getContext = bridgeClass.getMethod("getContext");
+                Method snapshot = bridgeClass.getMethod("snapshotMockedBeanTypes");
+                return new RuntimeLaunchBridgeAccessor(reset, getContext, snapshot);
+            } catch (Exception error) {
+                throw new IllegalStateException("Failed to initialize RuntimeLaunchBridge accessor", error);
+            }
+        }
+
+        private void reset() {
+            try {
+                resetMethod.invoke(null);
+            } catch (Exception error) {
+                throw new IllegalStateException("Failed resetting RuntimeLaunchBridge", error);
+            }
+        }
+
+        private Object getContext() {
+            try {
+                return getContextMethod.invoke(null);
+            } catch (Exception error) {
+                throw new IllegalStateException("Failed reading RuntimeLaunchBridge context", error);
+            }
+        }
+
+        private Map<String, String> snapshotMockedBeanTypes() {
+            try {
+                Object result = snapshotMethod.invoke(null);
+                if (!(result instanceof Map)) {
+                    return Collections.emptyMap();
+                }
+                Map<?, ?> source = (Map<?, ?>) result;
+                LinkedHashMap<String, String> converted = new LinkedHashMap<String, String>();
+                for (Map.Entry<?, ?> entry : source.entrySet()) {
+                    converted.put(String.valueOf(entry.getKey()), String.valueOf(entry.getValue()));
+                }
+                return converted;
+            } catch (Exception error) {
+                throw new IllegalStateException("Failed reading RuntimeLaunchBridge mocked beans", error);
+            }
         }
     }
 
