@@ -70,7 +70,7 @@ public final class SpringRuntimeBootstrapMain {
         private final List<String> forceMockClassPrefixes = new ArrayList<String>();
         private final List<String> appArgs = new ArrayList<String>();
         private final Map<String, String> extraProperties = new LinkedHashMap<String, String>();
-        private boolean keepRunning;
+        private boolean keepRunning = true;
 
         private CliOptions() {
             this.profiles.add("test");

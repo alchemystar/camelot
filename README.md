@@ -54,7 +54,7 @@ mvn -q -Dmaven.repo.local=.m2repo exec:java \
 
 - `--profile=test,local`：覆盖默认 profile（默认是 `test`）
 - `--property=key=value`：传入额外 Spring 属性
-- `--keep-running`：启动后不主动关闭上下文
+- `--keep-running`：保持上下文常驻（默认即为常驻）
 - `--scan-package=com.xxx`：手工指定 mock 扫描包（不传时会从启动类注解中自动解析）
 - `--force-mock-class-prefix=a.b.c,d.e.f`：类名前缀白名单（list），命中前缀即直接 mock
 - `--project-dir=/path/to/project`：指定待启动工程目录（从该目录加载 `target/classes`、`target/dependency/*.jar`）
