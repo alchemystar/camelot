@@ -797,6 +797,11 @@ public final class SpringBootNativeLauncher {
                     true,
                     classLoader
             );
+            final Class<?> applicationListenerType = Class.forName(
+                    "org.springframework.context.ApplicationListener",
+                    true,
+                    classLoader
+            );
             final Class<?> postProcessorClass = Class.forName(
                     "com.camelot.runtime.bootstrap.DaoMapperMockPostProcessor",
                     true,
@@ -821,6 +826,7 @@ public final class SpringBootNativeLauncher {
             );
             constructor.setAccessible(true);
             final AtomicReference<Object> postProcessorRef = new AtomicReference<Object>();
+            final Object destroyEventListener = createDestroyEventListener(classLoader, applicationListenerType);
 
             InvocationHandler handler = new InvocationHandler() {
                 @Override
@@ -848,6 +854,11 @@ public final class SpringBootNativeLauncher {
                                 beanFactoryPostProcessorType
                         );
                         addPostProcessor.invoke(context, postProcessor);
+                        Method addApplicationListener = context.getClass().getMethod(
+                                "addApplicationListener",
+                                applicationListenerType
+                        );
+                        addApplicationListener.invoke(context, destroyEventListener);
                         LOG.info("Registered DaoMapperMockPostProcessor into Spring context.");
                         return null;
                     }
@@ -879,6 +890,102 @@ public final class SpringBootNativeLauncher {
         } catch (Exception error) {
             throw new IllegalStateException("Failed to create cross-classloader mocking initializer", error);
         }
+    }
+
+    private static Object createDestroyEventListener(ClassLoader classLoader,
+                                                     final Class<?> applicationListenerType) {
+        InvocationHandler listenerHandler = new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                if (method == null) {
+                    return null;
+                }
+                String methodName = method.getName();
+                if ("onApplicationEvent".equals(methodName) && args != null && args.length == 1) {
+                    onDestroyEvent(args[0]);
+                    return null;
+                }
+                if ("toString".equals(methodName) && method.getParameterTypes().length == 0) {
+                    return "DestroyEventListenerProxy";
+                }
+                if ("hashCode".equals(methodName) && method.getParameterTypes().length == 0) {
+                    return Integer.valueOf(System.identityHashCode(proxy));
+                }
+                if ("equals".equals(methodName) && method.getParameterTypes().length == 1) {
+                    return Boolean.valueOf(proxy == args[0]);
+                }
+                return null;
+            }
+        };
+        return java.lang.reflect.Proxy.newProxyInstance(
+                classLoader,
+                new Class[]{applicationListenerType},
+                listenerHandler
+        );
+    }
+
+    private static void onDestroyEvent(Object event) {
+        if (event == null) {
+            return;
+        }
+        String eventType = event.getClass().getName();
+        if (!eventType.endsWith("ContextClosedEvent") && !eventType.endsWith("ContextStoppedEvent")) {
+            return;
+        }
+        Throwable trace = new Throwable("Spring context destroy trace");
+        String threadName = Thread.currentThread().getName();
+        String trigger = inferDestroyTrigger(trace.getStackTrace(), threadName);
+        LOG.warn(
+                "Observed Spring destroy event. eventType={} trigger={} thread={} stack:\n{}",
+                eventType,
+                trigger,
+                threadName,
+                stackTraceToString(trace)
+        );
+    }
+
+    private static String inferDestroyTrigger(StackTraceElement[] stack, String threadName) {
+        if (threadName != null && threadName.contains("spring-runtime-shutdown")) {
+            return "runtime-shutdown-hook";
+        }
+        if (threadName != null
+                && (threadName.contains("SpringContextShutdownHook")
+                || threadName.contains("ShutdownHook"))) {
+            return "jvm-shutdown-hook";
+        }
+        if (containsStack(stack, "com.camelot.runtime.bootstrap.SpringRuntimeBootstrapMain", "safeClose")) {
+            return "bootstrap-safe-close";
+        }
+        if (containsStack(stack, "org.springframework.boot.SpringApplication", "handleRunFailure")) {
+            return "spring-run-failure";
+        }
+        if (containsStack(stack, "org.springframework.context.support.AbstractApplicationContext", "close")) {
+            return "application-context-close";
+        }
+        return "unknown";
+    }
+
+    private static boolean containsStack(StackTraceElement[] stack, String className, String methodName) {
+        if (stack == null || className == null || methodName == null) {
+            return false;
+        }
+        for (StackTraceElement element : stack) {
+            if (element == null) {
+                continue;
+            }
+            if (className.equals(element.getClassName()) && methodName.equals(element.getMethodName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String stackTraceToString(Throwable throwable) {
+        StringWriter writer = new StringWriter();
+        PrintWriter printWriter = new PrintWriter(writer);
+        throwable.printStackTrace(printWriter);
+        printWriter.flush();
+        return writer.toString();
     }
 
     private static List<String> resolveMapperLocationsFromEnvironment(Object context) {
