@@ -49,8 +49,13 @@ public final class CamelotRuntimeContextInitializer
                 mapperLocations,
                 forceMissingTypeNames
         );
+        CallChainCollector callChainCollector = new CallChainCollector();
+        CallChainTracingBeanPostProcessor tracingPostProcessor =
+                new CallChainTracingBeanPostProcessor(callChainCollector, scanPackages);
         RuntimeLaunchBridge.setPostProcessor(postProcessor);
+        RuntimeLaunchBridge.setCallChainCollector(callChainCollector);
         context.addBeanFactoryPostProcessor(postProcessor);
+        context.addBeanFactoryPostProcessor(beanFactory -> beanFactory.addBeanPostProcessor(tracingPostProcessor));
         context.addApplicationListener(new ApplicationListener<ApplicationEvent>() {
             @Override
             public void onApplicationEvent(ApplicationEvent event) {

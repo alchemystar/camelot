@@ -25,6 +25,17 @@ public final class SpringRuntimeBootstrapMain {
         for (Map.Entry<String, String> entry : result.getMockedBeanTypes().entrySet()) {
             System.out.println("  - " + entry.getKey() + " -> " + entry.getValue());
         }
+        if (options.entrySignature != null && !options.entrySignature.trim().isEmpty()) {
+            EntryCallChainExecutor.InvokeResult invokeResult = EntryCallChainExecutor.invokeAndWriteDot(
+                    result.getContext(),
+                    options.entrySignature,
+                    options.dotFilePath
+            );
+            System.out.println("Entry invoked: " + invokeResult.getSignature());
+            System.out.println("Entry method: " + invokeResult.getDeclaringClass() + "#" + invokeResult.getMethodName());
+            System.out.println("Entry return: " + String.valueOf(invokeResult.getReturnValue()));
+            System.out.println("Call chain dot: " + invokeResult.getDotPath());
+        }
 
         if (options.keepRunning) {
             Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
@@ -71,6 +82,8 @@ public final class SpringRuntimeBootstrapMain {
         private final List<String> appArgs = new ArrayList<String>();
         private final Map<String, String> extraProperties = new LinkedHashMap<String, String>();
         private boolean keepRunning = true;
+        private String entrySignature;
+        private String dotFilePath = "call-chain.dot";
 
         private CliOptions() {
             this.profiles.add("test");
@@ -116,6 +129,14 @@ public final class SpringRuntimeBootstrapMain {
                     String key = raw.substring(0, split).trim();
                     String value = raw.substring(split + 1).trim();
                     options.extraProperties.put(key, value);
+                    continue;
+                }
+                if (arg.startsWith("--entry=")) {
+                    options.entrySignature = arg.substring("--entry=".length()).trim();
+                    continue;
+                }
+                if (arg.startsWith("--dot-file=")) {
+                    options.dotFilePath = arg.substring("--dot-file=".length()).trim();
                     continue;
                 }
                 if ("--keep-running".equals(arg)) {

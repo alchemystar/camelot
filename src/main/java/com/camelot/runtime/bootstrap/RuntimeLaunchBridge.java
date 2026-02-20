@@ -12,6 +12,8 @@ public final class RuntimeLaunchBridge {
             new AtomicReference<ConfigurableApplicationContext>();
     private static final AtomicReference<DaoMapperMockPostProcessor> LAST_POST_PROCESSOR =
             new AtomicReference<DaoMapperMockPostProcessor>();
+    private static final AtomicReference<CallChainCollector> LAST_CALL_CHAIN_COLLECTOR =
+            new AtomicReference<CallChainCollector>();
 
     private RuntimeLaunchBridge() {
     }
@@ -19,6 +21,7 @@ public final class RuntimeLaunchBridge {
     public static void reset() {
         LAST_CONTEXT.set(null);
         LAST_POST_PROCESSOR.set(null);
+        LAST_CALL_CHAIN_COLLECTOR.set(null);
     }
 
     public static void setContext(ConfigurableApplicationContext context) {
@@ -39,5 +42,24 @@ public final class RuntimeLaunchBridge {
             return Collections.emptyMap();
         }
         return postProcessor.snapshotMockedBeanTypes();
+    }
+
+    public static void setCallChainCollector(CallChainCollector collector) {
+        LAST_CALL_CHAIN_COLLECTOR.set(collector);
+    }
+
+    public static void clearCallChain() {
+        CallChainCollector collector = LAST_CALL_CHAIN_COLLECTOR.get();
+        if (collector != null) {
+            collector.clear();
+        }
+    }
+
+    public static String snapshotCallChainDot() {
+        CallChainCollector collector = LAST_CALL_CHAIN_COLLECTOR.get();
+        if (collector == null) {
+            return "digraph CallChain {\n}\n";
+        }
+        return collector.toDot();
     }
 }
