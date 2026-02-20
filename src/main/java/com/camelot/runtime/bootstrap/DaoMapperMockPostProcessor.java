@@ -216,6 +216,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 RootBeanDefinition replacement = buildNoOpMockBeanDefinition(expectedType);
                 replacement.setPrimary(true);
                 registry.registerBeanDefinition(beanName, replacement);
+                registerTypeNameAliases(registry, beanName, expectedType);
                 mockedBeanTypes.put(beanName, expectedType);
                 mockedBeanNames.add(beanName);
                 emitDiagnostic("Pre-register mock bean '" + beanName + "' as '" + expectedType
@@ -239,6 +240,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 RootBeanDefinition replacement = buildNoOpMockBeanDefinition(typeName);
                 replacement.setPrimary(true);
                 registry.registerBeanDefinition(generatedBeanName, replacement);
+                registerTypeNameAliases(registry, generatedBeanName, typeName);
                 mockedBeanTypes.put(generatedBeanName, typeName);
                 mockedBeanNames.add(generatedBeanName);
                 emitDiagnostic("Pre-register mock bean '" + generatedBeanName + "' as '" + typeName
@@ -262,6 +264,7 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
                 RootBeanDefinition replacement = buildNoOpMockBeanDefinition(typeName);
                 replacement.setPrimary(true);
                 registry.registerBeanDefinition(generatedBeanName, replacement);
+                registerTypeNameAliases(registry, generatedBeanName, typeName);
                 mockedBeanTypes.put(generatedBeanName, typeName);
                 mockedBeanNames.add(generatedBeanName);
                 emitDiagnostic("Pre-register mock bean '" + generatedBeanName + "' as '" + typeName
@@ -294,8 +297,8 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             simpleName = "daoMapperMock";
         }
         LinkedHashSet<String> candidates = new LinkedHashSet<String>();
-        candidates.add(simpleName);
         candidates.add(Introspector.decapitalize(simpleName));
+        candidates.add(simpleName);
         candidates.add(Character.toLowerCase(simpleName.charAt(0)) + simpleName.substring(1));
         for (String candidate : candidates) {
             if (candidate == null || candidate.trim().isEmpty()) {
@@ -341,6 +344,42 @@ final class DaoMapperMockPostProcessor implements BeanDefinitionRegistryPostProc
             }
         }
         return false;
+    }
+
+    private void registerTypeNameAliases(BeanDefinitionRegistry registry,
+                                         String primaryBeanName,
+                                         String typeName) {
+        if (registry == null) {
+            return;
+        }
+        String cleanPrimary = clean(primaryBeanName);
+        String cleanType = clean(typeName);
+        if (cleanPrimary == null || cleanType == null) {
+            return;
+        }
+        String simpleName = cleanType;
+        int split = cleanType.lastIndexOf('.');
+        if (split >= 0 && split < cleanType.length() - 1) {
+            simpleName = cleanType.substring(split + 1);
+        }
+        LinkedHashSet<String> aliases = new LinkedHashSet<String>(beanNameCandidates(simpleName));
+        aliases.remove(cleanPrimary);
+        for (String alias : aliases) {
+            String cleanAlias = clean(alias);
+            if (cleanAlias == null || cleanAlias.equals(cleanPrimary)) {
+                continue;
+            }
+            if (registry.containsBeanDefinition(cleanAlias) || registry.isAlias(cleanAlias)) {
+                continue;
+            }
+            try {
+                registry.registerAlias(cleanPrimary, cleanAlias);
+                emitDiagnostic("Register alias '" + cleanAlias + "' -> '" + cleanPrimary + "'");
+                LOG.info("Register alias '{}' -> '{}'", cleanAlias, cleanPrimary);
+            } catch (Throwable ignored) {
+                // ignore alias conflicts
+            }
+        }
     }
 
     private boolean tryMockByForcePrefix(BeanDefinitionRegistry registry,
