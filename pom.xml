@@ -32,6 +32,16 @@
             <artifactId>mybatis-spring</artifactId>
             <version>${mybatis.spring.version}</version>
         </dependency>
+        <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy</artifactId>
+            <version>1.14.18</version>
+        </dependency>
+        <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy-agent</artifactId>
+            <version>1.14.18</version>
+        </dependency>
     </dependencies>
 
     <build>

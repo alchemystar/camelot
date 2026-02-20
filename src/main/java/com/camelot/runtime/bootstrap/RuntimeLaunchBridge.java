@@ -22,6 +22,8 @@ public final class RuntimeLaunchBridge {
         LAST_CONTEXT.set(null);
         LAST_POST_PROCESSOR.set(null);
         LAST_CALL_CHAIN_COLLECTOR.set(null);
+        MethodPathRuntime.clear();
+        MethodPathRuntime.disable();
     }
 
     public static void setContext(ConfigurableApplicationContext context) {
@@ -44,11 +46,8 @@ public final class RuntimeLaunchBridge {
         return postProcessor.snapshotMockedBeanTypes();
     }
 
-    public static void setCallChainCollector(CallChainCollector collector) {
-        LAST_CALL_CHAIN_COLLECTOR.set(collector);
-    }
-
     public static void clearCallChain() {
+        MethodPathRuntime.clear();
         CallChainCollector collector = LAST_CALL_CHAIN_COLLECTOR.get();
         if (collector != null) {
             collector.clear();
@@ -56,10 +55,25 @@ public final class RuntimeLaunchBridge {
     }
 
     public static String snapshotCallChainDot() {
+        if (MethodPathRuntime.hasData()) {
+            return MethodPathRuntime.toDot();
+        }
         CallChainCollector collector = LAST_CALL_CHAIN_COLLECTOR.get();
         if (collector == null) {
             return "digraph CallChain {\n}\n";
         }
         return collector.toDot();
+    }
+
+    public static void enableCallChain() {
+        MethodPathRuntime.enable();
+    }
+
+    public static void disableCallChain() {
+        MethodPathRuntime.disable();
+    }
+
+    public static void setCallChainCollector(CallChainCollector collector) {
+        LAST_CALL_CHAIN_COLLECTOR.set(collector);
     }
 }

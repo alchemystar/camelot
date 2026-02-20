@@ -48,6 +48,12 @@ final class CallChainCollector {
         }
     }
 
+    boolean hasData() {
+        synchronized (this) {
+            return !nodes.isEmpty() || !edges.isEmpty();
+        }
+    }
+
     String toDot() {
         List<String> snapshotNodes;
         List<Edge> snapshotEdges;

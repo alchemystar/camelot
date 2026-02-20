@@ -70,6 +70,11 @@ mvn -q -Dmaven.repo.local=.m2repo exec:java \
   -Dexec.args="--startup-class=com.example.demo.StartApp --profile=test --entry=com.example.demo.service.PaymentService#pay/1 --dot-file=/tmp/camelot-pay.dot"
 ```
 
+调用链采集说明：
+
+- 只记录工程内部包（按启动类 `scan-package` 推导）的方法节点，不包含第三方 jar 包方法。
+- 采集窗口只覆盖 entry 执行期间（启动阶段的调用不会混入 DOT）。
+
 兼容说明：
 
 - 如果启动时遇到 `ApplicationServletEnvironment`（或拼写为 `ApplicaitonServletEnvironment`）相关 `ClassNotFoundException`，启动器会自动降级到 `spring.main.web-application-type=none` 再重试一次。

@@ -230,6 +230,7 @@ public final class SpringBootNativeLauncher {
                                              StartRequest request) {
         RuntimeLaunchBridgeAccessor bridge = RuntimeLaunchBridgeAccessor.forClassLoader(classLoader);
         bridge.reset();
+        MethodPathInstrumentation.installIfNeeded(packagePrefixes);
         Method mainMethod = resolveMainMethod(startupClass);
         List<String> mainArgs = buildMainArgs(
                 activeProfiles,

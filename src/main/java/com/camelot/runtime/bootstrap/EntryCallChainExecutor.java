@@ -45,7 +45,13 @@ final class EntryCallChainExecutor {
         Object[] args = buildArgs(method.getParameterTypes());
 
         invokeBridgeNoArg(context, "clearCallChain");
-        Object returnValue = invokeMethod(bean, method, args);
+        invokeBridgeNoArg(context, "enableCallChain");
+        Object returnValue;
+        try {
+            returnValue = invokeMethod(bean, method, args);
+        } finally {
+            invokeBridgeNoArg(context, "disableCallChain");
+        }
         String dotText = invokeBridgeString(context, "snapshotCallChainDot");
         Path dotPath = writeDot(dotFilePath, dotText);
         return new InvokeResult(spec.asText(), method.getDeclaringClass().getName(), method.getName(), dotPath, returnValue);
