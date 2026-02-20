@@ -98,7 +98,7 @@ public final class SpringBootNativeLauncher {
             boolean servletFallbackApplied = false;
             boolean suppressSpringApplicationCallbacks = false;
             RunOutcome outcome = null;
-            IllegalStateException lastError = null;
+            RuntimeException lastError = null;
             int attempt = 0;
             while (true) {
                 attempt++;
@@ -118,7 +118,7 @@ public final class SpringBootNativeLauncher {
                     );
                     lastError = null;
                     break;
-                } catch (IllegalStateException runError) {
+                } catch (RuntimeException runError) {
                     lastError = runError;
                     LOG.warn("Spring startup attempt {} failed, apply mock fallback and retry.", Integer.valueOf(attempt));
                     if (!servletFallbackApplied && isMissingServletEnvironmentClass(runError)) {
