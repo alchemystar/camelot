@@ -122,6 +122,7 @@ public class SpringCallPathAnalyzer {
 
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         mapper.writeValue(jsonPath.toFile(), report);
+        mapper.writeValue(externalBeansPath.toFile(), report.externalBeanRegistry);
         Files.write(dotPath, report.toDot().getBytes(StandardCharsets.UTF_8));
         Files.write(beanDotPath, report.toBeanDot().getBytes(StandardCharsets.UTF_8));
         Files.write(dependencyTreePath, report.toDependencyTreeText().getBytes(StandardCharsets.UTF_8));
@@ -388,7 +389,8 @@ public class SpringCallPathAnalyzer {
                 methodDisplay,
                 filteredEdges,
                 endpointPaths,
-                collectBeanClasses(beanRegistry)
+                collectBeanClasses(beanRegistry),
+                beanRegistry
         );
         } finally {
             this.debugLogger = previousLogger;
@@ -1246,17 +1248,25 @@ public class SpringCallPathAnalyzer {
                 if (beanId == null || isBlank(beanId)) {
                     beanId = decapitalize(classModel.simpleName);
                 }
-                registry.beanIdToClasses.computeIfAbsent(beanId, k -> new LinkedHashSet<>()).add(classModel.fqcn);
+                registry.registerBean(beanId, classModel.fqcn, "ANNOTATION");
             }
         }
 
         for (Map.Entry<String, String> entry : xmlModel.beansById.entrySet()) {
             String beanId = entry.getKey();
             String className = entry.getValue();
-            registry.beanIdToClasses.computeIfAbsent(beanId, k -> new LinkedHashSet<>()).add(className);
+            registry.registerBean(beanId, className, "XML");
         }
 
         registry.aliasToName.putAll(xmlModel.aliasToName);
+        for (Map.Entry<String, String> aliasEntry : xmlModel.aliasToName.entrySet()) {
+            String alias = aliasEntry.getKey();
+            String target = aliasEntry.getValue();
+            Set<String> targetClasses = registry.beanIdToClasses.getOrDefault(target, Collections.<String>emptySet());
+            for (String targetClass : targetClasses) {
+                registry.registerBean(alias, targetClass, "ALIAS");
+            }
+        }
         return registry;
     }
 
@@ -1277,7 +1287,8 @@ public class SpringCallPathAnalyzer {
                     }
                     Set<String> byBean = resolveClassesByBeanId(resourceName, beanRegistry, javaModel);
                     if (!byBean.isEmpty()) {
-                        targetsByField.computeIfAbsent(fieldModel.name, k -> new TargetSet()).addAll(byBean, "XML/ANNOTATION:resource");
+                        Set<String> sourceBeanNames = beanRegistry.beanClassToNames.getOrDefault(classModel.fqcn, Collections.<String>emptySet());
+                        targetsByField.computeIfAbsent(fieldModel.name, k -> new TargetSet()).addAll(byBean, Collections.<String>emptySet(), sourceBeanNames, "XML/ANNOTATION:resource");
                         resolvedByResourceName = true;
                     }
                 }
@@ -1291,8 +1302,9 @@ public class SpringCallPathAnalyzer {
                                 javaModel,
                                 beanRegistry
                         );
+                        Set<String> sourceBeanNames = beanRegistry.beanClassToNames.getOrDefault(classModel.fqcn, Collections.<String>emptySet());
                         targetsByField.computeIfAbsent(fieldModel.name, k -> new TargetSet())
-                                .addAll(narrowed.targets, narrowed.reason);
+                                .addAll(narrowed.targets, Collections.<String>emptySet(), sourceBeanNames, narrowed.reason);
                     }
                 }
             }
@@ -1310,8 +1322,9 @@ public class SpringCallPathAnalyzer {
                     if (!"ANNOTATION:type".equals(narrowed.reason)) {
                         reason = reason + "+" + narrowed.reason;
                     }
+                    Set<String> sourceBeanNames = beanRegistry.beanClassToNames.getOrDefault(classModel.fqcn, Collections.<String>emptySet());
                     targetsByField.computeIfAbsent(ctorEntry.getKey(), k -> new TargetSet())
-                            .addAll(narrowed.targets, reason);
+                            .addAll(narrowed.targets, Collections.<String>emptySet(), sourceBeanNames, reason);
                 }
             }
         }
@@ -1331,7 +1344,12 @@ public class SpringCallPathAnalyzer {
 
             for (String fromClass : fromClasses) {
                 Map<String, TargetSet> targetsByField = registry.targetsByClass.computeIfAbsent(fromClass, k -> new LinkedHashMap<>());
-                targetsByField.computeIfAbsent(propertyRef.propertyName, k -> new TargetSet()).addAll(toClasses, "XML:property-ref");
+                Set<String> sourceBeanNames = beanRegistry.beanClassToNames.getOrDefault(fromClass, Collections.<String>emptySet());
+                Set<String> targetBeanNames = new LinkedHashSet<String>();
+                for (String toClass : toClasses) {
+                    targetBeanNames.addAll(beanRegistry.beanClassToNames.getOrDefault(toClass, Collections.<String>emptySet()));
+                }
+                targetsByField.computeIfAbsent(propertyRef.propertyName, k -> new TargetSet()).addAll(toClasses, targetBeanNames, sourceBeanNames, "XML:property-ref");
             }
         }
 
@@ -1480,7 +1498,8 @@ public class SpringCallPathAnalyzer {
                     accumulator.to,
                     String.join("|", accumulator.reasons),
                     accumulator.line,
-                    listOf()
+                    listOf(),
+                    new ArrayList<String>(accumulator.targetBeanNames)
             ));
         }
         edges.sort(Comparator.comparing((CallEdge e) -> e.from).thenComparing(e -> e.to));
@@ -1641,14 +1660,14 @@ public class SpringCallPathAnalyzer {
                     String stopReason = detectUnsupportedStopReason(call);
                     if (!isBlank(stopReason)) {
                         String reason = enrichReasonWithEvidence("STOP:" + stopReason, call);
-                        addEdge(edgeMap, methodModel.id, toStopNodeId(stopReason), reason, call.line);
+                        addEdge(edgeMap, methodModel.id, toStopNodeId(stopReason), reason, call.line, Collections.<String>emptySet());
                     }
                     continue;
                 }
 
                 for (ResolvedCallTarget candidate : candidates) {
                     String reason = enrichReasonWithEvidence(candidate.reason, call);
-                    addEdge(edgeMap, methodModel.id, candidate.methodId, reason, call.line);
+                    addEdge(edgeMap, methodModel.id, candidate.methodId, reason, call.line, Collections.<String>emptySet());
 
                     MethodModel calleeMethod = methodsById.get(candidate.methodId);
                     if (calleeMethod == null) {
@@ -3045,7 +3064,7 @@ public class SpringCallPathAnalyzer {
                         );
                     }
                     for (Map.Entry<String, String> candidate : candidates.entrySet()) {
-                        addEdge(edgeMap, methodModel.id, candidate.getKey(), candidate.getValue(), call.line);
+                        addEdge(edgeMap, methodModel.id, candidate.getKey(), candidate.getValue(), call.line, Collections.<String>emptySet());
                     }
 
                     Map<String, String> pipelineCandidates = resolvePipelineAssemblyCandidates(
@@ -3058,7 +3077,7 @@ public class SpringCallPathAnalyzer {
                             candidates
                     );
                     for (Map.Entry<String, String> candidate : pipelineCandidates.entrySet()) {
-                        addEdge(edgeMap, methodModel.id, candidate.getKey(), candidate.getValue(), call.line);
+                        addEdge(edgeMap, methodModel.id, candidate.getKey(), candidate.getValue(), call.line, Collections.<String>emptySet());
                     }
                 }
             }
@@ -3071,7 +3090,8 @@ public class SpringCallPathAnalyzer {
                     accumulator.to,
                     String.join("|", accumulator.reasons),
                     accumulator.line,
-                    listOf()
+                    listOf(),
+                    new ArrayList<String>(accumulator.targetBeanNames)
             ));
         }
         edges.sort(Comparator.comparing((CallEdge e) -> e.from).thenComparing(e -> e.to));
@@ -3089,7 +3109,8 @@ public class SpringCallPathAnalyzer {
                          String fromMethodId,
                          String toMethodId,
                          String reason,
-                         int line) {
+                         int line,
+                         Collection<String> targetBeanNames) {
         String key = fromMethodId + "->" + toMethodId;
         CallEdgeAccumulator accumulator = edgeMap.get(key);
         if (accumulator == null) {
@@ -3106,6 +3127,9 @@ public class SpringCallPathAnalyzer {
             );
         }
         accumulator.reasons.add(reason);
+        if (targetBeanNames != null) {
+            accumulator.targetBeanNames.addAll(targetBeanNames);
+        }
         debugLogger.log(
                 "EDGE_ADD from=%s to=%s reason=%s line=%d",
                 fromMethodId,
@@ -5763,6 +5787,7 @@ public class SpringCallPathAnalyzer {
         public final List<CallEdge> edges;
         public final List<EndpointPaths> endpoints;
         public final Set<String> beanClassNames;
+        public final BeanRegistry beanRegistry;
 
         public CodeAnalysisResult(String projectRoot,
                                   JavaModel javaModel,
@@ -5770,7 +5795,8 @@ public class SpringCallPathAnalyzer {
                                   Map<String, String> methodDisplay,
                                   List<CallEdge> edges,
                                   List<EndpointPaths> endpoints,
-                                  Set<String> beanClassNames) {
+                                  Set<String> beanClassNames,
+                                  BeanRegistry beanRegistry) {
             this.projectRoot = projectRoot;
             this.javaModel = javaModel;
             this.methodsById = methodsById;
@@ -5780,6 +5806,7 @@ public class SpringCallPathAnalyzer {
             this.beanClassNames = beanClassNames == null
                     ? Collections.<String>emptySet()
                     : new LinkedHashSet<String>(beanClassNames);
+            this.beanRegistry = beanRegistry == null ? new BeanRegistry() : beanRegistry;
         }
     }
 
@@ -6071,6 +6098,7 @@ public class SpringCallPathAnalyzer {
         public final List<String> externalDependencyTypes;
         public final String callReason;
         public final int line;
+        public final List<String> targetBeanNames;
         public final DependencyNode child;
 
         public DependencyEdge(String fromMethodId,
@@ -6079,6 +6107,7 @@ public class SpringCallPathAnalyzer {
                               List<String> externalDependencyTypes,
                               String callReason,
                               int line,
+                              List<String> targetBeanNames,
                               DependencyNode child) {
             this.fromMethodId = fromMethodId;
             this.toMethodId = toMethodId;
@@ -6086,6 +6115,7 @@ public class SpringCallPathAnalyzer {
             this.externalDependencyTypes = externalDependencyTypes;
             this.callReason = callReason;
             this.line = line;
+            this.targetBeanNames = targetBeanNames == null ? new ArrayList<String>() : targetBeanNames;
             this.child = child;
         }
     }
@@ -6110,6 +6140,20 @@ public class SpringCallPathAnalyzer {
         }
     }
 
+
+    public static class ExternalBeanRegistration {
+        public final String beanName;
+        public final String beanClass;
+        public final String dependencyType;
+        public final String source;
+
+        public ExternalBeanRegistration(String beanName, String beanClass, String dependencyType, String source) {
+            this.beanName = beanName;
+            this.beanClass = beanClass;
+            this.dependencyType = dependencyType;
+            this.source = source;
+        }
+    }
     public static class CallEdge {
         public final String from;
         public final String to;
@@ -6182,6 +6226,23 @@ public class SpringCallPathAnalyzer {
     public static class BeanRegistry {
         public final Map<String, Set<String>> beanIdToClasses = new LinkedHashMap<>();
         public final Map<String, String> aliasToName = new LinkedHashMap<>();
+        public final Map<String, String> beanNameToClass = new LinkedHashMap<>();
+        public final Map<String, Set<String>> beanClassToNames = new LinkedHashMap<>();
+        public final Map<String, String> beanNameSource = new LinkedHashMap<>();
+
+        public void registerBean(String beanName, String beanClass, String source) {
+            if (isBlank(beanName) || isBlank(beanClass)) {
+                return;
+            }
+            beanIdToClasses.computeIfAbsent(beanName, k -> new LinkedHashSet<String>()).add(beanClass);
+            if (!beanNameToClass.containsKey(beanName)) {
+                beanNameToClass.put(beanName, beanClass);
+            }
+            beanClassToNames.computeIfAbsent(beanClass, k -> new LinkedHashSet<String>()).add(beanName);
+            if (!isBlank(source) && !beanNameSource.containsKey(beanName)) {
+                beanNameSource.put(beanName, source);
+            }
+        }
     }
 
     public static class InjectionRegistry {
@@ -6190,15 +6251,33 @@ public class SpringCallPathAnalyzer {
 
     public static class TargetSet {
         public final Set<String> targets = new LinkedHashSet<>();
+        public final Set<String> targetBeanNames = new LinkedHashSet<>();
+        public final Set<String> injectionSourceBeanNames = new LinkedHashSet<>();
         public final Set<String> reasons = new LinkedHashSet<>();
 
         public void addAll(Set<String> entries, String reason) {
-            targets.addAll(entries);
+            addAll(entries, Collections.<String>emptySet(), Collections.<String>emptySet(), reason);
+        }
+
+        public void addAll(Set<String> entries, Set<String> beanNames, Set<String> sourceBeanNames, String reason) {
+            if (entries != null) {
+                targets.addAll(entries);
+            }
+            if (beanNames != null) {
+                targetBeanNames.addAll(beanNames);
+            }
+            if (sourceBeanNames != null) {
+                injectionSourceBeanNames.addAll(sourceBeanNames);
+            }
             reasons.add(reason);
         }
 
         public String reasonSummary() {
-            return String.join("|", reasons);
+            String base = String.join("|", reasons);
+            if (injectionSourceBeanNames.isEmpty()) {
+                return base;
+            }
+            return base + "|CHAIN:injectionSourceBeanName=" + String.join(",", injectionSourceBeanNames);
         }
     }
 
@@ -6650,6 +6729,7 @@ public class SpringCallPathAnalyzer {
         public final String from;
         public final String to;
         public final Set<String> reasons = new LinkedHashSet<>();
+        public final Set<String> targetBeanNames = new LinkedHashSet<String>();
         public final int line;
         public int occurrences = 1;
 
@@ -6675,7 +6755,8 @@ public class SpringCallPathAnalyzer {
                                                String toMethodDisplay,
                                                List<String> dependencyTypes,
                                                String callReason,
-                                               int line) {
+                                               int line,
+                                               List<String> targetBeanNames) {
             MutableDependencyEdge edge = childrenByTarget.get(toMethodId);
             if (edge == null) {
                 edge = new MutableDependencyEdge(
@@ -6683,12 +6764,16 @@ public class SpringCallPathAnalyzer {
                         toMethodId,
                         toMethodDisplay,
                         callReason,
-                        line
+                        line,
+                        targetBeanNames
                 );
                 childrenByTarget.put(toMethodId, edge);
             }
             if (dependencyTypes != null) {
                 edge.externalDependencyTypes.addAll(dependencyTypes);
+            }
+            if (targetBeanNames != null) {
+                edge.targetBeanNames.addAll(targetBeanNames);
             }
             return edge.child;
         }
@@ -6703,6 +6788,7 @@ public class SpringCallPathAnalyzer {
                         new ArrayList<String>(edge.externalDependencyTypes),
                         edge.callReason,
                         edge.line,
+                        new ArrayList<String>(edge.targetBeanNames),
                         edge.child.toImmutable()
                 ));
             }
@@ -6717,18 +6803,23 @@ public class SpringCallPathAnalyzer {
         private final Set<String> externalDependencyTypes = new LinkedHashSet<String>();
         private final String callReason;
         private final int line;
+        private final Set<String> targetBeanNames = new LinkedHashSet<String>();
         private final MutableDependencyNode child;
 
         private MutableDependencyEdge(String fromMethodId,
                                       String toMethodId,
                                       String toMethodDisplay,
                                       String callReason,
-                                      int line) {
+                                      int line,
+                                      List<String> targetBeanNames) {
             this.fromMethodId = fromMethodId;
             this.toMethodId = toMethodId;
             this.toMethodDisplay = toMethodDisplay;
             this.callReason = callReason;
             this.line = line;
+            if (targetBeanNames != null) {
+                this.targetBeanNames.addAll(targetBeanNames);
+            }
             this.child = new MutableDependencyNode(toMethodId, toMethodDisplay);
         }
     }
