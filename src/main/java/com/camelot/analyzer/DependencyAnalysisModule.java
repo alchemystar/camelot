@@ -59,15 +59,20 @@ public class DependencyAnalysisModule {
                 normalizedNonExternalRpcPrefixes,
                 logger
         );
+        List<SpringCallPathAnalyzer.CallEdge> strengthEdges = computeDependencyStrength(
+                enrichedEdges,
+                codeResult.methodsById,
+                logger
+        );
         List<SpringCallPathAnalyzer.ExternalDependencyTree> trees = buildExternalDependencyTrees(
                 codeResult.endpoints,
-                enrichedEdges,
+                strengthEdges,
                 codeResult.methodDisplay,
                 logger
         );
         List<SpringCallPathAnalyzer.BeanDependencyEdge> beanDependencies = buildBeanDependencyEdges(
                 codeResult,
-                enrichedEdges,
+                strengthEdges,
                 logger
         );
         List<SpringCallPathAnalyzer.EndpointDependencySummary> endpointDependencySummaries = buildEndpointDependencySummaries(
@@ -78,8 +83,8 @@ public class DependencyAnalysisModule {
                 logger
         );
 
-        logger.log("DEPENDENCY_ANALYSIS_DONE edges=%d trees=%d beanDeps=%d endpointDeps=%d",
-                enrichedEdges.size(),
+        logger.log("DEPENDENCY_ANALYSIS_DONE edges=%d trees=%d beanDeps=%d",
+                strengthEdges.size(),
                 trees.size(),
                 beanDependencies.size(),
                 endpointDependencySummaries.size());
@@ -87,7 +92,7 @@ public class DependencyAnalysisModule {
                 Instant.now().toString(),
                 codeResult.projectRoot,
                 codeResult.methodDisplay,
-                enrichedEdges,
+                strengthEdges,
                 codeResult.endpoints,
                 beanDependencies,
                 trees,
@@ -252,6 +257,94 @@ public class DependencyAnalysisModule {
             ));
         }
         return edges;
+    }
+
+    private List<SpringCallPathAnalyzer.CallEdge> computeDependencyStrength(
+            List<SpringCallPathAnalyzer.CallEdge> edges,
+            Map<String, SpringCallPathAnalyzer.MethodModel> methodsById,
+            SpringCallPathAnalyzer.DebugLogger debugLogger) {
+        List<SpringCallPathAnalyzer.CallEdge> result = new ArrayList<SpringCallPathAnalyzer.CallEdge>();
+        for (SpringCallPathAnalyzer.CallEdge edge : edges) {
+            StrengthDecision decision = evaluateEdgeStrength(edge, methodsById);
+            debugLogger.log(
+                    "EDGE_STRENGTH from=%s to=%s strength=%s strong=%s reason=%s line=%d",
+                    edge.from,
+                    edge.to,
+                    decision.strength,
+                    decision.strongDependency,
+                    decision.reason,
+                    edge.line
+            );
+            result.add(new SpringCallPathAnalyzer.CallEdge(
+                    edge.from,
+                    edge.to,
+                    edge.reason,
+                    edge.line,
+                    edge.externalDependencyTypes,
+                    decision.strength,
+                    decision.strongDependency,
+                    decision.reason
+            ));
+        }
+        return result;
+    }
+
+    private StrengthDecision evaluateEdgeStrength(SpringCallPathAnalyzer.CallEdge edge,
+                                                  Map<String, SpringCallPathAnalyzer.MethodModel> methodsById) {
+        SpringCallPathAnalyzer.MethodModel fromMethod = methodsById == null ? null : methodsById.get(edge.from);
+        if (fromMethod == null || fromMethod.calls == null || fromMethod.calls.isEmpty()) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.UNKNOWN, false, "UNKNOWN");
+        }
+        List<SpringCallPathAnalyzer.CallSite> matchedSites = new ArrayList<SpringCallPathAnalyzer.CallSite>();
+        for (SpringCallPathAnalyzer.CallSite callSite : fromMethod.calls) {
+            if (callSite.line == edge.line) {
+                matchedSites.add(callSite);
+            }
+        }
+        if (matchedSites.isEmpty()) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.UNKNOWN, false, "UNKNOWN");
+        }
+
+        boolean unconditional = true;
+        boolean hasCatchOnly = false;
+        boolean hasFallbackGuard = false;
+        boolean hasConditional = false;
+        for (SpringCallPathAnalyzer.CallSite callSite : matchedSites) {
+            SpringCallPathAnalyzer.CallContext context = callSite.context;
+            if (context == null) {
+                unconditional = false;
+                continue;
+            }
+            if (context.inCatchBody || context.inFinallyBody) {
+                hasCatchOnly = true;
+                unconditional = false;
+            }
+            if (context.inConditionalBranch) {
+                hasConditional = true;
+                unconditional = false;
+            }
+            if (context.hasFallbackSibling || context.featureFlagGuarded || context.nullGuarded || context.exceptionGuarded) {
+                hasFallbackGuard = true;
+                unconditional = false;
+            }
+            if (context.inTryBody) {
+                unconditional = false;
+            }
+        }
+
+        if (hasCatchOnly) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.WEAK, false, "ONLY_IN_CATCH");
+        }
+        if (hasFallbackGuard) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.WEAK, false, "FALLBACK_GUARDED");
+        }
+        if (hasConditional) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.WEAK, false, "CONDITIONAL_PATH");
+        }
+        if (unconditional) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.STRONG, true, "UNCONDITIONAL_PATH");
+        }
+        return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.UNKNOWN, false, "UNKNOWN");
     }
 
     private List<SpringCallPathAnalyzer.ExternalDependencyTree> buildExternalDependencyTrees(
@@ -699,6 +792,20 @@ public class DependencyAnalysisModule {
 
     private static boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    private static class StrengthDecision {
+        private final SpringCallPathAnalyzer.DependencyStrength strength;
+        private final boolean strongDependency;
+        private final String reason;
+
+        private StrengthDecision(SpringCallPathAnalyzer.DependencyStrength strength,
+                                 boolean strongDependency,
+                                 String reason) {
+            this.strength = strength == null ? SpringCallPathAnalyzer.DependencyStrength.UNKNOWN : strength;
+            this.strongDependency = strongDependency;
+            this.reason = isBlank(reason) ? "UNKNOWN" : reason;
+        }
     }
 
     private static class MethodHop {
