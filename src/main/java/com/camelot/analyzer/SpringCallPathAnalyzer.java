@@ -28,7 +28,11 @@ import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.nodeTypes.NodeWithAnnotations;
+import com.github.javaparser.ast.stmt.IfStmt;
 import com.github.javaparser.ast.stmt.ReturnStmt;
+import com.github.javaparser.ast.stmt.SwitchEntry;
+import com.github.javaparser.ast.stmt.TryStmt;
+import com.github.javaparser.ast.Node;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
@@ -114,7 +118,7 @@ public class SpringCallPathAnalyzer {
         Path dotPath = options.outputDir.resolve("call-graph.dot");
         Path beanDotPath = options.outputDir.resolve("bean-dependency-graph.dot");
         Path dependencyTreePath = options.outputDir.resolve("external-dependency-tree.txt");
-        Path externalBeansPath = options.outputDir.resolve("external-beans.json");
+        Path endpointStrongDependencyPath = options.outputDir.resolve("endpoint-strong-dependency.txt");
 
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         mapper.writeValue(jsonPath.toFile(), report);
@@ -122,13 +126,14 @@ public class SpringCallPathAnalyzer {
         Files.write(dotPath, report.toDot().getBytes(StandardCharsets.UTF_8));
         Files.write(beanDotPath, report.toBeanDot().getBytes(StandardCharsets.UTF_8));
         Files.write(dependencyTreePath, report.toDependencyTreeText().getBytes(StandardCharsets.UTF_8));
+        Files.write(endpointStrongDependencyPath, report.toEndpointDependencySummaryText().getBytes(StandardCharsets.UTF_8));
 
         System.out.println("Analysis finished.");
         System.out.println("JSON report: " + jsonPath.toAbsolutePath());
         System.out.println("DOT graph:   " + dotPath.toAbsolutePath());
         System.out.println("Bean DOT:    " + beanDotPath.toAbsolutePath());
         System.out.println("Dep tree:    " + dependencyTreePath.toAbsolutePath());
-        System.out.println("Ext beans:   " + externalBeansPath.toAbsolutePath());
+        System.out.println("Endpoint dep: " + endpointStrongDependencyPath.toAbsolutePath());
         System.out.println("Endpoints:   " + report.endpoints.size());
         System.out.println("Methods:     " + report.methodDisplay.size());
         System.out.println("Edges:       " + report.edges.size());
@@ -897,6 +902,82 @@ public class SpringCallPathAnalyzer {
         return model;
     }
 
+    private CallContext detectCallContext(MethodCallExpr callExpr) {
+        CallContext context = new CallContext();
+        if (callExpr == null) {
+            return context;
+        }
+        Optional<Node> cursor = callExpr.getParentNode().map(n -> (Node) n);
+        while (cursor.isPresent()) {
+            Node node = cursor.get();
+            if (node instanceof IfStmt || node instanceof SwitchEntry) {
+                context.inConditionalBranch = true;
+            }
+            if (node instanceof TryStmt) {
+                TryStmt tryStmt = (TryStmt) node;
+                if (isNodeInside(callExpr, tryStmt.getTryBlock())) {
+                    context.inTryBody = true;
+                }
+                for (com.github.javaparser.ast.stmt.CatchClause catchClause : tryStmt.getCatchClauses()) {
+                    if (isNodeInside(callExpr, catchClause.getBody())) {
+                        context.inCatchBody = true;
+                    }
+                }
+                if (tryStmt.getFinallyBlock().isPresent() && isNodeInside(callExpr, tryStmt.getFinallyBlock().get())) {
+                    context.inFinallyBody = true;
+                }
+            }
+            cursor = node.getParentNode().map(n -> (Node) n);
+        }
+
+        String callText = callExpr.toString().toLowerCase(Locale.ROOT);
+        context.nullGuarded = containsAny(callText, "!= null", "nonnull", "optional", "ispresent");
+        context.featureFlagGuarded = containsAny(callText, "feature", "toggle", "flag", "enabled", "switch");
+        context.exceptionGuarded = containsAny(callText, "fallback", "degrade", "recover", "resilien", "default");
+        context.hasFallbackSibling = detectFallbackSibling(callExpr);
+        return context;
+    }
+
+    private boolean detectFallbackSibling(MethodCallExpr callExpr) {
+        Optional<Node> cursor = callExpr.getParentNode().map(n -> (Node) n);
+        while (cursor.isPresent()) {
+            Node node = cursor.get();
+            if (node instanceof IfStmt) {
+                IfStmt ifStmt = (IfStmt) node;
+                if (ifStmt.getElseStmt().isPresent()) {
+                    String elseText = ifStmt.getElseStmt().get().toString().toLowerCase(Locale.ROOT);
+                    if (containsAny(elseText, "return", "default", "fallback", "empty", "null")) {
+                        return true;
+                    }
+                }
+            }
+            cursor = node.getParentNode().map(n -> (Node) n);
+        }
+        return false;
+    }
+
+    private boolean isNodeInside(Node source, Node candidateContainer) {
+        if (source == null || candidateContainer == null) {
+            return false;
+        }
+        return source.getRange().isPresent()
+                && candidateContainer.getRange().isPresent()
+                && candidateContainer.getRange().get().contains(source.getRange().get().begin)
+                && candidateContainer.getRange().get().contains(source.getRange().get().end);
+    }
+
+    private boolean containsAny(String text, String... tokens) {
+        if (isBlank(text) || tokens == null) {
+            return false;
+        }
+        for (String token : tokens) {
+            if (!isBlank(token) && text.contains(token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private CallSite toCallSite(MethodCallExpr callExpr) {
         ScopeType scopeType = ScopeType.OTHER;
         String scopeToken = null;
@@ -924,6 +1005,7 @@ public class SpringCallPathAnalyzer {
         }
 
         int line = callExpr.getBegin().map(p -> p.line).orElse(-1);
+        CallContext context = detectCallContext(callExpr);
         List<String> argumentTokens = new ArrayList<String>();
         for (Expression argument : callExpr.getArguments()) {
             String token = toArgumentToken(argument);
@@ -938,7 +1020,8 @@ public class SpringCallPathAnalyzer {
                 callExpr.getNameAsString(),
                 callExpr.getArguments().size(),
                 line,
-                argumentTokens
+                argumentTokens,
+                context
         );
     }
 
@@ -3125,7 +3208,8 @@ public class SpringCallPathAnalyzer {
                         signature.methodName,
                         signature.argumentCount,
                         call.line,
-                        listOf()
+                        listOf(),
+                        CallContext.empty()
                 );
                 Set<String> targets = resolveMethodInClassHierarchy(stageTarget.getKey(), syntheticCall, javaModel);
                 for (String target : targets) {
@@ -5734,7 +5818,7 @@ public class SpringCallPathAnalyzer {
         public final List<EndpointPaths> endpoints;
         public final List<BeanDependencyEdge> beanDependencies;
         public final List<ExternalDependencyTree> externalDependencyTrees;
-        public final List<ExternalBeanRegistration> externalBeanRegistry;
+        public final List<EndpointDependencySummary> endpointDependencySummaries;
 
         public AnalysisReport(String generatedAt,
                               String projectRoot,
@@ -5743,7 +5827,7 @@ public class SpringCallPathAnalyzer {
                               List<EndpointPaths> endpoints,
                               List<BeanDependencyEdge> beanDependencies,
                               List<ExternalDependencyTree> externalDependencyTrees,
-                              List<ExternalBeanRegistration> externalBeanRegistry) {
+                              List<EndpointDependencySummary> endpointDependencySummaries) {
             this.generatedAt = generatedAt;
             this.projectRoot = projectRoot;
             this.methodDisplay = methodDisplay;
@@ -5753,9 +5837,9 @@ public class SpringCallPathAnalyzer {
                     ? new ArrayList<BeanDependencyEdge>()
                     : beanDependencies;
             this.externalDependencyTrees = externalDependencyTrees;
-            this.externalBeanRegistry = externalBeanRegistry == null
-                    ? new ArrayList<ExternalBeanRegistration>()
-                    : externalBeanRegistry;
+            this.endpointDependencySummaries = endpointDependencySummaries == null
+                    ? new ArrayList<EndpointDependencySummary>()
+                    : endpointDependencySummaries;
         }
 
         public String toDot() {
@@ -5867,6 +5951,91 @@ public class SpringCallPathAnalyzer {
 
         private static String escape(String raw) {
             return raw.replace("\\", "\\\\").replace("\"", "\\\"");
+        }
+
+        public String toEndpointDependencySummaryText() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Endpoint Strong Dependency Summary\n");
+            sb.append("GeneratedAt: ").append(generatedAt).append("\n");
+            sb.append("ProjectRoot: ").append(projectRoot).append("\n\n");
+            if (endpointDependencySummaries == null || endpointDependencySummaries.isEmpty()) {
+                sb.append("No endpoint dependency summary available.\n");
+                return sb.toString();
+            }
+            int strongCount = 0;
+            for (EndpointDependencySummary summary : endpointDependencySummaries) {
+                if (!summary.strong) {
+                    continue;
+                }
+                strongCount++;
+                sb.append(summary.endpointPath)
+                        .append(" [")
+                        .append(String.join(",", summary.httpMethods))
+                        .append("] -> ")
+                        .append(summary.externalBean)
+                        .append(" strong=").append(summary.strong)
+                        .append(" weak=").append(summary.weak)
+                        .append(" unknown=").append(summary.unknown)
+                        .append("\n");
+                if (!isBlank(summary.shortestStrongChain)) {
+                    sb.append("  shortestStrongChain: ").append(summary.shortestStrongChain).append("\n");
+                }
+                if (!isBlank(summary.samplePath)) {
+                    sb.append("  samplePath: ").append(summary.samplePath).append("\n");
+                }
+                if (summary.lines != null && !summary.lines.isEmpty()) {
+                    sb.append("  lines: ").append(summary.lines).append("\n");
+                }
+                if (summary.reasons != null && !summary.reasons.isEmpty()) {
+                    sb.append("  reasons: ").append(summary.reasons).append("\n");
+                }
+                sb.append("\n");
+            }
+            if (strongCount == 0) {
+                sb.append("No strong endpoint dependencies found.\n");
+            }
+            return sb.toString();
+        }
+    }
+
+    public enum DependencyStrength {
+        STRONG,
+        WEAK,
+        UNKNOWN
+    }
+
+    public static class EndpointDependencySummary {
+        public final String endpointPath;
+        public final List<String> httpMethods;
+        public final String externalBean;
+        public final boolean strong;
+        public final boolean weak;
+        public final boolean unknown;
+        public final String shortestStrongChain;
+        public final String samplePath;
+        public final List<Integer> lines;
+        public final List<String> reasons;
+
+        public EndpointDependencySummary(String endpointPath,
+                                         List<String> httpMethods,
+                                         String externalBean,
+                                         boolean strong,
+                                         boolean weak,
+                                         boolean unknown,
+                                         String shortestStrongChain,
+                                         String samplePath,
+                                         List<Integer> lines,
+                                         List<String> reasons) {
+            this.endpointPath = endpointPath;
+            this.httpMethods = httpMethods == null ? new ArrayList<String>() : httpMethods;
+            this.externalBean = externalBean;
+            this.strong = strong;
+            this.weak = weak;
+            this.unknown = unknown;
+            this.shortestStrongChain = shortestStrongChain == null ? "" : shortestStrongChain;
+            this.samplePath = samplePath == null ? "" : samplePath;
+            this.lines = lines == null ? new ArrayList<Integer>() : lines;
+            this.reasons = reasons == null ? new ArrayList<String>() : reasons;
         }
     }
 
@@ -5991,16 +6160,37 @@ public class SpringCallPathAnalyzer {
         public final String reason;
         public final int line;
         public final List<String> externalDependencyTypes;
-        public final List<String> targetBeanNames;
+        public final DependencyStrength dependencyStrength;
+        public final boolean strongDependency;
+        public final String strengthReason;
 
-        public CallEdge(String from, String to, String reason, int line, List<String> externalDependencyTypes, List<String> targetBeanNames) {
+        public CallEdge(String from, String to, String reason, int line, List<String> externalDependencyTypes) {
+            this(from, to, reason, line, externalDependencyTypes, DependencyStrength.UNKNOWN, false, "UNKNOWN");
+        }
+
+        public CallEdge(String from,
+                        String to,
+                        String reason,
+                        int line,
+                        List<String> externalDependencyTypes,
+                        DependencyStrength dependencyStrength,
+                        boolean strongDependency,
+                        String strengthReason) {
             this.from = from;
             this.to = to;
             this.reason = reason;
             this.line = line;
             this.externalDependencyTypes = externalDependencyTypes == null ? listOf() : externalDependencyTypes;
-            this.targetBeanNames = targetBeanNames == null ? listOf() : targetBeanNames;
+            this.dependencyStrength = dependencyStrength == null ? DependencyStrength.UNKNOWN : dependencyStrength;
+            this.strongDependency = strongDependency;
+            this.strengthReason = isBlank(strengthReason) ? "UNKNOWN" : strengthReason;
         }
+    }
+
+    public enum DependencyStrength {
+        STRONG,
+        WEAK,
+        UNKNOWN
     }
 
     public static class Endpoint {
@@ -6243,6 +6433,7 @@ public class SpringCallPathAnalyzer {
         public final int argumentCount;
         public final int line;
         public final List<String> argumentTokens;
+        public final CallContext context;
 
         public CallSite(ScopeType scopeType,
                         String scopeToken,
@@ -6250,7 +6441,8 @@ public class SpringCallPathAnalyzer {
                         String methodName,
                         int argumentCount,
                         int line,
-                        List<String> argumentTokens) {
+                        List<String> argumentTokens,
+                        CallContext context) {
             this.scopeType = scopeType;
             this.scopeToken = scopeToken;
             this.scopeCall = scopeCall;
@@ -6258,6 +6450,22 @@ public class SpringCallPathAnalyzer {
             this.argumentCount = argumentCount;
             this.line = line;
             this.argumentTokens = argumentTokens == null ? new ArrayList<String>() : argumentTokens;
+            this.context = context == null ? CallContext.empty() : context;
+        }
+    }
+
+    public static class CallContext {
+        public boolean inConditionalBranch;
+        public boolean inTryBody;
+        public boolean inCatchBody;
+        public boolean inFinallyBody;
+        public boolean nullGuarded;
+        public boolean featureFlagGuarded;
+        public boolean exceptionGuarded;
+        public boolean hasFallbackSibling;
+
+        public static CallContext empty() {
+            return new CallContext();
         }
     }
 

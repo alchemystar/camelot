@@ -63,15 +63,27 @@ public class DependencyAnalysisModule {
                 normalizedNonExternalRpcPrefixes,
                 logger
         );
+        List<SpringCallPathAnalyzer.CallEdge> strengthEdges = computeDependencyStrength(
+                enrichedEdges,
+                codeResult.methodsById,
+                logger
+        );
         List<SpringCallPathAnalyzer.ExternalDependencyTree> trees = buildExternalDependencyTrees(
                 codeResult.endpoints,
-                enrichedEdges,
+                strengthEdges,
                 codeResult.methodDisplay,
                 logger
         );
         List<SpringCallPathAnalyzer.BeanDependencyEdge> beanDependencies = buildBeanDependencyEdges(
                 codeResult,
+                strengthEdges,
+                logger
+        );
+        List<SpringCallPathAnalyzer.EndpointDependencySummary> endpointDependencySummaries = buildEndpointDependencySummaries(
+                codeResult.endpoints,
                 enrichedEdges,
+                codeResult.methodsById,
+                codeResult.methodDisplay,
                 logger
         );
         List<SpringCallPathAnalyzer.ExternalBeanRegistration> externalBeanRegistry = buildExternalBeanRegistry(
@@ -81,20 +93,20 @@ public class DependencyAnalysisModule {
         );
         writeExternalBeansAuditFile(projectRoot, externalBeanRegistry, logger);
 
-        logger.log("DEPENDENCY_ANALYSIS_DONE edges=%d trees=%d beanDeps=%d externalBeans=%d",
-                enrichedEdges.size(),
+        logger.log("DEPENDENCY_ANALYSIS_DONE edges=%d trees=%d beanDeps=%d",
+                strengthEdges.size(),
                 trees.size(),
                 beanDependencies.size(),
-                externalBeanRegistry.size());
+                endpointDependencySummaries.size());
         return new SpringCallPathAnalyzer.AnalysisReport(
                 Instant.now().toString(),
                 codeResult.projectRoot,
                 codeResult.methodDisplay,
-                enrichedEdges,
+                strengthEdges,
                 codeResult.endpoints,
                 beanDependencies,
                 trees,
-                externalBeanRegistry
+                endpointDependencySummaries
         );
     }
 
@@ -286,6 +298,94 @@ public class DependencyAnalysisModule {
         return edges;
     }
 
+    private List<SpringCallPathAnalyzer.CallEdge> computeDependencyStrength(
+            List<SpringCallPathAnalyzer.CallEdge> edges,
+            Map<String, SpringCallPathAnalyzer.MethodModel> methodsById,
+            SpringCallPathAnalyzer.DebugLogger debugLogger) {
+        List<SpringCallPathAnalyzer.CallEdge> result = new ArrayList<SpringCallPathAnalyzer.CallEdge>();
+        for (SpringCallPathAnalyzer.CallEdge edge : edges) {
+            StrengthDecision decision = evaluateEdgeStrength(edge, methodsById);
+            debugLogger.log(
+                    "EDGE_STRENGTH from=%s to=%s strength=%s strong=%s reason=%s line=%d",
+                    edge.from,
+                    edge.to,
+                    decision.strength,
+                    decision.strongDependency,
+                    decision.reason,
+                    edge.line
+            );
+            result.add(new SpringCallPathAnalyzer.CallEdge(
+                    edge.from,
+                    edge.to,
+                    edge.reason,
+                    edge.line,
+                    edge.externalDependencyTypes,
+                    decision.strength,
+                    decision.strongDependency,
+                    decision.reason
+            ));
+        }
+        return result;
+    }
+
+    private StrengthDecision evaluateEdgeStrength(SpringCallPathAnalyzer.CallEdge edge,
+                                                  Map<String, SpringCallPathAnalyzer.MethodModel> methodsById) {
+        SpringCallPathAnalyzer.MethodModel fromMethod = methodsById == null ? null : methodsById.get(edge.from);
+        if (fromMethod == null || fromMethod.calls == null || fromMethod.calls.isEmpty()) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.UNKNOWN, false, "UNKNOWN");
+        }
+        List<SpringCallPathAnalyzer.CallSite> matchedSites = new ArrayList<SpringCallPathAnalyzer.CallSite>();
+        for (SpringCallPathAnalyzer.CallSite callSite : fromMethod.calls) {
+            if (callSite.line == edge.line) {
+                matchedSites.add(callSite);
+            }
+        }
+        if (matchedSites.isEmpty()) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.UNKNOWN, false, "UNKNOWN");
+        }
+
+        boolean unconditional = true;
+        boolean hasCatchOnly = false;
+        boolean hasFallbackGuard = false;
+        boolean hasConditional = false;
+        for (SpringCallPathAnalyzer.CallSite callSite : matchedSites) {
+            SpringCallPathAnalyzer.CallContext context = callSite.context;
+            if (context == null) {
+                unconditional = false;
+                continue;
+            }
+            if (context.inCatchBody || context.inFinallyBody) {
+                hasCatchOnly = true;
+                unconditional = false;
+            }
+            if (context.inConditionalBranch) {
+                hasConditional = true;
+                unconditional = false;
+            }
+            if (context.hasFallbackSibling || context.featureFlagGuarded || context.nullGuarded || context.exceptionGuarded) {
+                hasFallbackGuard = true;
+                unconditional = false;
+            }
+            if (context.inTryBody) {
+                unconditional = false;
+            }
+        }
+
+        if (hasCatchOnly) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.WEAK, false, "ONLY_IN_CATCH");
+        }
+        if (hasFallbackGuard) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.WEAK, false, "FALLBACK_GUARDED");
+        }
+        if (hasConditional) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.WEAK, false, "CONDITIONAL_PATH");
+        }
+        if (unconditional) {
+            return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.STRONG, true, "UNCONDITIONAL_PATH");
+        }
+        return new StrengthDecision(SpringCallPathAnalyzer.DependencyStrength.UNKNOWN, false, "UNKNOWN");
+    }
+
     private List<SpringCallPathAnalyzer.ExternalDependencyTree> buildExternalDependencyTrees(
             List<SpringCallPathAnalyzer.EndpointPaths> endpointPaths,
             List<SpringCallPathAnalyzer.CallEdge> edges,
@@ -367,6 +467,138 @@ public class DependencyAnalysisModule {
         }
         debugLogger.log("EXTERNAL_DEP_TREES count=%d", trees.size());
         return trees;
+    }
+
+    private List<SpringCallPathAnalyzer.EndpointDependencySummary> buildEndpointDependencySummaries(
+            List<SpringCallPathAnalyzer.EndpointPaths> endpointPaths,
+            List<SpringCallPathAnalyzer.CallEdge> edges,
+            Map<String, SpringCallPathAnalyzer.MethodModel> methodsById,
+            Map<String, String> methodDisplay,
+            SpringCallPathAnalyzer.DebugLogger debugLogger) {
+        if (endpointPaths == null || endpointPaths.isEmpty() || edges == null || edges.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Map<String, SpringCallPathAnalyzer.CallEdge> edgeByKey = new LinkedHashMap<String, SpringCallPathAnalyzer.CallEdge>();
+        for (SpringCallPathAnalyzer.CallEdge edge : edges) {
+            edgeByKey.put(edge.from + "->" + edge.to, edge);
+        }
+
+        List<SpringCallPathAnalyzer.EndpointDependencySummary> summaries = new ArrayList<SpringCallPathAnalyzer.EndpointDependencySummary>();
+        for (SpringCallPathAnalyzer.EndpointPaths endpointPath : endpointPaths) {
+            if (endpointPath == null || endpointPath.paths == null) {
+                continue;
+            }
+            Map<String, EndpointDependencyAccumulator> byBean = new LinkedHashMap<String, EndpointDependencyAccumulator>();
+            int totalPaths = endpointPath.paths.size();
+            for (List<String> path : endpointPath.paths) {
+                if (path == null || path.size() < 2) {
+                    continue;
+                }
+                Set<String> touchedBeans = new LinkedHashSet<String>();
+                Set<String> strongBeans = new LinkedHashSet<String>();
+
+                for (int i = 0; i + 1 < path.size(); i++) {
+                    String from = path.get(i);
+                    String to = path.get(i + 1);
+                    SpringCallPathAnalyzer.CallEdge edge = edgeByKey.get(from + "->" + to);
+                    if (edge == null || edge.externalDependencyTypes == null || edge.externalDependencyTypes.isEmpty()) {
+                        continue;
+                    }
+
+                    String externalBean = toClassName(edge.to, methodsById);
+                    if (isBlank(externalBean)) {
+                        externalBean = edge.to;
+                    }
+                    EndpointDependencyAccumulator accumulator = byBean.computeIfAbsent(
+                            externalBean,
+                            k -> new EndpointDependencyAccumulator(endpointPath.path, endpointPath.httpMethods, externalBean)
+                    );
+
+                    SpringCallPathAnalyzer.DependencyStrength strength = classifyDependencyStrength(edge.reason);
+                    touchedBeans.add(externalBean);
+                    if (strength == SpringCallPathAnalyzer.DependencyStrength.STRONG) {
+                        strongBeans.add(externalBean);
+                        accumulator.recordShortestStrongChain(buildMethodChain(path, 0, i + 1, methodDisplay));
+                    } else if (strength == SpringCallPathAnalyzer.DependencyStrength.UNKNOWN) {
+                        accumulator.hasUnknownEvidence = true;
+                    }
+
+                    accumulator.recordSamplePath(buildMethodChain(path, 0, path.size() - 1, methodDisplay));
+                    if (edge.line > 0) {
+                        accumulator.lines.add(Integer.valueOf(edge.line));
+                    }
+                    accumulator.addEvidenceReason(edge.reason);
+                }
+
+                for (String bean : touchedBeans) {
+                    EndpointDependencyAccumulator acc = byBean.get(bean);
+                    acc.touchedPathCount++;
+                    if (strongBeans.contains(bean)) {
+                        acc.strongPathCount++;
+                    }
+                }
+            }
+
+            for (EndpointDependencyAccumulator acc : byBean.values()) {
+                boolean unknown = totalPaths <= 0 || acc.hasUnknownEvidence;
+                boolean strong = totalPaths > 0 && acc.strongPathCount == totalPaths;
+                boolean weak = !strong && (acc.touchedPathCount > 0 || acc.strongPathCount > 0);
+                summaries.add(new SpringCallPathAnalyzer.EndpointDependencySummary(
+                        acc.endpointPath,
+                        acc.httpMethods,
+                        acc.externalBean,
+                        strong,
+                        weak,
+                        unknown,
+                        acc.shortestStrongChain,
+                        acc.samplePath,
+                        new ArrayList<Integer>(acc.lines),
+                        new ArrayList<String>(acc.evidenceReasons)
+                ));
+            }
+        }
+
+        summaries.sort((a, b) -> {
+            int endpointCompare = a.endpointPath.compareTo(b.endpointPath);
+            if (endpointCompare != 0) {
+                return endpointCompare;
+            }
+            if (a.strong != b.strong) {
+                return a.strong ? -1 : 1;
+            }
+            return a.externalBean.compareTo(b.externalBean);
+        });
+        debugLogger.log("ENDPOINT_DEP_SUMMARY count=%d", summaries.size());
+        return summaries;
+    }
+
+    private SpringCallPathAnalyzer.DependencyStrength classifyDependencyStrength(String reasonSummary) {
+        if (isBlank(reasonSummary)) {
+            return SpringCallPathAnalyzer.DependencyStrength.UNKNOWN;
+        }
+        String lower = reasonSummary.toLowerCase(Locale.ROOT);
+        if (lower.contains("runtime:") || lower.contains("unknown") || lower.contains("stop:")) {
+            return SpringCallPathAnalyzer.DependencyStrength.UNKNOWN;
+        }
+        if (lower.contains("condition") || lower.contains("fallback")) {
+            return SpringCallPathAnalyzer.DependencyStrength.WEAK;
+        }
+        return SpringCallPathAnalyzer.DependencyStrength.STRONG;
+    }
+
+    private String buildMethodChain(List<String> path,
+                                    int startInclusive,
+                                    int endInclusive,
+                                    Map<String, String> methodDisplay) {
+        List<String> segments = new ArrayList<String>();
+        int start = Math.max(0, startInclusive);
+        int end = Math.min(endInclusive, path.size() - 1);
+        for (int i = start; i <= end; i++) {
+            String methodId = path.get(i);
+            String display = methodDisplay.get(methodId);
+            segments.add(isBlank(display) ? methodId : display);
+        }
+        return String.join(" -> ", segments);
     }
 
     private List<String> classifyExternalDependencyTypes(String calleeMethodId,
@@ -650,6 +882,20 @@ public class DependencyAnalysisModule {
         return value == null || value.trim().isEmpty();
     }
 
+    private static class StrengthDecision {
+        private final SpringCallPathAnalyzer.DependencyStrength strength;
+        private final boolean strongDependency;
+        private final String reason;
+
+        private StrengthDecision(SpringCallPathAnalyzer.DependencyStrength strength,
+                                 boolean strongDependency,
+                                 String reason) {
+            this.strength = strength == null ? SpringCallPathAnalyzer.DependencyStrength.UNKNOWN : strength;
+            this.strongDependency = strongDependency;
+            this.reason = isBlank(reason) ? "UNKNOWN" : reason;
+        }
+    }
+
     private static class MethodHop {
         private final String methodId;
         private final int depth;
@@ -670,6 +916,52 @@ public class DependencyAnalysisModule {
         private BeanDependencyAccumulator(String fromBeanClass, String toBeanClass) {
             this.fromBeanClass = fromBeanClass;
             this.toBeanClass = toBeanClass;
+        }
+    }
+
+    private static class EndpointDependencyAccumulator {
+        private final String endpointPath;
+        private final List<String> httpMethods;
+        private final String externalBean;
+        private int strongPathCount = 0;
+        private int touchedPathCount = 0;
+        private boolean hasUnknownEvidence = false;
+        private String shortestStrongChain = "";
+        private String samplePath = "";
+        private final Set<Integer> lines = new LinkedHashSet<Integer>();
+        private final Set<String> evidenceReasons = new LinkedHashSet<String>();
+
+        private EndpointDependencyAccumulator(String endpointPath, List<String> httpMethods, String externalBean) {
+            this.endpointPath = endpointPath;
+            this.httpMethods = httpMethods == null ? Collections.<String>emptyList() : new ArrayList<String>(httpMethods);
+            this.externalBean = externalBean;
+        }
+
+        private void recordShortestStrongChain(String chain) {
+            if (isBlank(chain)) {
+                return;
+            }
+            if (isBlank(shortestStrongChain) || chain.length() < shortestStrongChain.length()) {
+                shortestStrongChain = chain;
+            }
+        }
+
+        private void recordSamplePath(String path) {
+            if (isBlank(samplePath) && !isBlank(path)) {
+                samplePath = path;
+            }
+        }
+
+        private void addEvidenceReason(String reasonSummary) {
+            if (isBlank(reasonSummary)) {
+                return;
+            }
+            for (String token : reasonSummary.split("\\|")) {
+                String trimmed = token == null ? "" : token.trim();
+                if (trimmed.startsWith("EVIDENCE:")) {
+                    evidenceReasons.add(trimmed);
+                }
+            }
         }
     }
 
